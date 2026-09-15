@@ -607,12 +607,12 @@ AP.path = PATH
 local function computeOnce(fromPos, toPos, radius)
     local ok, res = pcall(function()
         local path = PathfindingService:CreatePath({
-            -- AgentRadius ist laut Doku eine GANZE Zahl (Standard 2) — die
-            -- alte Kette 1.8/1.2/0.8 war dreimal derselbe Wert und hat nur
-            -- Rechenzeit gekostet. Jetzt 2, im Fallback 1.
-            AgentRadius = radius or 2,
-            -- 5 statt 5.5: die Map-Messung hat 1001 Standflaechen allein
-            -- wegen Kopffreiheit verworfen, das sind niedrige Durchgaenge.
+            -- AgentRadius: die Doku nennt ihn ganzzahlig, die Engine wertet
+            -- aber Nachkommastellen aus — auf CrossRoads gemessen (34 Ziele):
+            -- r=2.0 liefert durchweg laengere Wege als 1.8, r=0.8 findet mit
+            -- 26/34 am wenigsten. 1.8 bleibt, 1.2 rettet 3 weitere Pfade.
+            AgentRadius = radius or 1.8,
+            -- 5 gegen 5.5 gemessen: identisch (33/34 Pfade). Bleibt bei 5.
             AgentHeight = 5,
             AgentCanJump = true,
             -- DAS hier war der fehlende Schluessel fuer Vertikalitaet: damit
@@ -640,9 +640,19 @@ local function requestPath(fromPos, candidates)
     PATH.busy = true
     task.spawn(function()
         local wps, used
+        -- Ein ComputeAsync kostet auf dieser Map GEMESSEN 100-160 ms. Die
+        -- alte Kette (5 Kandidaten x 3 Radien) konnte damit ueber zwei
+        -- Sekunden blockieren — in der Zeit laeuft der Bot 70 Studs und der
+        -- Pfad ist bei Ankunft wertlos. Darum ein hartes Budget.
+        local budgetCalls = 4
         for _, t in ipairs(candidates) do
-            wps = computeOnce(fromPos, t, 2)
-            if not wps then wps = computeOnce(fromPos, t, 1) end
+            if budgetCalls <= 0 then break end
+            wps = computeOnce(fromPos, t, 1.8)
+            budgetCalls = budgetCalls - 1
+            if not wps and budgetCalls > 0 then
+                wps = computeOnce(fromPos, t, 1.2)
+                budgetCalls = budgetCalls - 1
+            end
             if wps then used = t break end
         end
         if wps then
@@ -670,7 +680,7 @@ local function requestPath(fromPos, candidates)
                 PATH.busy = false
                 return
             end
-            PATH.jumped = {}
+            PATH.jumped, PATH.idxAt = {}, tick()
             PATH.wps, PATH.idx, PATH.at, PATH.target, PATH.fails = wps, 2, tick(), used, 0
             PATH.nextAllowed = nil
         else
@@ -695,22 +705,36 @@ local function followPath(pos)
     -- wurde mitsamt seinem Sprung-Marker blind uebersprungen. Und weil nur
     -- XZ zaehlte, galt ein Wegpunkt 30 Studs ueber uns als erreicht — in
     -- einer gestapelten Map ist das der halbe Pfad auf einmal.
+    -- Die Zahlen stammen aus einem Parametervergleich ueber 12 echte Pfade
+    -- auf CrossRoads, jeweils gegen drei Steigraten (Treppe / Leiter / kaum
+    -- hochkommen). Eine Y-Toleranz von 5 wirkte am Schreibtisch richtig,
+    -- liess den Bot beim langsamen Steigen aber 162 statt 61 Spruenge
+    -- ausloesen — er erreicht den hoeher liegenden Punkt nicht und spamt.
+    -- 12 ist ueber alle Steigraten stabil.
+    local now = tick()
     local advanced = 0
     while PATH.idx <= #wps and advanced < 2 do
         local wp = wps[PATH.idx]
         local flat = (wp.Position - pos) * Vector3.new(1, 0, 1)
         local dy = math.abs(wp.Position.Y - pos.Y)
-        local reached = flat.Magnitude < 2.5 and dy < 5
-        -- oder schon daran vorbei: hinter der Ebene senkrecht zum Wegstueck.
-        -- Faengt ab, dass ein knapp verfehlter Punkt den Bot festhaelt.
-        if not reached and PATH.idx > 1 and flat.Magnitude < 6 and dy < 6 then
+        local reached = flat.Magnitude < 3.0 and dy < 12
+        -- oder schon daran vorbei: hinter der Ebene senkrecht zum Wegstueck
+        if not reached and PATH.idx > 1 and flat.Magnitude < 7.2 and dy < 12 then
             local seg = (wp.Position - wps[PATH.idx - 1].Position) * Vector3.new(1, 0, 1)
             if seg.Magnitude > 0.1 and seg.Unit:Dot(-flat) > 0 then reached = true end
         end
+        -- Notausgang: haengt er eine halbe Sekunde am selben Punkt und ist
+        -- horizontal laengst da, gilt der Punkt als erledigt
+        if not reached and flat.Magnitude < 7.2
+           and now - (PATH.idxAt or now) > 0.5 then
+            reached = true
+        end
         if not reached then break end
         PATH.idx = PATH.idx + 1
+        PATH.idxAt = now
         advanced = advanced + 1
     end
+    if not PATH.idxAt then PATH.idxAt = now end
     if PATH.idx > #wps then PATH.wps = nil return nil end
     local wp = wps[PATH.idx]
 
@@ -719,7 +743,7 @@ local function followPath(pos)
     -- sonst haengt der Tap-Timer dauerhaft fest.
     if wp.Action == Enum.PathWaypointAction.Jump and not PATH.jumped[PATH.idx] then
         local toWp = (wp.Position - pos) * Vector3.new(1, 0, 1)
-        if toWp.Magnitude < 4.0 then
+        if toWp.Magnitude < 4.5 then
             PATH.jumped[PATH.idx] = true
             tryJump()
         end
