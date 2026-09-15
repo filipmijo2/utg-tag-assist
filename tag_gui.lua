@@ -596,7 +596,8 @@ local function tryJump(force)
 end
 
 local PathfindingService = game:GetService("PathfindingService")
-local PATH = { wps = nil, idx = 1, at = 0, target = nil, busy = false, fails = 0 }
+local PATH = { wps = nil, idx = 1, at = 0, target = nil, busy = false, fails = 0,
+               jumped = {} }
 AP.path = PATH
 
 -- Ein Pfad direkt zum Gegner scheitert oft (er steht auf einem Dach, auf einer
@@ -606,17 +607,20 @@ AP.path = PATH
 local function computeOnce(fromPos, toPos, radius)
     local ok, res = pcall(function()
         local path = PathfindingService:CreatePath({
-            -- AgentRadius zu gross = NoPath in enger Geometrie; R6-Rumpf ist
-            -- ~2 breit, also 1.5 plus Puffer, und im Fallback noch kleiner.
-            AgentRadius = radius or 1.8,
-            AgentHeight = 5.5,
+            -- AgentRadius ist laut Doku eine GANZE Zahl (Standard 2) — die
+            -- alte Kette 1.8/1.2/0.8 war dreimal derselbe Wert und hat nur
+            -- Rechenzeit gekostet. Jetzt 2, im Fallback 1.
+            AgentRadius = radius or 2,
+            -- 5 statt 5.5: die Map-Messung hat 1001 Standflaechen allein
+            -- wegen Kopffreiheit verworfen, das sind niedrige Durchgaenge.
+            AgentHeight = 5,
             AgentCanJump = true,
             -- DAS hier war der fehlende Schluessel fuer Vertikalitaet: damit
             -- bezieht die Wegfindung TrussParts (die Leitern dieser Maps) in
             -- die Navigation ein, statt sie als Wand zu behandeln.
             AgentCanClimb = true,
             AgentMaxSlope = 89,
-            WaypointSpacing = 3,
+            WaypointSpacing = 4,
         })
         path:ComputeAsync(fromPos, toPos)
         if path.Status == Enum.PathStatus.Success then
@@ -637,29 +641,36 @@ local function requestPath(fromPos, candidates)
     task.spawn(function()
         local wps, used
         for _, t in ipairs(candidates) do
-            wps = computeOnce(fromPos, t, 1.8)
-            if not wps then wps = computeOnce(fromPos, t, 1.2) end
-            if not wps then wps = computeOnce(fromPos, t, 0.8) end
+            wps = computeOnce(fromPos, t, 2)
+            if not wps then wps = computeOnce(fromPos, t, 1) end
             if wps then used = t break end
         end
         if wps then
-            -- Laenge gegen Luftlinie pruefen: ein Pfad, der 2.5x so lang ist,
-            -- ist ein Umweg um die halbe Map — dann lieber direkt laufen.
+            -- Laenge gegen Luftlinie pruefen. Die alte Regel "laenger als das
+            -- 2.5-fache der Luftlinie = Unsinn" hat in dieser Map genau die
+            -- richtigen Pfade weggeworfen: gemessener Durchschnittsumweg ist
+            -- x2.03, weil die Luftlinie durch Beton geht und der echte Weg
+            -- ueber Treppen und Leitern fuehrt. Hoehenunterschied kostet nun
+            -- ausdruecklich Weglaenge, statt als Umweg zu gelten.
             local len, prev = 0, nil
             for _, w in ipairs(wps) do
                 if prev then len = len + (w.Position - prev).Magnitude end
                 prev = w.Position
             end
-            local direct = (used - fromPos).Magnitude
-            if direct > 1 and len > direct * 2.5 then
+            local delta = used - fromPos
+            local flat = (delta * Vector3.new(1, 0, 1)).Magnitude
+            local budget = (flat + 4 * math.abs(delta.Y) + 20) * 2.0
+            if len > budget then
                 PATH.wps, PATH.at, PATH.fails = nil, tick(), PATH.fails + 1
                 PATH.nextAllowed = tick() + math.min(1.5 + PATH.fails * 0.5, 6)
                 if PATH.fails % 4 == 1 then
-                    LOG(("Pfad verworfen: %.0f Studs Umweg fuer %.0f Studs Luftlinie"):format(len, direct))
+                    LOG(("Pfad verworfen: %.0f Studs fuer %.0f flach / %.0f hoch (Budget %.0f)")
+                        :format(len, flat, delta.Y, budget))
                 end
                 PATH.busy = false
                 return
             end
+            PATH.jumped = {}
             PATH.wps, PATH.idx, PATH.at, PATH.target, PATH.fails = wps, 2, tick(), used, 0
             PATH.nextAllowed = nil
         else
@@ -678,23 +689,40 @@ end
 local function followPath(pos)
     local wps = PATH.wps
     if not wps then return nil end
-    -- erreichte Wegpunkte ueberspringen
-    while PATH.idx <= #wps do
+    -- Wegpunkte abhaken. Die alte Regel "XZ-Abstand < 4.5" war bei
+    -- WaypointSpacing 3 groesser als der Abstand zwischen zwei Wegpunkten:
+    -- es lag staendig schon der uebernaechste Punkt im Streichbereich und
+    -- wurde mitsamt seinem Sprung-Marker blind uebersprungen. Und weil nur
+    -- XZ zaehlte, galt ein Wegpunkt 30 Studs ueber uns als erreicht — in
+    -- einer gestapelten Map ist das der halbe Pfad auf einmal.
+    local advanced = 0
+    while PATH.idx <= #wps and advanced < 2 do
         local wp = wps[PATH.idx]
-        local v = (wp.Position - pos) * Vector3.new(1, 0, 1)
-        if v.Magnitude < 4.5 then
-            if wp.Action == Enum.PathWaypointAction.Jump then
-                tryJump()
-            end
-            PATH.idx = PATH.idx + 1
-        else
-            break
+        local flat = (wp.Position - pos) * Vector3.new(1, 0, 1)
+        local dy = math.abs(wp.Position.Y - pos.Y)
+        local reached = flat.Magnitude < 2.5 and dy < 5
+        -- oder schon daran vorbei: hinter der Ebene senkrecht zum Wegstueck.
+        -- Faengt ab, dass ein knapp verfehlter Punkt den Bot festhaelt.
+        if not reached and PATH.idx > 1 and flat.Magnitude < 6 and dy < 6 then
+            local seg = (wp.Position - wps[PATH.idx - 1].Position) * Vector3.new(1, 0, 1)
+            if seg.Magnitude > 0.1 and seg.Unit:Dot(-flat) > 0 then reached = true end
         end
+        if not reached then break end
+        PATH.idx = PATH.idx + 1
+        advanced = advanced + 1
     end
     if PATH.idx > #wps then PATH.wps = nil return nil end
     local wp = wps[PATH.idx]
-    if wp.Action == Enum.PathWaypointAction.Jump then
-        tryJump()
+
+    -- Sprung beim ANLAUF ausloesen statt beim Erreichen: bei ~30 Studs/s ist
+    -- der Absprungpunkt sonst schon ueberlaufen. Pro Wegpunkt genau einmal,
+    -- sonst haengt der Tap-Timer dauerhaft fest.
+    if wp.Action == Enum.PathWaypointAction.Jump and not PATH.jumped[PATH.idx] then
+        local toWp = (wp.Position - pos) * Vector3.new(1, 0, 1)
+        if toWp.Magnitude < 4.0 then
+            PATH.jumped[PATH.idx] = true
+            tryJump()
+        end
     end
     -- Der Weg darf jetzt ueber Leitern fuehren. Ein Wegpunkt deutlich ueber uns
     -- in Leiternaehe heisst: dranhalten und klettern, nicht danebenlaufen.
