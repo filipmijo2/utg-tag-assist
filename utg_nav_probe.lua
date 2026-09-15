@@ -43,7 +43,8 @@ local CFG = {
     agentHeight  = 5.5,   -- Kopffreiheit, die ein Knoten braucht
     maxSlope     = 50,    -- steiler = keine Standflaeche (Grad)
     stepUp       = 3.0,   -- Hoehenunterschied, den Gehen noch schafft
-    nodeCap      = 7000,  -- Notbremse gegen Speicherfresser
+    nodeCap      = 20000, -- Notbremse. 7000 war zu knapp: FactionAction hat
+                          -- das Limit gerissen, der Rest der Map fiel weg.
     pfSamples    = 45,    -- Stichproben fuer den Wegfindungs-Test
     rayBudget    = 500,   -- Raycasts pro Frame, dann eine Pause (gegen Ruckeln)
 }
