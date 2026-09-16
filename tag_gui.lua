@@ -2072,10 +2072,18 @@ local function followPath(pos)
             -- erlaubt ist und er sonst beim Absteigen klebt.
             local up = wp.Position.Y - pos.Y
             local heightOk = up < 2.5 and up > -12
-            -- Tuerdurchgaenge muessen genau getroffen werden: bei 3 Studs
-            -- Toleranz schneidet er die Ecke und laeuft in den Rahmen.
-            local tight = (wp.kind == "via") and 1.6 or 3.0
+            -- Tuerdurchgaenge brauchen Genauigkeit, aber 1.6 Studs waren zu
+            -- streng: gemessen entfielen darauf 56 % der gesamten
+            -- Haengerzeit (im Schnitt 2.45 s je Fall, Zustand "Running")
+            -- — er traf den Punkt nicht und blieb davor stehen.
+            local tight = (wp.kind == "via") and 2.6 or 3.0
             reached = flat.Magnitude < tight and heightOk
+            -- Zusaetzliches Ventil nur fuer Durchgaenge: wer lange genug
+            -- dicht davor steht, hat ihn faktisch passiert.
+            if not reached and wp.kind == "via" and flat.Magnitude < 5.0
+               and now - (PATH.idxAt or now) > 0.6 then
+                reached = true
+            end
             -- oder schon daran vorbei: hinter der Ebene senkrecht zum Wegstueck
             if not reached and PATH.idx > 1 and flat.Magnitude < 7.2 and heightOk then
                 local seg = (wp.Position - wps[PATH.idx - 1].Position) * Vector3.new(1, 0, 1)
