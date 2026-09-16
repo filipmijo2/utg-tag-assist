@@ -2871,7 +2871,11 @@ local JUKE_MOVES = {
             -- nicht stumpf kehrt, sondern schraeg zurueck: haelt Tempo
             local side = Vector3.new(-ctx.facing.Z, 0, ctx.facing.X)
             local s = (math.random() < 0.5) and 1 or -1
-            m.fake = (-ctx.facing * 1.0 + side * s * 0.55).Unit
+            -- Mehr seitlich als rueckwaerts: das Spiel setzt Momentum auf 0,
+            -- sobald die Seitgeschwindigkeit unter 6.8 faellt. Eine echte
+            -- Kehrtwende tut genau das. Ein weiter Bogen dreht ebenso um,
+            -- haelt aber das Tempo.
+            m.fake = (-ctx.facing * 0.55 + side * s * 1.15).Unit
         end,
         run = function(ctx, m, t)
             -- Laenger durchziehen: bei 32 Studs/s sind 0.32 s nur 10 Studs,
@@ -2889,7 +2893,8 @@ local JUKE_MOVES = {
             -- Vorwaertsanteil, damit das Tempo erhalten bleibt
             local s = (math.random() < 0.5) and 1 or -1
             local side = Vector3.new(-ctx.facing.Z, 0, ctx.facing.X) * s
-            m.dir = (-ctx.facing * 1.0 + side * 0.75).Unit
+            -- ebenfalls als Bogen, nicht als Kehrtwende (siehe double180)
+            m.dir = (-ctx.facing * 0.5 + side * 1.2).Unit
         end,
         run = function(ctx, m, t)
             -- richtig committen: einmal 180 und dann auch dabei bleiben
@@ -3031,6 +3036,20 @@ local function jukeStep(pos, facing, toThreat, threatD, level)
 
     local a = JUKE.active
     if a then
+        -- MOMENTUM-WACHE. Das Spiel setzt Momentum auf 0, sobald die
+        -- Seitgeschwindigkeit unter 6.8 faellt — wer bei einem Manoever
+        -- stehenbleibt, wird gefangen. Bricht das Tempo zu stark ein, wird
+        -- das Manoever sofort abgebrochen statt zu Ende gefahren.
+        local hrpJ = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+        local sp = hrpJ and (hrpJ.AssemblyLinearVelocity * Vector3.new(1, 0, 1)).Magnitude or 99
+        a.slow = (sp < 9) and ((a.slow or 0) + 1) or 0
+        if a.slow > 12 then          -- rund 0.2 s dauerhaft zu langsam
+            JUKE.cd[a.def.name] = now
+            JUKE.lastAny = now
+            JUKE.aborted = (JUKE.aborted or 0) + 1
+            JUKE.active, AP.jukeName = nil, nil
+            return nil
+        end
         local dir = a.def.run(ctx, a, now - a.t0)
         if dir then
             AP.jukeName = a.def.name
