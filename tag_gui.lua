@@ -1660,6 +1660,31 @@ local function failTick(pos, hum, goalActive)
         end
     end
     WATCH.lastY = pos.Y
+
+    -- 7) HIN UND HER: kippt die Laufrichtung staendig um, kommt der Bot
+    -- nicht voran, auch wenn er sich dauernd bewegt. Ueber ein Fenster von
+    -- 0.3 s gemessen, sonst ist die Richtung von Frame zu Frame zu verrauscht.
+    if not WATCH.dirAt or now - WATCH.dirAt > 0.3 then
+        if WATCH.dirPos then
+            local mv = (pos - WATCH.dirPos) * Vector3.new(1, 0, 1)
+            if mv.Magnitude > 1.0 then
+                local d = mv.Unit
+                if WATCH.dir and d:Dot(WATCH.dir) < -0.4 then
+                    WATCH.flips = (WATCH.flips or 0) + 1
+                    if WATCH.flips >= 3 then
+                        failNote("hin_und_her",
+                            ("%d Richtungswechsel hintereinander"):format(WATCH.flips))
+                        WATCH.flips = 0
+                    end
+                else
+                    WATCH.flips = 0
+                end
+                WATCH.dir = d
+            end
+        end
+        WATCH.dirPos, WATCH.dirAt = pos, now
+    end
+
     WATCH.pos, WATCH.at = pos, now
 end
 
@@ -1837,8 +1862,14 @@ local function followPath(pos)
             -- gegen die Unterseite der Treppe.
             -- Nach OBEN daher nur 4 Studs (eine Stufe), nach UNTEN weiter
             -- 12, weil Fallen erlaubt ist und er sonst beim Absteigen klebt.
+            -- Nach OBEN wird auf Fusshoehe geprueft: liegt der Punkt auf
+            -- einer Erhoehung, reicht es nicht, ihn seitlich zu beruehren.
+            -- Mit 4 Studs Spielraum galt eine kniehohe Kiste als erreicht,
+            -- waehrend der Bot davorstand — danach zeigte der Rest des Weges
+            -- ins Leere. Nach UNTEN bleibt es grosszuegig, weil Fallen
+            -- erlaubt ist und er sonst beim Absteigen klebt.
             local up = wp.Position.Y - pos.Y
-            local heightOk = up < 4 and up > -12
+            local heightOk = up < 2.5 and up > -12
             reached = flat.Magnitude < 3.0 and heightOk
             -- oder schon daran vorbei: hinter der Ebene senkrecht zum Wegstueck
             if not reached and PATH.idx > 1 and flat.Magnitude < 7.2 and heightOk then
@@ -1854,9 +1885,9 @@ local function followPath(pos)
             -- Position neu planen.
             if not reached and flat.Magnitude < 7.2
                and now - (PATH.idxAt or now) > 0.5 then
-                if up >= 4 then
+                if up >= 2.5 then
                     failNote("unter_dem_weg",
-                        ("Wegpunkt %.0f Studs ueber dem Bot, neu geplant"):format(up))
+                        ("Wegpunkt %.1f Studs ueber dem Bot, neu geplant"):format(up))
                     PATH.wps, PATH.at = nil, 0
                     return nil
                 end
@@ -3509,22 +3540,36 @@ local function autopilotStep(threat, threatD, prey, preyD)
             rawset(CFG, "__chasing", false)
         end
 
+        -- Das Fluchtziel bekommt eine Haltefrist. Vorher wurde alle 2.5 s
+        -- neu gewaehlt und zusaetzlich sofort verworfen, sobald irgendein
+        -- Jaeger naeher dran war — bei laufenden Verfolgern kippt das
+        -- staendig zwischen zwei Punkten, und der Bot rennt sichtbar hin
+        -- und her, ohne je irgendwo anzukommen.
+        local held = nowE - (AP.escAt or 0)
         local needNew = not AP.escNode
-            or nowE - (AP.escAt or 0) > 2.5
+            or held > 6.0
             or ((AP.escNode - pos) * Vector3.new(1, 0, 1)).Magnitude < 18
         if needNew and not closeDanger and not preyTarget then
             local node = pickEscapeNode(pos, state.threats or {}, state.preys or {})
             if node then
-                AP.escNode, AP.escAt = node, nowE
-            else
+                -- einen laufenden Lauf nicht fuer einen minimal anderen
+                -- Punkt aufgeben: der neue muss spuerbar woanders liegen
+                local keepOld = AP.escNode and held < 2.5
+                    and ((node - AP.escNode) * Vector3.new(1, 0, 1)).Magnitude < 40
+                if not keepOld then
+                    AP.escNode, AP.escAt = node, nowE
+                end
+            elseif not AP.escNode then
                 AP.escNode = nil
             end
         end
-        -- Ziel verwerfen, wenn ein Jaeger naeher dran ist als wir
-        if AP.escNode then
+        -- Ziel nur aufgeben, wenn ein Jaeger DEUTLICH besser steht, und
+        -- auch dann erst nach einer kurzen Mindestlaufzeit. Sonst entsteht
+        -- genau das Flattern, das den Bot hin und her laufen laesst.
+        if AP.escNode and held > 1.2 then
             local dMe = ((AP.escNode - pos) * Vector3.new(1, 0, 1)).Magnitude
             for _, t in ipairs(state.threats or {}) do
-                if ((AP.escNode - t.pos) * Vector3.new(1, 0, 1)).Magnitude < dMe * 0.8 then
+                if ((AP.escNode - t.pos) * Vector3.new(1, 0, 1)).Magnitude < dMe * 0.55 then
                     AP.escNode, AP.escAt = nil, nil
                     break
                 end
