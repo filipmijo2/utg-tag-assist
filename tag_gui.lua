@@ -2048,12 +2048,10 @@ local function followPath(pos)
         local reached
         if wp.kind == "climb" then
             -- Der Kopf einer Leiter liegt bis zu 45 Studs ueber dem Fuss.
-            -- Hier darf weder die Y-Toleranz noch der Notausgang greifen,
-            -- sonst gilt der Punkt als erledigt, bevor ueberhaupt geklettert
-            -- wurde — der Bot laeuft dann unten daran vorbei.
-            -- eng greifen: bei 5 Studs galt die Leiter als erreicht,
-            -- obwohl er noch gar nicht an ihr haengt — er lief dann
-            -- seitlich daran vorbei
+            -- Hier darf der Notausgang nicht greifen, sonst gilt der Punkt
+            -- als erledigt, bevor ueberhaupt geklettert wurde. Und eng
+            -- greifen: bei 5 Studs Toleranz galt die Leiter als erreicht,
+            -- obwohl er noch gar nicht an ihr hing — er lief seitlich vorbei.
             reached = flat.Magnitude < 2.0 and dy < 5
         else
             -- Die Hoehentoleranz muss ASYMMETRISCH sein. Mit einem
@@ -2062,8 +2060,6 @@ local function followPath(pos)
             -- die XZ-Position ja dieselbe wie oben darauf. Er gilt dann als
             -- angekommen, ohne je hochgelaufen zu sein, und springt danach
             -- gegen die Unterseite der Treppe.
-            -- Nach OBEN daher nur 4 Studs (eine Stufe), nach UNTEN weiter
-            -- 12, weil Fallen erlaubt ist und er sonst beim Absteigen klebt.
             -- Nach OBEN wird auf Fusshoehe geprueft: liegt der Punkt auf
             -- einer Erhoehung, reicht es nicht, ihn seitlich zu beruehren.
             -- Mit 4 Studs Spielraum galt eine kniehohe Kiste als erreicht,
@@ -2078,12 +2074,9 @@ local function followPath(pos)
             -- — er traf den Punkt nicht und blieb davor stehen.
             local tight = (wp.kind == "via") and 2.6 or 3.0
             reached = flat.Magnitude < tight and heightOk
-            -- Zusaetzliches Ventil nur fuer Durchgaenge: wer lange genug
-            -- dicht davor steht, hat ihn faktisch passiert.
-            if not reached and wp.kind == "via" and flat.Magnitude < 5.0
-               and now - (PATH.idxAt or now) > 0.6 then
-                reached = true
-            end
+            -- (Ein eigenes Ventil fuer Durchgaenge stand hier mit 0.6 s und
+            --  war toter Code: der allgemeine Notausgang unten greift schon
+            --  bei 0.5 s und deckt denselben Fall ab.)
             -- oder schon daran vorbei: hinter der Ebene senkrecht zum Wegstueck
             if not reached and PATH.idx > 1 and flat.Magnitude < 7.2 and heightOk then
                 local seg = (wp.Position - wps[PATH.idx - 1].Position) * Vector3.new(1, 0, 1)
