@@ -150,7 +150,17 @@ local function sampleNodes(bb, onProgress)
                 prevY = hy
                 if hit.Normal.Y >= cosLimit then
                     local foot = hit.Position + Vector3.new(0, 0.5, 0)
-                    if not cast(foot, Vector3.new(0, CFG.agentHeight, 0)) then
+                    -- Kopffreiheit messen statt nur pruefen: enge Stellen
+                    -- wurden bisher komplett verworfen, dort gab es also gar
+                    -- keinen Weg. Durch solche Luecken kommt man aber per
+                    -- Rolle durch, und der Bot blieb genau daran haengen.
+                    local ceil = cast(foot, Vector3.new(0, CFG.agentHeight, 0))
+                    local low = false
+                    if ceil then
+                        local h = ceil.Position.Y - foot.Y
+                        low = h >= 2.2
+                    end
+                    if (not ceil) or low then
                         -- Gefahrflaechen merken statt wegwerfen: der Weg
                         -- darueber bleibt moeglich, kostet aber so viel, dass
                         -- A* ihn nur nimmt, wenn es gar nicht anders geht.
@@ -159,7 +169,8 @@ local function sampleNodes(bb, onProgress)
                             or (inst and (inst:GetAttribute("Lava")
                                           or inst:GetAttribute("ContactDamage")
                                           or inst:GetAttribute("Acid"))) and true or false
-                        local nd = { p = foot, ix = ix, iz = iz, id = #nodes + 1, e = {}, bad = bad }
+                        local nd = { p = foot, ix = ix, iz = iz, id = #nodes + 1, e = {},
+                                     bad = bad, low = low }
                         nodes[#nodes+1] = nd
                         local k = ix .. "," .. iz
                         local b = grid[k] ; if not b then b = {} grid[k] = b end
@@ -188,6 +199,8 @@ end
 local DANGER_COST = 6.0
 local function addEdge(a, b, kind, cost, via)
     if b.bad then cost = cost + DANGER_COST end
+    -- Fuehrt die Kante in eine enge Stelle, muss dort gerollt werden
+    if b.low and kind == "walk" then kind = "roll" ; cost = cost + 0.4 end
     a.e[#a.e+1] = { to = b.id, k = kind, c = cost, via = via }
 end
 
@@ -286,9 +299,17 @@ local function buildWalk(nodes, grid, prof)
                         -- der Bot stoesst sich am Vorsprung den Kopf und
                         -- rutscht wieder ab. Also pruefen, ob ueber dem
                         -- Absprungpunkt ueberhaupt Platz zum Steigen ist.
+                        -- Zwei Bedingungen, nicht eine: ueber dem Absprungpunkt
+                        -- muss Platz zum Steigen sein UND der Anflug auf
+                        -- Zielhoehe muss frei sein. Ein Ueberhang ragt ueber
+                        -- das ZIEL, nicht ueber den Absprung — die alte
+                        -- Pruefung sah ihn deshalb nur teilweise.
                         local headroom = not cast(n.p + Vector3.new(0, 1, 0),
                                                   Vector3.new(0, dy + 4.5, 0))
-                        if headroom then
+                        local lip = Vector3.new(n.p.X, o.p.Y + 1.8, n.p.Z)
+                        local approach = not cast(lip,
+                                                  (o.p + Vector3.new(0, 1.8, 0)) - lip)
+                        if headroom and approach then
                             addEdge(n, o, "hop", dist / prof.speed + 0.15, via)
                             hop = hop + 1
                         end
@@ -385,10 +406,13 @@ local function buildJumpDrop(nodes, grid, cell, prof)
                             local flat = ((o.p - a.p) * Vector3.new(1,0,1)).Magnitude
                             local dy = o.p.Y - a.p.Y
                             if flat <= prof.reach * 0.9 and math.abs(dy) > CFG.stepUp then
+                                local lipJ = Vector3.new(a.p.X, o.p.Y + 1.8, a.p.Z)
                                 if dy > 0 and dy <= prof.rise and arcClear(a.p, o.p, prof)
                                    and not cast(a.p + Vector3.new(0, 1, 0),
-                                                Vector3.new(0, dy + 4.5, 0)) then
-                                    -- kein Ueberhang ueber dem Absprungpunkt
+                                                Vector3.new(0, dy + 4.5, 0))
+                                   and not cast(lipJ, (o.p + Vector3.new(0, 1.8, 0)) - lipJ) then
+                                    -- kein Ueberhang, weder ueber dem Absprung
+                                    -- noch ueber der Zielkante
                                     addEdge(a, o, "jump", flat / prof.speed + 0.25)
                                     jumps = jumps + 1
                                 elseif dy < 0 then
@@ -650,7 +674,7 @@ end
 -- Knoten eine Zeile "x,y,z>ziel:art:kosten,..." mit einem Buchstaben je
 -- Kantenart — das ist rund ein Viertel so gross und laedt deutlich schneller.
 local KIND2CH = { walk="w", hop="h", step="s", jump="j", drop="d",
-                  climb="c", zip="z", pad="p", wallrun="r" }
+                  climb="c", zip="z", pad="p", wallrun="r", roll="o" }
 local CH2KIND = {}
 for k, v in pairs(KIND2CH) do CH2KIND[v] = k end
 
