@@ -239,6 +239,45 @@ local function markHazards(nodes, mapRoot)
     return marked, #vols
 end
 
+-- Knoten von Kanten wegschieben.
+-- Die Abtastung laeuft auf einem map-globalen Raster, das sich nicht an
+-- Treppen oder Rampen ausrichtet. Trifft ein Strahl gerade noch die
+-- aeusserste Kante einer Stufe, liegt der Knoten genau dort — der Bot
+-- laeuft hin, rutscht seitlich ab und verfehlt damit oft die ganze
+-- Treppe. Also wird jeder Knoten von seinen Abbruchkanten weggeschoben,
+-- solange darunter noch dieselbe Flaeche liegt.
+local function nudgeFromEdges(nodes)
+    local moved = 0
+    for i, nd in ipairs(nodes) do
+        local push, edges = Vector3.zero, 0
+        for k = 0, 7 do
+            local ang = k * math.pi / 4
+            local dir = Vector3.new(math.cos(ang), 0, math.sin(ang))
+            local probe = nd.p + dir * 2.0 + Vector3.new(0, 0.6, 0)
+            local hit = cast(probe, Vector3.new(0, -3.5, 0))
+            -- kein Boden daneben, oder er liegt deutlich tiefer: Abbruchkante
+            if (not hit) or math.abs(hit.Position.Y - nd.p.Y) > 2.0 then
+                push = push - dir
+                edges = edges + 1
+            end
+        end
+        -- 7 oder 8 Kanten heisst freistehender Pfosten, da hilft Schieben nicht
+        if edges >= 1 and edges <= 6 and push.Magnitude > 0.1 then
+            local target = nd.p + push.Unit * 1.6
+            local under = cast(target + Vector3.new(0, 1.2, 0), Vector3.new(0, -4, 0))
+            if under and math.abs(under.Position.Y - nd.p.Y) < 1.5 then
+                local foot = under.Position + Vector3.new(0, 0.5, 0)
+                if not cast(foot, Vector3.new(0, CFG.agentHeight * 0.6, 0)) then
+                    nd.p = foot
+                    moved = moved + 1
+                end
+            end
+        end
+        if i % 700 == 0 then breathe() end
+    end
+    return moved
+end
+
 ------------------------------------------------------------------
 -- 4) Kanten. Kosten sind SEKUNDEN.
 ------------------------------------------------------------------
@@ -696,7 +735,9 @@ function NAV.bake(onProgress)
     if #nodes < 50 then return nil, "zu wenige Knoten: " .. #nodes end
 
     local stats = {}
-    -- MUSS vor dem Kantenbau laufen: addEdge liest nd.bad
+    -- Beide MUESSEN vor dem Kantenbau laufen: das Wegschieben aendert
+    -- Knotenpositionen, addEdge liest nd.bad
+    stats.nudged = nudgeFromEdges(nodes)
     stats.hazard, stats.hazardParts = markHazards(nodes, mapRoot)
     stats.walk, stats.hop, stats.step = buildWalk(nodes, grid, prof)
     stats.climb = buildClimb(nodes, grid, bb, cell, mapRoot, prof)
