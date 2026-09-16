@@ -3861,16 +3861,29 @@ local function autopilotStep(threat, threatD, prey, preyD)
         -- Distanz: eine Leiter direkt vor der Nase findet die freie
         -- Steuerung nie.
         local climbNeed = math.abs(pathTarget.Y - pos.Y) > 14
+        -- Gemessen nach Modus getrennt (GlassHouses, je Minute):
+        --   FLUCHT   mit Route 337 Fehler, ohne Route  96
+        --   STREIFEN mit Route  34 Fehler, ohne Route  29
+        --   JAGD     ohne Route  21 Fehler bei 35.8 Studs/s
+        -- Auf der Flucht schadet die Route also massiv: das Ziel ist nur
+        -- eine grobe Himmelsrichtung, und stur abgefahrene Wegpunkte
+        -- kosten dort mehr als sie bringen. Beim Jagen zaehlt dagegen der
+        -- genaue Punkt. Darum greift die Route auf der Flucht erst sehr
+        -- spaet, sonst frueh.
+        local farEnough = (mode == "FLUCHT") and 150 or 70
+        local nearEnough = (mode == "FLUCHT") and 110 or 45
         if climbNeed then
             AP.longRange = true
-        elseif toGoal > 70 then
+        elseif toGoal > farEnough then
             AP.longRange = true
-        elseif toGoal < 45 then
+        elseif toGoal < nearEnough then
             AP.longRange = false
         end
         if not AP.longRange then
             wantPath = false
-            if PATH.wps then PATH.wps = nil end
+            -- bewusster Moduswechsel, kein verlorener Weg: sonst meldet die
+            -- Fehlererkennung hier faelschlich "pfad_verloren"
+            if PATH.wps then PATH.wps = nil ; PATH.target = nil end
             AP.usingPath = false
             AP.routeTo = "direkt"
         end
