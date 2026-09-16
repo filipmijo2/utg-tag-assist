@@ -2726,13 +2726,22 @@ local function climbStep(pos, dirHint)
     if dir.Magnitude < 0.05 then return nil end
     dir = dir.Unit
 
-    -- parallel ausrichten, damit RightVector garantiert auf die Wand zeigt
-    local m = RENV.shared.multipliers
-    if m then
-        m.RotateInMoveDirection = false
-        AP.climbRotating = true
+    -- Parallel zur Wand ausrichten, damit RightVector auf sie zeigt.
+    -- NUR wenn der Bot auch wirklich in der Luft ist: dieser Zweig laeuft
+    -- jeden Frame, sobald ueberhaupt eine Wand in Reichweite steht. Am
+    -- Boden hat er damit dauerhaft die Blickrichtung an die Kamera
+    -- gekoppelt statt an die Laufrichtung — beim Weglaufen entlang von
+    -- Waenden war das praktisch durchgehend der Fall.
+    local humW = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+    local airborne = humW and humW.FloorMaterial == Enum.Material.Air
+    if airborne then
+        local m = RENV.shared.multipliers
+        if m then
+            m.RotateInMoveDirection = false
+            AP.climbRotating = true
+        end
+        hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + tan)
     end
-    hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + tan)
 
     -- SPRUNG-TIMING (der eigentliche Knackpunkt):
     -- Ein Sprung waehrend eines laufenden Wallruns bedeutet ABSTOSSEN. Wer im
