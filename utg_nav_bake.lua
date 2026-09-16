@@ -151,7 +151,15 @@ local function sampleNodes(bb, onProgress)
                 if hit.Normal.Y >= cosLimit then
                     local foot = hit.Position + Vector3.new(0, 0.5, 0)
                     if not cast(foot, Vector3.new(0, CFG.agentHeight, 0)) then
-                        local nd = { p = foot, ix = ix, iz = iz, id = #nodes + 1, e = {} }
+                        -- Gefahrflaechen merken statt wegwerfen: der Weg
+                        -- darueber bleibt moeglich, kostet aber so viel, dass
+                        -- A* ihn nur nimmt, wenn es gar nicht anders geht.
+                        local inst, mat = hit.Instance, hit.Material
+                        local bad = (mat == Enum.Material.Water)
+                            or (inst and (inst:GetAttribute("Lava")
+                                          or inst:GetAttribute("ContactDamage")
+                                          or inst:GetAttribute("Acid"))) and true or false
+                        local nd = { p = foot, ix = ix, iz = iz, id = #nodes + 1, e = {}, bad = bad }
                         nodes[#nodes+1] = nd
                         local k = ix .. "," .. iz
                         local b = grid[k] ; if not b then b = {} grid[k] = b end
@@ -174,8 +182,13 @@ end
 ------------------------------------------------------------------
 -- 4) Kanten. Kosten sind SEKUNDEN.
 ------------------------------------------------------------------
-local function addEdge(a, b, kind, cost)
-    a.e[#a.e+1] = { to = b.id, k = kind, c = cost }
+-- Wasser und Schadensflaechen: Strafaufschlag auf jede Kante, die DORTHIN
+-- fuehrt. In Sekunden gerechnet entspricht das einem langen Umweg, also
+-- meidet A* sie zuverlaessig, ohne dass sie ganz unpassierbar werden.
+local DANGER_COST = 6.0
+local function addEdge(a, b, kind, cost, via)
+    if b.bad then cost = cost + DANGER_COST end
+    a.e[#a.e+1] = { to = b.id, k = kind, c = cost, via = via }
 end
 
 -- naechster Knoten zu einer Position, ueber das Raster
@@ -213,23 +226,40 @@ end
 -- gegenueber 88 % draussen — ganze Raeume hingen unverbunden im Graphen.
 -- Darum bei Blockade zusaetzlich quer versetzte Strahlen: findet den
 -- Durchgang auch dann, wenn er seitlich der Ideallinie liegt.
+-- Der Charakter ist rund 2 Studs breit und laeuft die Verbindungslinie
+-- entlang. Ein EINZELNER freier Strahl reicht deshalb nicht als Beweis:
+-- kommt nur ein seitlich versetzter Strahl durch, liegt die Oeffnung
+-- neben der Laufspur und der Bot rennt gegen die Wand — genau das war
+-- als "laeuft in Waende" sichtbar.
+-- Geprueft wird daher ein KORRIDOR aus drei parallelen Strahlen, die alle
+-- frei sein muessen. Ist er mittig blockiert, wird der Korridor seitlich
+-- verschoben; klappt es dort, liefert die Funktion diesen Versatz als
+-- Durchgangspunkt zurueck, den der Wegpunkt-Folger dann auch anlaeuft.
+local CORRIDOR = 1.15
+local function corridorFree(a, c, side, off)
+    local o = side * off
+    for _, w in ipairs({ 0, CORRIDOR, -CORRIDOR }) do
+        local shift = o + side * w
+        if cast(a + shift, (c + shift) - (a + shift)) then return false end
+    end
+    return true
+end
+
+-- Rueckgabe: begehbar?, optionaler Durchgangspunkt
 local function passable(a, c)
-    if not cast(a, c - a) then return true end
     local flat = (c - a) * Vector3.new(1, 0, 1)
-    if flat.Magnitude < 0.1 then return false end
+    if flat.Magnitude < 0.1 then return false, nil end
     local side = Vector3.new(-flat.Unit.Z, 0, flat.Unit.X)
-    -- quer versetzt UND auf mehreren Hoehen: eine Tuerschwelle blockiert
-    -- unten, ein Sturz oben, und die Oeffnung liegt selten mittig
-    for _, off in ipairs({ 0, 1.2, -1.2, 2.0, -2.0 }) do
-        for _, up in ipairs({ 0, -1.4, 1.2 }) do
-            if not (off == 0 and up == 0) then
-                local lift = Vector3.new(0, up, 0)
-                local a2, c2 = a + side * off + lift, c + side * off + lift
-                if not cast(a2, c2 - a2) then return true end
-            end
+    if corridorFree(a, c, side, 0) then return true, nil end
+    -- mittig zu, aber vielleicht gibt es daneben eine Tuer
+    for _, off in ipairs({ 1.6, -1.6, 2.6, -2.6 }) do
+        if corridorFree(a, c, side, off) then
+            -- Mitte des versetzten Korridors als Zwischenziel
+            local mid = (a + c) * 0.5 + side * off
+            return true, mid
         end
     end
-    return false
+    return false, nil
 end
 
 local function buildWalk(nodes, grid, prof)
@@ -244,24 +274,29 @@ local function buildWalk(nodes, grid, prof)
                     local dist = (o.p - n.p).Magnitude
                     local a = n.p + Vector3.new(0, 2.2, 0)
                     local c = o.p + Vector3.new(0, 2.2, 0)
-                    if math.abs(dy) <= CFG.stepUp then
-                        if passable(a, c) then
-                            addEdge(n, o, "walk", dist / prof.speed)
-                            walk = walk + 1
-                        end
+                    local okPass, via = passable(a, c)
+                    if not okPass then
+                        -- nichts
+                    elseif math.abs(dy) <= CFG.stepUp then
+                        addEdge(n, o, "walk", dist / prof.speed, via)
+                        walk = walk + 1
                     elseif dy > CFG.stepUp and dy <= prof.rise then
-                        -- Stufe hoch: braucht einen Sprung, ist aber kurz
-                        if passable(a, c) then
-                            addEdge(n, o, "hop", dist / prof.speed + 0.15)
+                        -- Stufe hoch: braucht einen Sprung, ist aber kurz.
+                        -- Ein Ueberhang ueber der Kante macht das unmoeglich:
+                        -- der Bot stoesst sich am Vorsprung den Kopf und
+                        -- rutscht wieder ab. Also pruefen, ob ueber dem
+                        -- Absprungpunkt ueberhaupt Platz zum Steigen ist.
+                        local headroom = not cast(n.p + Vector3.new(0, 1, 0),
+                                                  Vector3.new(0, dy + 4.5, 0))
+                        if headroom then
+                            addEdge(n, o, "hop", dist / prof.speed + 0.15, via)
                             hop = hop + 1
                         end
                     elseif dy < -CFG.stepUp and dy > -30 then
                         -- Stufe runter: einfach fallen lassen
-                        if passable(a, c) then
-                            addEdge(n, o, "step",
-                                    dist / prof.speed + math.sqrt(2 * math.abs(dy) / prof.g))
-                            step = step + 1
-                        end
+                        addEdge(n, o, "step",
+                                dist / prof.speed + math.sqrt(2 * math.abs(dy) / prof.g), via)
+                        step = step + 1
                     end
                 end
             end
@@ -350,7 +385,10 @@ local function buildJumpDrop(nodes, grid, cell, prof)
                             local flat = ((o.p - a.p) * Vector3.new(1,0,1)).Magnitude
                             local dy = o.p.Y - a.p.Y
                             if flat <= prof.reach * 0.9 and math.abs(dy) > CFG.stepUp then
-                                if dy > 0 and dy <= prof.rise and arcClear(a.p, o.p, prof) then
+                                if dy > 0 and dy <= prof.rise and arcClear(a.p, o.p, prof)
+                                   and not cast(a.p + Vector3.new(0, 1, 0),
+                                                Vector3.new(0, dy + 4.5, 0)) then
+                                    -- kein Ueberhang ueber dem Absprungpunkt
                                     addEdge(a, o, "jump", flat / prof.speed + 0.25)
                                     jumps = jumps + 1
                                 elseif dy < 0 then
@@ -543,8 +581,14 @@ function NAV.findPath(startPos, goalPos)
             if cur == t.id then
                 local path, at = {}, cur
                 while at do
-                    table.insert(path, 1, { node = nodes[at], kind = came[at] and came[at].k or "walk" })
-                    at = came[at] and came[at].from or nil
+                    local cm = came[at]
+                    table.insert(path, 1, { node = nodes[at], kind = cm and cm.k or "walk" })
+                    -- Durchgangspunkt einer Tuer: liegt neben der Luftlinie
+                    -- und muss eigens angelaufen werden
+                    if cm and cm.via then
+                        table.insert(path, 1, { node = { p = cm.via }, kind = "via" })
+                    end
+                    at = cm and cm.from or nil
                 end
                 return path, nil, visited
             end
@@ -553,7 +597,7 @@ function NAV.findPath(startPos, goalPos)
                 local ng = gScore[cur] + e.c
                 if not gScore[e.to] or ng < gScore[e.to] then
                     gScore[e.to] = ng
-                    came[e.to] = { from = cur, k = e.k }
+                    came[e.to] = { from = cur, k = e.k, via = e.via }
                     push(e.to, ng + h(nodes[e.to]))
                 end
             end
@@ -646,8 +690,13 @@ function NAV.load(mapName)
                         local f = string.split(chunk, ":")
                         local to = tonumber(f[1])
                         if to then
+                            local via
+                            if f[4] and f[5] and f[6] then
+                                via = Vector3.new(tonumber(f[4]) or 0, tonumber(f[5]) or 0,
+                                                  tonumber(f[6]) or 0)
+                            end
                             e[#e+1] = { to = to, k = CH2KIND[f[2]] or "walk",
-                                        c = tonumber(f[3]) or 1 }
+                                        c = tonumber(f[3]) or 1, via = via }
                         end
                     end
                 end
@@ -684,7 +733,11 @@ function NAV.save()
     for _, n in ipairs(G.nodes) do
         local es = {}
         for _, e in ipairs(n.e) do
-            es[#es+1] = e.to .. ":" .. (KIND2CH[e.k] or "w") .. ":" .. r2(e.c)
+            local s = e.to .. ":" .. (KIND2CH[e.k] or "w") .. ":" .. r2(e.c)
+            if e.via then
+                s = s .. ":" .. r1(e.via.X) .. ":" .. r1(e.via.Y) .. ":" .. r1(e.via.Z)
+            end
+            es[#es+1] = s
         end
         buf[#buf+1] = r1(n.p.X) .. "," .. r1(n.p.Y) .. "," .. r1(n.p.Z)
                       .. ">" .. table.concat(es, ",")

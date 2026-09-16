@@ -619,6 +619,10 @@ end
 ------------------------------------------------------------------
 
 ------------------------------------------------------------------
+
+------------------------------------------------------------------
+
+------------------------------------------------------------------
 -- 3c-2) EIGENER NAVIGATIONSGRAPH
 --     PathfindingService kennt keine der Fortbewegungsarten dieses
 --     Spiels (Wallrun, Zipline, Jumppad, Rail, SwingBar) und findet
@@ -762,7 +766,15 @@ do
                     if hit.Normal.Y >= cosLimit then
                         local foot = hit.Position + Vector3.new(0, 0.5, 0)
                         if not cast(foot, Vector3.new(0, CFG.agentHeight, 0)) then
-                            local nd = { p = foot, ix = ix, iz = iz, id = #nodes + 1, e = {} }
+                            -- Gefahrflaechen merken statt wegwerfen: der Weg
+                            -- darueber bleibt moeglich, kostet aber so viel, dass
+                            -- A* ihn nur nimmt, wenn es gar nicht anders geht.
+                            local inst, mat = hit.Instance, hit.Material
+                            local bad = (mat == Enum.Material.Water)
+                                or (inst and (inst:GetAttribute("Lava")
+                                              or inst:GetAttribute("ContactDamage")
+                                              or inst:GetAttribute("Acid"))) and true or false
+                            local nd = { p = foot, ix = ix, iz = iz, id = #nodes + 1, e = {}, bad = bad }
                             nodes[#nodes+1] = nd
                             local k = ix .. "," .. iz
                             local b = grid[k] ; if not b then b = {} grid[k] = b end
@@ -785,8 +797,13 @@ do
     ------------------------------------------------------------------
     -- 4) Kanten. Kosten sind SEKUNDEN.
     ------------------------------------------------------------------
-    local function addEdge(a, b, kind, cost)
-        a.e[#a.e+1] = { to = b.id, k = kind, c = cost }
+    -- Wasser und Schadensflaechen: Strafaufschlag auf jede Kante, die DORTHIN
+    -- fuehrt. In Sekunden gerechnet entspricht das einem langen Umweg, also
+    -- meidet A* sie zuverlaessig, ohne dass sie ganz unpassierbar werden.
+    local DANGER_COST = 6.0
+    local function addEdge(a, b, kind, cost, via)
+        if b.bad then cost = cost + DANGER_COST end
+        a.e[#a.e+1] = { to = b.id, k = kind, c = cost, via = via }
     end
     
     -- naechster Knoten zu einer Position, ueber das Raster
@@ -824,23 +841,40 @@ do
     -- gegenueber 88 % draussen — ganze Raeume hingen unverbunden im Graphen.
     -- Darum bei Blockade zusaetzlich quer versetzte Strahlen: findet den
     -- Durchgang auch dann, wenn er seitlich der Ideallinie liegt.
+    -- Der Charakter ist rund 2 Studs breit und laeuft die Verbindungslinie
+    -- entlang. Ein EINZELNER freier Strahl reicht deshalb nicht als Beweis:
+    -- kommt nur ein seitlich versetzter Strahl durch, liegt die Oeffnung
+    -- neben der Laufspur und der Bot rennt gegen die Wand — genau das war
+    -- als "laeuft in Waende" sichtbar.
+    -- Geprueft wird daher ein KORRIDOR aus drei parallelen Strahlen, die alle
+    -- frei sein muessen. Ist er mittig blockiert, wird der Korridor seitlich
+    -- verschoben; klappt es dort, liefert die Funktion diesen Versatz als
+    -- Durchgangspunkt zurueck, den der Wegpunkt-Folger dann auch anlaeuft.
+    local CORRIDOR = 1.15
+    local function corridorFree(a, c, side, off)
+        local o = side * off
+        for _, w in ipairs({ 0, CORRIDOR, -CORRIDOR }) do
+            local shift = o + side * w
+            if cast(a + shift, (c + shift) - (a + shift)) then return false end
+        end
+        return true
+    end
+    
+    -- Rueckgabe: begehbar?, optionaler Durchgangspunkt
     local function passable(a, c)
-        if not cast(a, c - a) then return true end
         local flat = (c - a) * Vector3.new(1, 0, 1)
-        if flat.Magnitude < 0.1 then return false end
+        if flat.Magnitude < 0.1 then return false, nil end
         local side = Vector3.new(-flat.Unit.Z, 0, flat.Unit.X)
-        -- quer versetzt UND auf mehreren Hoehen: eine Tuerschwelle blockiert
-        -- unten, ein Sturz oben, und die Oeffnung liegt selten mittig
-        for _, off in ipairs({ 0, 1.2, -1.2, 2.0, -2.0 }) do
-            for _, up in ipairs({ 0, -1.4, 1.2 }) do
-                if not (off == 0 and up == 0) then
-                    local lift = Vector3.new(0, up, 0)
-                    local a2, c2 = a + side * off + lift, c + side * off + lift
-                    if not cast(a2, c2 - a2) then return true end
-                end
+        if corridorFree(a, c, side, 0) then return true, nil end
+        -- mittig zu, aber vielleicht gibt es daneben eine Tuer
+        for _, off in ipairs({ 1.6, -1.6, 2.6, -2.6 }) do
+            if corridorFree(a, c, side, off) then
+                -- Mitte des versetzten Korridors als Zwischenziel
+                local mid = (a + c) * 0.5 + side * off
+                return true, mid
             end
         end
-        return false
+        return false, nil
     end
     
     local function buildWalk(nodes, grid, prof)
@@ -855,24 +889,29 @@ do
                         local dist = (o.p - n.p).Magnitude
                         local a = n.p + Vector3.new(0, 2.2, 0)
                         local c = o.p + Vector3.new(0, 2.2, 0)
-                        if math.abs(dy) <= CFG.stepUp then
-                            if passable(a, c) then
-                                addEdge(n, o, "walk", dist / prof.speed)
-                                walk = walk + 1
-                            end
+                        local okPass, via = passable(a, c)
+                        if not okPass then
+                            -- nichts
+                        elseif math.abs(dy) <= CFG.stepUp then
+                            addEdge(n, o, "walk", dist / prof.speed, via)
+                            walk = walk + 1
                         elseif dy > CFG.stepUp and dy <= prof.rise then
-                            -- Stufe hoch: braucht einen Sprung, ist aber kurz
-                            if passable(a, c) then
-                                addEdge(n, o, "hop", dist / prof.speed + 0.15)
+                            -- Stufe hoch: braucht einen Sprung, ist aber kurz.
+                            -- Ein Ueberhang ueber der Kante macht das unmoeglich:
+                            -- der Bot stoesst sich am Vorsprung den Kopf und
+                            -- rutscht wieder ab. Also pruefen, ob ueber dem
+                            -- Absprungpunkt ueberhaupt Platz zum Steigen ist.
+                            local headroom = not cast(n.p + Vector3.new(0, 1, 0),
+                                                      Vector3.new(0, dy + 4.5, 0))
+                            if headroom then
+                                addEdge(n, o, "hop", dist / prof.speed + 0.15, via)
                                 hop = hop + 1
                             end
                         elseif dy < -CFG.stepUp and dy > -30 then
                             -- Stufe runter: einfach fallen lassen
-                            if passable(a, c) then
-                                addEdge(n, o, "step",
-                                        dist / prof.speed + math.sqrt(2 * math.abs(dy) / prof.g))
-                                step = step + 1
-                            end
+                            addEdge(n, o, "step",
+                                    dist / prof.speed + math.sqrt(2 * math.abs(dy) / prof.g), via)
+                            step = step + 1
                         end
                     end
                 end
@@ -961,7 +1000,10 @@ do
                                 local flat = ((o.p - a.p) * Vector3.new(1,0,1)).Magnitude
                                 local dy = o.p.Y - a.p.Y
                                 if flat <= prof.reach * 0.9 and math.abs(dy) > CFG.stepUp then
-                                    if dy > 0 and dy <= prof.rise and arcClear(a.p, o.p, prof) then
+                                    if dy > 0 and dy <= prof.rise and arcClear(a.p, o.p, prof)
+                                       and not cast(a.p + Vector3.new(0, 1, 0),
+                                                    Vector3.new(0, dy + 4.5, 0)) then
+                                        -- kein Ueberhang ueber dem Absprungpunkt
                                         addEdge(a, o, "jump", flat / prof.speed + 0.25)
                                         jumps = jumps + 1
                                     elseif dy < 0 then
@@ -1154,8 +1196,14 @@ do
                 if cur == t.id then
                     local path, at = {}, cur
                     while at do
-                        table.insert(path, 1, { node = nodes[at], kind = came[at] and came[at].k or "walk" })
-                        at = came[at] and came[at].from or nil
+                        local cm = came[at]
+                        table.insert(path, 1, { node = nodes[at], kind = cm and cm.k or "walk" })
+                        -- Durchgangspunkt einer Tuer: liegt neben der Luftlinie
+                        -- und muss eigens angelaufen werden
+                        if cm and cm.via then
+                            table.insert(path, 1, { node = { p = cm.via }, kind = "via" })
+                        end
+                        at = cm and cm.from or nil
                     end
                     return path, nil, visited
                 end
@@ -1164,7 +1212,7 @@ do
                     local ng = gScore[cur] + e.c
                     if not gScore[e.to] or ng < gScore[e.to] then
                         gScore[e.to] = ng
-                        came[e.to] = { from = cur, k = e.k }
+                        came[e.to] = { from = cur, k = e.k, via = e.via }
                         push(e.to, ng + h(nodes[e.to]))
                     end
                 end
@@ -1257,8 +1305,13 @@ do
                             local f = string.split(chunk, ":")
                             local to = tonumber(f[1])
                             if to then
+                                local via
+                                if f[4] and f[5] and f[6] then
+                                    via = Vector3.new(tonumber(f[4]) or 0, tonumber(f[5]) or 0,
+                                                      tonumber(f[6]) or 0)
+                                end
                                 e[#e+1] = { to = to, k = CH2KIND[f[2]] or "walk",
-                                            c = tonumber(f[3]) or 1 }
+                                            c = tonumber(f[3]) or 1, via = via }
                             end
                         end
                     end
@@ -1295,7 +1348,11 @@ do
         for _, n in ipairs(G.nodes) do
             local es = {}
             for _, e in ipairs(n.e) do
-                es[#es+1] = e.to .. ":" .. (KIND2CH[e.k] or "w") .. ":" .. r2(e.c)
+                local s = e.to .. ":" .. (KIND2CH[e.k] or "w") .. ":" .. r2(e.c)
+                if e.via then
+                    s = s .. ":" .. r1(e.via.X) .. ":" .. r1(e.via.Y) .. ":" .. r1(e.via.Z)
+                end
+                es[#es+1] = s
             end
             buf[#buf+1] = r1(n.p.X) .. "," .. r1(n.p.Y) .. "," .. r1(n.p.Z)
                           .. ">" .. table.concat(es, ",")
@@ -1397,6 +1454,7 @@ local KIND_COLOR = {
     drop    = Color3.fromRGB( 70, 150, 255),
     climb   = Color3.fromRGB(190,  90, 255),
     zip     = Color3.fromRGB( 60, 230, 230),
+    via     = Color3.fromRGB(255, 255,  90),
     pad     = Color3.fromRGB(255,  90, 200),
     wallrun = Color3.fromRGB(255,  70,  70),
 }
@@ -1482,15 +1540,162 @@ local function chasePoint(pos, preyPl)
     return CHASE.point
 end
 
+------------------------------------------------------------------
+-- FEHLERERKENNUNG
+--     Jede Art, wie das Abfahren eines Weges scheitern kann, bekommt
+--     einen eigenen Zaehler. Ohne diese Trennung sieht man nur "der Bot
+--     haengt" und raet beim Beheben.
+------------------------------------------------------------------
+local FAIL = {
+    counts = {}, last = {}, recent = {},
+    seg = { sum = 0, n = 0, max = 0 },     -- Abweichung vom Sollweg
+}
+ENV.fail = FAIL
+
+local function failNote(kind, detail)
+    FAIL.counts[kind] = (FAIL.counts[kind] or 0) + 1
+    local now = tick()
+    FAIL.recent[#FAIL.recent + 1] = { t = now, kind = kind, detail = detail }
+    if #FAIL.recent > 60 then table.remove(FAIL.recent, 1) end
+    -- entprellt ins Log, sonst flutet ein Dauerfehler die Datei
+    if not FAIL.last[kind] or now - FAIL.last[kind] > 6 then
+        FAIL.last[kind] = now
+        LOG(("FEHLER %s (%d.) %s"):format(kind, FAIL.counts[kind], detail or ""))
+    end
+end
+
+-- Laufender Zustand fuer die Erkennung
+local WATCH = { pos = nil, at = 0, movedAt = 0, idx = nil, idxAt = 0,
+                kind = nil, kindAt = 0, kindY = nil, jumpAt = 0, jumpY = nil,
+                lastY = nil, hadPath = false }
+
+local function failTick(pos, hum, goalActive)
+    local now = tick()
+    local wps, idx = PATH.wps, PATH.idx
+
+    -- 1) STECKENGEBLIEBEN: will laufen, kommt aber nicht vom Fleck
+    if WATCH.pos then
+        local moved = ((pos - WATCH.pos) * Vector3.new(1, 0, 1)).Magnitude
+        if moved > 1.0 then WATCH.movedAt = now end
+        if goalActive and now - WATCH.movedAt > 1.5 then
+            failNote("steckt", ("%.1f s ohne Fortschritt"):format(now - WATCH.movedAt))
+            WATCH.movedAt = now
+        end
+    else
+        WATCH.movedAt = now
+    end
+
+    -- 2) ABWEICHUNG vom Sollweg: wie weit laeuft er neben dem Pfad her?
+    if wps and idx and idx > 1 and wps[idx] and wps[idx - 1] then
+        local a = wps[idx - 1].Position * Vector3.new(1, 0, 1)
+        local b = wps[idx].Position * Vector3.new(1, 0, 1)
+        local ab = b - a
+        if ab.Magnitude > 0.1 then
+            local p2 = pos * Vector3.new(1, 0, 1)
+            local t = math.clamp((p2 - a):Dot(ab.Unit) / ab.Magnitude, 0, 1)
+            local dev = (p2 - (a + ab * t)).Magnitude
+            -- Respawn oder Rundenwechsel setzt den Charakter irgendwohin,
+            -- waehrend der alte Weg noch steht. Solche Spruenge sind kein
+            -- Pfadfehler und wuerden den Schnitt unbrauchbar machen
+            -- (gemessen einmal 2138 Studs).
+            if dev > 100 then
+                PATH.wps = nil
+            else
+                FAIL.seg.sum = FAIL.seg.sum + dev
+                FAIL.seg.n = FAIL.seg.n + 1
+                if dev > FAIL.seg.max then FAIL.seg.max = dev end
+                if dev > 10 then
+                    failNote("abgekommen", ("%.0f Studs neben dem Weg"):format(dev))
+                end
+            end
+        end
+    end
+
+    -- 3) WEGPUNKT HAENGT: derselbe Index viel zu lange
+    if wps and idx then
+        if WATCH.idx ~= idx then WATCH.idx, WATCH.idxAt = idx, now
+        elseif now - WATCH.idxAt > 4 then
+            local wp = wps[idx]
+            failNote("wegpunkt_haengt",
+                ("Art %s, %.0f Studs flach / %.0f hoch"):format(
+                    tostring(wp and wp.kind),
+                    wp and ((wp.Position - pos) * Vector3.new(1,0,1)).Magnitude or -1,
+                    wp and (wp.Position.Y - pos.Y) or 0))
+            WATCH.idxAt = now
+        end
+    end
+
+    -- 4) KANTENARTEN, die ihr Versprechen nicht halten
+    local curKind = (wps and idx and wps[idx]) and wps[idx].kind or nil
+    if curKind ~= WATCH.kind then
+        WATCH.kind, WATCH.kindAt, WATCH.kindY = curKind, now, pos.Y
+    elseif curKind and now - WATCH.kindAt > 2.5 then
+        local gained = pos.Y - (WATCH.kindY or pos.Y)
+        local climbing = (hum and hum:GetState() == Enum.HumanoidStateType.Climbing)
+                         or RENV.shared.touchingTruss
+        if curKind == "climb" and not climbing and gained < 3 then
+            failNote("klettern_greift_nicht",
+                ("seit %.1f s an der Leiter, %.0f Studs gewonnen"):format(now - WATCH.kindAt, gained))
+        elseif (curKind == "hop" or curKind == "jump") and gained < 1 then
+            failNote("sprung_ohne_hoehe",
+                ("Art %s, %.1f s, %.0f Studs"):format(curKind, now - WATCH.kindAt, gained))
+        end
+        WATCH.kindAt, WATCH.kindY = now, pos.Y
+    end
+
+    -- 5) PFAD VERLOREN, obwohl das Ziel noch weit weg ist
+    if WATCH.hadPath and not wps then
+        local tgt = PATH.target
+        if tgt and (tgt - pos).Magnitude > 12 then
+            failNote("pfad_verloren", ("%.0f Studs vom Ziel"):format((tgt - pos).Magnitude))
+        end
+    end
+    WATCH.hadPath = wps ~= nil
+
+    -- 6) STURZ: viel Hoehe verloren, ohne dass ein Abstieg geplant war
+    if WATCH.lastY then
+        local drop = WATCH.lastY - pos.Y
+        if drop > 22 and curKind ~= "drop" and curKind ~= "step" then
+            failNote("sturz", ("%.0f Studs gefallen (Art %s)"):format(drop, tostring(curKind)))
+        end
+    end
+    WATCH.lastY = pos.Y
+    WATCH.pos, WATCH.at = pos, now
+end
+
 local computeEngine        -- weiter unten definiert
+-- Sichtlinie fuer die Glaettung: derselbe Korridor-Gedanke wie beim Backen,
+-- denn was der Bot faehrt, muss fuer seine Breite frei sein.
+local smoothRP = RaycastParams.new()
+smoothRP.FilterType = Enum.RaycastFilterType.Exclude
+smoothRP.RespectCanCollide = true
+local function lineFree(a, b)
+    local ign = { workspace.CurrentCamera }
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if pl.Character then ign[#ign + 1] = pl.Character end
+    end
+    local vis = workspace:FindFirstChild("UTG_PathVis")
+    if vis then ign[#ign + 1] = vis end
+    smoothRP.FilterDescendantsInstances = ign
+    local flat = (b - a) * Vector3.new(1, 0, 1)
+    if flat.Magnitude < 0.1 then return true end
+    local side = Vector3.new(-flat.Unit.Z, 0, flat.Unit.X)
+    for _, w in ipairs({ 0, 1.15, -1.15 }) do
+        local o = side * w + Vector3.new(0, 2.2, 0)
+        if workspace:Raycast(a + o, (b + o) - (a + o), smoothRP) then return false end
+    end
+    return true
+end
+
 local function computeGraph(fromPos, toPos)
     if not NAV.graph then return nil end
     local ok, path = pcall(NAV.findPath, fromPos, toPos)
     if not ok or type(path) ~= "table" or #path < 2 then return nil end
-    local wps = {}
+
+    local raw = {}
     for i, step in ipairs(path) do
         local kind = step.kind
-        wps[i] = {
+        raw[i] = {
             Position = step.node.p,
             Action = (kind == "jump" or kind == "pad" or kind == "hop")
                      and Enum.PathWaypointAction.Jump
@@ -1498,7 +1703,13 @@ local function computeGraph(fromPos, toPos)
             kind = kind,
         }
     end
-    return wps
+
+    -- Ein Glaettungsversuch (aufeinanderfolgende Gehpunkte bei freier Sicht
+    -- zusammenfassen) hat die Abweichung vom Sollweg NICHT verbessert,
+    -- sondern von 5.5 auf 6.3 Studs verschlechtert und "abgekommen" von 408
+    -- auf 720 Meldungen getrieben: zusammengefasst wurde auch ueber Ecken
+    -- hinweg. Bis das sauber funktioniert, bleiben die Rohpunkte.
+    return raw
 end
 
 -- Beide Verfahren, jedes fuer das, was es nachweislich kann. Gemessen auf
@@ -1578,6 +1789,7 @@ local function requestPath(fromPos, candidates)
         else
             PATH.wps, PATH.fails = nil, PATH.fails + 1
             PATH.at = tick()
+            failNote("kein_weg", ("%d Kandidaten erfolglos"):format(#candidates))
             PATH.nextAllowed = tick() + math.min(1.5 + PATH.fails * 0.5, 6)
             if PATH.fails % 5 == 1 then
                 LOG(("Pfad nicht berechenbar (%d. Mal) — es laeuft die direkte Steuerung"):format(PATH.fails))
@@ -1617,16 +1829,37 @@ local function followPath(pos)
             -- wurde — der Bot laeuft dann unten daran vorbei.
             reached = flat.Magnitude < 5.0 and dy < 5
         else
-            reached = flat.Magnitude < 3.0 and dy < 12
+            -- Die Hoehentoleranz muss ASYMMETRISCH sein. Mit einem
+            -- symmetrischen Fenster von 12 Studs hakt der Bot einen
+            -- Wegpunkt ab, der ueber ihm liegt — unter einer Treppe ist
+            -- die XZ-Position ja dieselbe wie oben darauf. Er gilt dann als
+            -- angekommen, ohne je hochgelaufen zu sein, und springt danach
+            -- gegen die Unterseite der Treppe.
+            -- Nach OBEN daher nur 4 Studs (eine Stufe), nach UNTEN weiter
+            -- 12, weil Fallen erlaubt ist und er sonst beim Absteigen klebt.
+            local up = wp.Position.Y - pos.Y
+            local heightOk = up < 4 and up > -12
+            reached = flat.Magnitude < 3.0 and heightOk
             -- oder schon daran vorbei: hinter der Ebene senkrecht zum Wegstueck
-            if not reached and PATH.idx > 1 and flat.Magnitude < 7.2 and dy < 12 then
+            if not reached and PATH.idx > 1 and flat.Magnitude < 7.2 and heightOk then
                 local seg = (wp.Position - wps[PATH.idx - 1].Position) * Vector3.new(1, 0, 1)
                 if seg.Magnitude > 0.1 and seg.Unit:Dot(-flat) > 0 then reached = true end
             end
-            -- Notausgang: haengt er eine halbe Sekunde am selben Punkt und ist
-            -- horizontal laengst da, gilt der Punkt als erledigt
+            -- Notausgang: haengt er eine halbe Sekunde am selben Punkt und
+            -- ist horizontal laengst da, gilt der Punkt als erledigt.
+            -- NICHT aber, wenn der Punkt ueber ihm liegt — dann steht er
+            -- darunter (der Treppenfall) und Ueberspringen macht es
+            -- schlimmer, weil der Weg danach durch die Decke zeigt.
+            -- Stattdessen den Weg verwerfen und von der tatsaechlichen
+            -- Position neu planen.
             if not reached and flat.Magnitude < 7.2
                and now - (PATH.idxAt or now) > 0.5 then
+                if up >= 4 then
+                    failNote("unter_dem_weg",
+                        ("Wegpunkt %.0f Studs ueber dem Bot, neu geplant"):format(up))
+                    PATH.wps, PATH.at = nil, 0
+                    return nil
+                end
                 reached = true
             end
         end
@@ -1660,6 +1893,36 @@ local function followPath(pos)
         end
         if best then
             AP.ladder = best
+            -- Eine Leiter hat vier Seiten, aber meist stehen ein bis drei
+            -- davon an einer Wand. Haelt man auf die Mitte zu, landet man
+            -- genau dort und rutscht seitlich daran herum, ohne zu greifen.
+            -- Also erst die freie Seite bestimmen, sie anlaufen, und von
+            -- dort auf die Leiter zuhalten — nur so trifft der Blickstrahl
+            -- des Spiels den TrussPart.
+            local cf = best.CFrame
+            local half = math.max(best.Size.X, best.Size.Z) * 0.5
+            local anchor, aDist
+            for _, dir in ipairs({ cf.LookVector, -cf.LookVector,
+                                   cf.RightVector, -cf.RightVector }) do
+                local flatDir = (dir * Vector3.new(1, 0, 1))
+                if flatDir.Magnitude > 0.1 then
+                    flatDir = flatDir.Unit
+                    local probe = best.Position + flatDir * (half + 3.5)
+                    -- Seite frei? (nichts zwischen Leiter und Standplatz)
+                        local blocked = workspace:Raycast(
+                            best.Position + Vector3.new(0, 1, 0),
+                            flatDir * (half + 3.5), AP.rp)
+                        if not blocked then
+                            local d = ((probe - pos) * Vector3.new(1, 0, 1)).Magnitude
+                            if not aDist or d < aDist then anchor, aDist = probe, d end
+                        end
+                end
+            end
+            if anchor and aDist and aDist > 3.5 then
+                -- noch nicht auf der richtigen Seite: erst dorthin
+                local v = (anchor - pos) * Vector3.new(1, 0, 1)
+                if v.Magnitude > 0.1 then return v.Unit end
+            end
             local v = (best.Position - pos) * Vector3.new(1, 0, 1)
             if v.Magnitude > 0.1 then return v.Unit end
         end
@@ -1702,6 +1965,31 @@ local function followPath(pos)
     end
     local dir = (wp.Position - pos) * Vector3.new(1, 0, 1)
     if dir.Magnitude < 0.1 then return nil end
+
+    -- KURVE VORWEGNEHMEN. Der Bot dreht hoechstens 330 Grad/s und laeuft
+    -- 32 Studs/s — sein engster fahrbarer Kurvenradius ist damit 5.6 Studs.
+    -- Zielt er stur auf den aktuellen Wegpunkt, kann er erst einlenken,
+    -- wenn er schon darueber hinaus ist; an einer Dachkante bedeutet das
+    -- Absturz. Also wird ab 7 Studs Naehe die Richtung zum naechsten Punkt
+    -- eingemischt, zunehmend staerker je naeher er kommt.
+    -- Ausgenommen sind Punkte, an denen die Position genau stimmen muss:
+    -- Leiter, Zipline, Jumppad und Tuerdurchgaenge.
+    local nxt = wps[PATH.idx + 1]
+    local exact = (wp.kind == "climb" or wp.kind == "zip"
+                   or wp.kind == "pad" or wp.kind == "via")
+    if nxt and not exact and dir.Magnitude < 7 then
+        local nextExact = (nxt.kind == "climb" or nxt.kind == "zip"
+                           or nxt.kind == "pad" or nxt.kind == "via")
+        local d2 = (nxt.Position - pos) * Vector3.new(1, 0, 1)
+        -- nicht ueber einen Absprung hinweg mischen: der Sprung braucht
+        -- die volle Richtung auf seinen eigenen Punkt
+        local jumpNext = (nxt.Action == Enum.PathWaypointAction.Jump)
+        if d2.Magnitude > 0.1 and not nextExact and not jumpNext then
+            local blend = math.clamp((1 - dir.Magnitude / 7) * 0.6, 0, 0.6)
+            local mixed = dir.Unit * (1 - blend) + d2.Unit * blend
+            if mixed.Magnitude > 0.05 then return mixed.Unit end
+        end
+    end
     return dir.Unit
 end
 
@@ -3312,6 +3600,8 @@ local function autopilotStep(threat, threatD, prey, preyD)
         PATH.wps = nil
     end
 
+    pcall(failTick, pos, hum, goal ~= nil)
+
     -- AUSBRUCH: steckt er beim Jagen in einer Kammer/Hoehle fest (kein Pfad,
     -- Luftlinie blockiert, kaum Auswege), hat das Rauskommen Vorrang vor dem
     -- Ziel — sonst rennt er dauerhaft gegen die Innenwand.
@@ -3409,6 +3699,16 @@ local function autopilotStep(threat, threatD, prey, preyD)
             local ak3 = math.clamp(CFG.ankles or 3, 0, 10)
             -- Grad pro Sekunde: normal zuegig, beim Haken deutlich schneller
             local degPerSec = juking3 and (780 + ak3 * 45) or (330 + ak3 * 30)
+            -- Beim Abfahren eines berechneten Weges gibt es KEINE
+            -- Drehbegrenzung mehr. Sie existierte nur, damit die Bewegung
+            -- menschlich aussieht — aber bei 420 Grad/s und 32 Studs/s ist
+            -- der engste fahrbare Kurvenradius 4.4 Studs, waehrend die
+            -- Wegpunkte im Rasterabstand von 4 bis 6 stehen. Der Bot konnte
+            -- die Kurven schlicht nicht fahren, schnitt sie ab und driftete
+            -- gemessen 4 bis 8 Studs neben den Weg — bei hohem Tempo mehr.
+            if AP.usingPath and not juking3 then
+                degPerSec = 100000
+            end
             local maxRad = math.rad(degPerSec) * dtT
             local dot = math.clamp(cur:Dot(dir), -1, 1)
             local ang = math.acos(dot)
