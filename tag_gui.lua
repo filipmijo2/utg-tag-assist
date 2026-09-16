@@ -48,7 +48,7 @@ local CFG = {
     -- AYIP: 0 = aus, 1/2/3 = Juke-Stufen (entspricht frueher Ankles 6 / 8 / 10)
     ayip        = 0,   -- aus = altes Standardverhalten
     -- Mindestabstand fuer Finten: fest, der Regler dafuer ist entfallen
-    feintDist   = 19,
+    feintDist   = 25,
     thirdPerson = false,   -- Taste T
     preset      = 3,       -- fest auf Maximum (kein Umschalten mehr)
 }
@@ -2918,46 +2918,44 @@ end
 
 local JUKE_MOVES = {
     -- 180 Grad antaeuschen und sofort wieder zurueck
-    {   name = "double180", cd = 3, minLevel = 1, maxD = 22,
+    {   name = "double180", cd = 3, minLevel = 1, maxD = 25,
         init = function(ctx, m)
             m.back = ctx.facing
-            -- nicht stumpf kehrt, sondern schraeg zurueck: haelt Tempo
-            local side = Vector3.new(-ctx.facing.Z, 0, ctx.facing.X)
-            local s = (math.random() < 0.5) and 1 or -1
-            -- Mehr seitlich als rueckwaerts: das Spiel setzt Momentum auf 0,
-            -- sobald die Seitgeschwindigkeit unter 6.8 faellt. Eine echte
-            -- Kehrtwende tut genau das. Ein weiter Bogen dreht ebenso um,
-            -- haelt aber das Tempo.
-            m.fake = (-ctx.facing * 0.55 + side * s * 1.15).Unit
+            m.s = (math.random() < 0.5) and 1 or -1
         end,
         run = function(ctx, m, t)
-            -- Laenger durchziehen: bei 32 Studs/s sind 0.32 s nur 10 Studs,
-            -- das kauft einem kein Verfolger ab. Erst weglaufen lassen,
-            -- dann kehren.
-            if t < 0.55 then return m.fake end
+            -- Kreisfoermig aufziehen statt sofort kehrt: erst seitlich weg,
+            -- dann zunehmend nach hinten. Das haelt das Tempo (das Spiel
+            -- setzt Momentum auf 0, sobald die Seitgeschwindigkeit unter
+            -- 6.8 faellt) und sieht aus wie ein Bogen statt wie ein Knick.
+            if t < 0.55 then
+                local p = t / 0.55
+                return turn(ctx.facing, m.s * (75 + 95 * p))
+            end
             if t < 1.25 then return m.back end
             return nil
         end },
 
     -- 180 Grad wirklich durchziehen und am Verfolger vorbeilaufen
-    {   name = "commit180", cd = 3, minLevel = 2, maxD = 20,
+    {   name = "commit180", cd = 3, minLevel = 2, maxD = 23,
         init = function(ctx, m)
-            -- schraeg an ihm vorbei statt frontal auf ihn zu, und mit
-            -- Vorwaertsanteil, damit das Tempo erhalten bleibt
-            local s = (math.random() < 0.5) and 1 or -1
-            local side = Vector3.new(-ctx.facing.Z, 0, ctx.facing.X) * s
-            -- ebenfalls als Bogen, nicht als Kehrtwende (siehe double180)
-            m.dir = (-ctx.facing * 0.5 + side * 1.2).Unit
+            m.s = (math.random() < 0.5) and 1 or -1
         end,
         run = function(ctx, m, t)
-            -- richtig committen: einmal 180 und dann auch dabei bleiben
-            if t < 1.7 then return m.dir end
+            -- Erst seitlich anreissen, dann kreisfoermig hinter den
+            -- Verfolger aufdrehen und dort bleiben. Ein sofortiger
+            -- 180er wuerde ihn ausbremsen.
+            if t < 0.6 then
+                local p = t / 0.6
+                return turn(ctx.facing, m.s * (70 + 85 * p))
+            end
+            if t < 1.7 then return turn(ctx.facing, m.s * 155) end
             return nil
         end },
 
     -- Knoechelbrecher: 12 Uhr -> 9 Uhr -> 3 Uhr, ab Stufe 2 auch
     -- zurueck auf 9 Uhr und dort bleiben
-    {   name = "ankleBreaker", cd = 3, minLevel = 1, maxD = 24,
+    {   name = "ankleBreaker", cd = 3, minLevel = 1, maxD = 25,
         init = function(ctx, m)
             -- Seitwaerts MIT Vorwaertsanteil, so wie es die alte Mechanik
             -- gemacht hat: ein harter 85-Grad-Knick bremst den Bot aus und
@@ -2981,7 +2979,7 @@ local JUKE_MOVES = {
 
     -- Kanten-Finte: an der Klippe abspringen und im selben Sprung
     -- wieder auf dem Ausgangspunkt landen
-    {   name = "bamboozle", cd = 5, minLevel = 2, maxD = 24, mapMove = true,
+    {   name = "bamboozle", cd = 5, minLevel = 2, maxD = 25, mapMove = true,
         ready = function(ctx)
             local near = groundAt(ctx.pos, ctx.facing, 4, 10)
             local far = groundAt(ctx.pos, ctx.facing, 11, 14)
@@ -3027,7 +3025,7 @@ local JUKE_MOVES = {
         end },
 
     -- Rollfinte: waehrend der Rolle die Richtung wechseln
-    {   name = "rollFeint", cd = 3, minLevel = 1, maxD = 22,
+    {   name = "rollFeint", cd = 3, minLevel = 1, maxD = 25,
         init = function(ctx, m)
             m.dir = turn(ctx.facing, (math.random() < 0.5) and 70 or -70)
             m.fired = false
@@ -3105,6 +3103,16 @@ local function jukeStep(pos, facing, toThreat, threatD, level)
         end
         local dir = a.def.run(ctx, a, now - a.t0)
         if dir then
+            -- Keine Finte in eine Wand: das kostet das gesamte Tempo und
+            -- bringt nichts. Ist die Richtung zu, wird abgebrochen statt
+            -- dagegenzulaufen.
+            if rayClear(pos, dir, 2.4, 9) < 0.7 then
+                JUKE.cd[a.def.name] = now
+                JUKE.lastAny = now
+                JUKE.wallAborts = (JUKE.wallAborts or 0) + 1
+                JUKE.active, AP.jukeName = nil, nil
+                return nil
+            end
             AP.jukeName = a.def.name
             return dir
         end
@@ -3118,7 +3126,7 @@ local function jukeStep(pos, facing, toThreat, threatD, level)
     if now - JUKE.lastAny < jukeGap(level) then return nil end
     -- Nur in spuerbarer Naehe finten. Weiter weg sieht es niemand, kostet
     -- aber Strecke - und der Verfolger hat Zeit, die Abkuerzung zu nehmen.
-    if threatD > 24 then return nil end
+    if threatD > 25 then return nil end
     -- Und nur vom BODEN aus starten: in der Luft laesst sich die Richtung
     -- kaum aendern, das Manoever verpufft dann wirkungslos. Die Spruenge
     -- innerhalb von bamboozle und stairJuke sind davon unberuehrt, weil
@@ -3154,6 +3162,14 @@ local function jukeStep(pos, facing, toThreat, threatD, level)
     end
     local m = { def = def, t0 = now }
     if def.init then def.init(ctx, m) end
+    -- Startrichtung vorab pruefen, damit das Manoever gar nicht erst in
+    -- eine Wand beginnt
+    local first = def.run(ctx, m, 0)
+    if first and rayClear(pos, first, 2.4, 9) < 0.7 then
+        JUKE.cd[def.name] = now
+        JUKE.wallAborts = (JUKE.wallAborts or 0) + 1
+        return nil
+    end
     JUKE.active = m
     JUKE.count = JUKE.count + 1
     JUKE.log[def.name] = (JUKE.log[def.name] or 0) + 1
