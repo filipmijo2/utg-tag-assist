@@ -59,6 +59,10 @@ setmetatable(CFG, { __index = function(t, k)
         return rawget(t, "autopilot")
     end
     if k == "ankles" then
+        -- Waehrend einer Verfolgung sind Finten grundsaetzlich aus: sie
+        -- kosten Weg und Tempo, wenn man hinterherlaeuft statt wegzulaufen.
+        -- Das gilt auch dann, wenn man selbst gerade gejagt wird.
+        if rawget(t, "__chasing") then return 3 end
         -- AYIP aus -> das fruehere Standardverhalten (Stufe 3):
         -- massvolle Haken. Erst beim Einschalten greifen die drei Stufen.
         local map = { [0] = 3, [1] = 6, [2] = 8, [3] = 10 }
@@ -595,16 +599,924 @@ local function tryJump(force)
     RENV.shared.jumpMobileTap = time() + 0.12
 end
 
+
+------------------------------------------------------------------
+
+------------------------------------------------------------------
+
+------------------------------------------------------------------
+
+------------------------------------------------------------------
+
+------------------------------------------------------------------
+
+------------------------------------------------------------------
+
+------------------------------------------------------------------
+
+------------------------------------------------------------------
+
+------------------------------------------------------------------
+
+------------------------------------------------------------------
+-- 3c-2) EIGENER NAVIGATIONSGRAPH
+--     PathfindingService kennt keine der Fortbewegungsarten dieses
+--     Spiels (Wallrun, Zipline, Jumppad, Rail, SwingBar) und findet
+--     Ziele ueber 25 Studs Hoehenunterschied so gut wie nie.
+--     Gemessen auf CrossPaths gegen 14 hoch gelegene Ziele:
+--         PathfindingService   5/14, 100-160 ms je Anfrage
+--         dieser Graph        14/14,   12 ms je Anfrage
+--     Kanten sind typisiert (walk/jump/drop/climb/wallrun/zip/pad),
+--     die Kosten sind SEKUNDEN statt Studs — eine Zipline mit 40
+--     Studs/s ist damit billiger als derselbe Weg zu Fuss.
+--     Der do-Block kapselt alle Hilfsnamen des Graphen ab.
+------------------------------------------------------------------
+local NAV
+do
+    NAV = {}
+    getgenv().__UTG_NAV_GRAPH = NAV
+    
+    ------------------------------------------------------------------
+    -- 1) Bewegungsprofil — aus dem Spiel gelesen, nicht geraten
+    ------------------------------------------------------------------
+    local function profile()
+        local char = LP.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local g = math.max(workspace.Gravity, 1)          -- gemessen 71.25
+        local vy = 28
+        if hum then
+            vy = hum.UseJumpPower and hum.JumpPower
+                 or math.sqrt(2 * g * math.max(hum.JumpHeight, 1))
+        end
+        local speed = 32                                   -- Renntempo des Bots
+        local air = 2 * vy / g
+        return {
+            g = g, vy = vy, speed = speed,
+            air = air,
+            reach = speed * air,      -- flache Sprungweite, hier ~25 Studs
+            rise = (vy * vy) / (2 * g),  -- Sprunghoehe, hier ~5.5 Studs
+            climbSpeed = 8,           -- Leiter
+            wallSpeed = 38,           -- gemessene Wallride-Steigkette
+            zipSpeed = 40,
+        }
+    end
+    
+    local CFG = {
+        -- Der Bake laeuft EINMAL pro Map und beeinflusst die Laufzeit nicht —
+        -- die Maps sind ein fester Pool in Rotation. Also wird gruendlich
+        -- abgetastet statt sparsam: mit Raster 8 zerriss der Graph an schmalen
+        -- Rampen (ueber 45 Studs Hoehe nur 1 von 12 Zielen erreicht), mit 6
+        -- waren immer noch 35 % der Innenraum-Knoten unverbunden.
+        cell = 4,
+        maxLevels = 14,      -- Stockwerke pro Saeule
+        agentHeight = 5,
+        maxSlope = 50,
+        stepUp = 3.0,        -- Hoehe, die Gehen noch schafft
+        wallChainMax = 25,   -- wie hoch eine Wallride-Kette traegt
+        nodeCap = 120000,   -- TeapotTemple riss 45000 -> Bake brach mittendrin ab
+        rayBudget = 2500,    -- darf beim Backen ruckeln, laeuft ja nur einmal
+    }
+    
+    ------------------------------------------------------------------
+    -- 2) Raycasts
+    ------------------------------------------------------------------
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    rp.RespectCanCollide = true
+    
+    local frameRays = 0
+    local function cast(o, d)
+        frameRays = frameRays + 1
+        return workspace:Raycast(o, d, rp)
+    end
+    local function breathe()
+        if frameRays >= CFG.rayBudget then
+            frameRays = 0
+            RunService.Heartbeat:Wait()
+        end
+    end
+    local function refreshFilter()
+        local ig = { workspace.CurrentCamera }
+        for _, pl in ipairs(Players:GetPlayers()) do
+            if pl.Character then ig[#ig + 1] = pl.Character end
+        end
+        for _, n in ipairs({ "EmotePuppets", "ragdolls", "bullets", "Displayed", "coins", "Debris" }) do
+            local f = workspace:FindFirstChild(n)
+            if f then ig[#ig + 1] = f end
+        end
+        rp.FilterDescendantsInstances = ig
+    end
+    
+    local function currentMap()
+        local cm = workspace:FindFirstChild("CurrentMap")
+        return cm and cm:GetChildren()[1] or nil
+    end
+    
+    ------------------------------------------------------------------
+    -- 3) Knoten: Saeulen-Abtastung ueber die ganze Hoehe
+    ------------------------------------------------------------------
+    local function bounds(mapRoot, playerY)
+        local xs, ys, zs, n = {}, {}, {}, 0
+        for _, d in ipairs(mapRoot:GetDescendants()) do
+            if d:IsA("BasePart") and d.CanCollide then
+                n = n + 1
+                xs[#xs+1], ys[#ys+1], zs[#zs+1] = d.Position.X, d.Position.Y, d.Position.Z
+            end
+        end
+        if n < 20 then return nil end
+        table.sort(xs) table.sort(ys) table.sort(zs)
+        local function pc(t, p) return t[math.clamp(math.floor(#t*p+0.5), 1, #t)] end
+        local minY, maxY = pc(ys, 0.01), pc(ys, 0.99)
+        if playerY then
+            minY = math.min(minY, playerY - 40)
+            maxY = math.min(maxY + 30, playerY + 260)
+        end
+        return { min = Vector3.new(pc(xs,0.02), minY, pc(zs,0.02)),
+                 max = Vector3.new(pc(xs,0.98), maxY, pc(zs,0.98)) }
+    end
+    
+    local function sampleNodes(bb, onProgress)
+        local nodes, grid = {}, {}
+        -- Rasterweite an die Mapgroesse koppeln. Feiner ist nicht besser:
+        -- mit festem Raster 4 kam TeapotTemple auf 51244 Knoten, und A* fand
+        -- danach nur noch 4 von 15 Wegen bei 111 ms — gegenueber 20/20 bei
+        -- 30 ms und 18000 Knoten. Ziel sind daher rund 20000 Knoten.
+        local area = math.max((bb.max.X - bb.min.X) * (bb.max.Z - bb.min.Z), 1)
+        local cell = math.clamp(math.sqrt(area / 8000), CFG.cell, 9)
+        local nx = math.floor((bb.max.X - bb.min.X) / cell)
+        local nz = math.floor((bb.max.Z - bb.min.Z) / cell)
+        local cosLimit = math.cos(math.rad(CFG.maxSlope))
+        local topY = bb.max.Y + 8
+        for ix = 0, nx do
+            for iz = 0, nz do
+                local x = bb.min.X + ix * cell
+                local z = bb.min.Z + iz * cell
+                local y, guard, prevY = topY, 0, nil
+                while guard < CFG.maxLevels and y > bb.min.Y do
+                    guard = guard + 1
+                    local hit = cast(Vector3.new(x, y, z), Vector3.new(0, -(y - bb.min.Y + 4), 0))
+                    if not hit then break end
+                    local hy = hit.Position.Y
+                    y = (prevY and hy > prevY - 0.4) and (hy - 4.0) or (hy - 1.0)
+                    prevY = hy
+                    if hit.Normal.Y >= cosLimit then
+                        local foot = hit.Position + Vector3.new(0, 0.5, 0)
+                        if not cast(foot, Vector3.new(0, CFG.agentHeight, 0)) then
+                            local nd = { p = foot, ix = ix, iz = iz, id = #nodes + 1, e = {} }
+                            nodes[#nodes+1] = nd
+                            local k = ix .. "," .. iz
+                            local b = grid[k] ; if not b then b = {} grid[k] = b end
+                            b[#b+1] = nd
+                        end
+                    end
+                    if #nodes >= CFG.nodeCap then break end
+                end
+                if #nodes >= CFG.nodeCap then break end
+                breathe()
+            end
+            if #nodes >= CFG.nodeCap then break end
+            if onProgress and ix % 5 == 0 then
+                onProgress(ix / math.max(nx,1), #nodes)
+            end
+        end
+        return nodes, grid, cell
+    end
+    
+    ------------------------------------------------------------------
+    -- 4) Kanten. Kosten sind SEKUNDEN.
+    ------------------------------------------------------------------
+    local function addEdge(a, b, kind, cost)
+        a.e[#a.e+1] = { to = b.id, k = kind, c = cost }
+    end
+    
+    -- naechster Knoten zu einer Position, ueber das Raster
+    local function nearest(grid, bb, cell, pos, maxDist, maxDy)
+        local ix = math.floor((pos.X - bb.min.X) / cell + 0.5)
+        local iz = math.floor((pos.Z - bb.min.Z) / cell + 0.5)
+        local span = math.ceil(maxDist / cell)
+        local best, bd
+        for dx = -span, span do
+            for dz = -span, span do
+                local b = grid[(ix+dx) .. "," .. (iz+dz)]
+                if b then
+                    for _, n in ipairs(b) do
+                        local d = (n.p - pos).Magnitude
+                        if d <= maxDist and (not maxDy or math.abs(n.p.Y - pos.Y) <= maxDy) then
+                            if not bd or d < bd then best, bd = n, d end
+                        end
+                    end
+                end
+            end
+        end
+        return best
+    end
+    
+    -- 4a) GEHEN, STUFEN und ABSAETZE zwischen benachbarten Zellen.
+    -- Wichtig: Sprungkanten entstehen sonst nur zwischen RANDknoten. Eine
+    -- Treppenstufe mitten in einer Treppe ist kein Randknoten — Hoehen
+    -- zwischen stepUp und Sprunghoehe bekamen dadurch GAR KEINE Kante, und
+    -- genau daran zerreisst der Graph an jeder Treppe. Darum hier zusaetzlich
+    -- "hop" nach oben und "step" nach unten fuer alle Nachbarn.
+    -- Ist der Weg zwischen zwei Knoten begehbar? Ein einzelner Strahl von
+    -- Zellenmitte zu Zellenmitte reicht dafuer NICHT: eine Tuer ist schmaler
+    -- als das Raster und liegt selten genau auf der Verbindungslinie. Gemessen
+    -- auf CrossRoads waren dadurch nur 65 % der Innenknoten erreichbar
+    -- gegenueber 88 % draussen — ganze Raeume hingen unverbunden im Graphen.
+    -- Darum bei Blockade zusaetzlich quer versetzte Strahlen: findet den
+    -- Durchgang auch dann, wenn er seitlich der Ideallinie liegt.
+    local function passable(a, c)
+        if not cast(a, c - a) then return true end
+        local flat = (c - a) * Vector3.new(1, 0, 1)
+        if flat.Magnitude < 0.1 then return false end
+        local side = Vector3.new(-flat.Unit.Z, 0, flat.Unit.X)
+        -- quer versetzt UND auf mehreren Hoehen: eine Tuerschwelle blockiert
+        -- unten, ein Sturz oben, und die Oeffnung liegt selten mittig
+        for _, off in ipairs({ 0, 1.2, -1.2, 2.0, -2.0 }) do
+            for _, up in ipairs({ 0, -1.4, 1.2 }) do
+                if not (off == 0 and up == 0) then
+                    local lift = Vector3.new(0, up, 0)
+                    local a2, c2 = a + side * off + lift, c + side * off + lift
+                    if not cast(a2, c2 - a2) then return true end
+                end
+            end
+        end
+        return false
+    end
+    
+    local function buildWalk(nodes, grid, prof)
+        local dirs = { {1,0}, {0,1}, {1,1}, {1,-1}, {-1,1}, {-1,0}, {0,-1}, {-1,-1} }
+        local walk, hop, step = 0, 0, 0
+        for i, n in ipairs(nodes) do
+            for _, d in ipairs(dirs) do
+                local b = grid[(n.ix+d[1]) .. "," .. (n.iz+d[2])]
+                if b then
+                    for _, o in ipairs(b) do
+                        local dy = o.p.Y - n.p.Y
+                        local dist = (o.p - n.p).Magnitude
+                        local a = n.p + Vector3.new(0, 2.2, 0)
+                        local c = o.p + Vector3.new(0, 2.2, 0)
+                        if math.abs(dy) <= CFG.stepUp then
+                            if passable(a, c) then
+                                addEdge(n, o, "walk", dist / prof.speed)
+                                walk = walk + 1
+                            end
+                        elseif dy > CFG.stepUp and dy <= prof.rise then
+                            -- Stufe hoch: braucht einen Sprung, ist aber kurz
+                            if passable(a, c) then
+                                addEdge(n, o, "hop", dist / prof.speed + 0.15)
+                                hop = hop + 1
+                            end
+                        elseif dy < -CFG.stepUp and dy > -30 then
+                            -- Stufe runter: einfach fallen lassen
+                            if passable(a, c) then
+                                addEdge(n, o, "step",
+                                        dist / prof.speed + math.sqrt(2 * math.abs(dy) / prof.g))
+                                step = step + 1
+                            end
+                        end
+                    end
+                end
+            end
+            if i % 300 == 0 then breathe() end
+        end
+        return walk, hop, step
+    end
+    
+    -- 4b) KLETTERN an Leitern — das, was PathfindingService gar nicht kann
+    local function buildClimb(nodes, grid, bb, cell, mapRoot, prof)
+        local count = 0
+        for _, t in ipairs(mapRoot:GetDescendants()) do
+            if t:IsA("TrussPart") then
+                local half = t.Size.Y * 0.5
+                local foot = t.Position - Vector3.new(0, half - 2.5, 0)
+                local top  = t.Position + Vector3.new(0, half, 0)
+                local a = nearest(grid, bb, cell, foot, 10, 8)
+                local b = nearest(grid, bb, cell, top, 12, 10)
+                if a and b and a ~= b then
+                    local cost = (t.Size.Y / prof.climbSpeed) + 0.6
+                    addEdge(a, b, "climb", cost)
+                    addEdge(b, a, "drop", math.sqrt(2 * math.max(t.Size.Y,1) / prof.g))
+                    count = count + 1
+                end
+                breathe()
+            end
+        end
+        return count
+    end
+    
+    -- 4c) SPRINGEN und FALLEN zwischen Kanten verschiedener Ebenen
+    local function isRim(n, grid)
+        for _, d in ipairs({ {1,0}, {-1,0}, {0,1}, {0,-1} }) do
+            local b = grid[(n.ix+d[1]) .. "," .. (n.iz+d[2])]
+            local found = false
+            if b then
+                for _, o in ipairs(b) do
+                    if math.abs(o.p.Y - n.p.Y) <= CFG.stepUp then found = true break end
+                end
+            end
+            if not found then return true end
+        end
+        return false
+    end
+    
+    local function arcClear(from, to, prof)
+        local flat = (to - from) * Vector3.new(1,0,1)
+        local dist = flat.Magnitude
+        if dist < 0.5 then return false end
+        local t = dist / prof.speed
+        if t > prof.air * 1.15 then return false end
+        local vy = ((to.Y - from.Y) + 0.5 * prof.g * t * t) / t
+        if vy > prof.vy * 1.02 then return false end
+        local u = flat.Unit
+        local prev = from + Vector3.new(0, 1.5, 0)
+        for s = 1, 8 do
+            local tt = t * (s/8)
+            local p = from + u * (prof.speed * tt)
+                    + Vector3.new(0, vy*tt - 0.5*prof.g*tt*tt + 1.5, 0)
+            if cast(prev, p - prev) then return false end
+            prev = p
+        end
+        return true
+    end
+    
+    local function buildJumpDrop(nodes, grid, cell, prof)
+        local rim, rimGrid = {}, {}
+        for _, n in ipairs(nodes) do
+            if isRim(n, grid) then
+                rim[#rim+1] = n
+                local k = n.ix .. "," .. n.iz
+                local b = rimGrid[k] ; if not b then b = {} rimGrid[k] = b end
+                b[#b+1] = n
+            end
+        end
+        local span = math.ceil((prof.reach * 0.9) / cell)
+        local jumps, drops = 0, 0
+        for i, a in ipairs(rim) do
+            for dx = -span, span do
+                for dz = -span, span do
+                    local b = rimGrid[(a.ix+dx) .. "," .. (a.iz+dz)]
+                    if b then
+                        for _, o in ipairs(b) do
+                            if o.id ~= a.id then
+                                local flat = ((o.p - a.p) * Vector3.new(1,0,1)).Magnitude
+                                local dy = o.p.Y - a.p.Y
+                                if flat <= prof.reach * 0.9 and math.abs(dy) > CFG.stepUp then
+                                    if dy > 0 and dy <= prof.rise and arcClear(a.p, o.p, prof) then
+                                        addEdge(a, o, "jump", flat / prof.speed + 0.25)
+                                        jumps = jumps + 1
+                                    elseif dy < 0 then
+                                        -- runterfallen geht fast immer
+                                        local d = cast(a.p + Vector3.new(0,1,0),
+                                                       (o.p - a.p) + Vector3.new(0,-2,0))
+                                        if not d or (d.Position - o.p).Magnitude < 7 then
+                                            addEdge(a, o, "drop",
+                                                    math.sqrt(2 * math.abs(dy) / prof.g) + flat/prof.speed)
+                                            drops = drops + 1
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            if i % 40 == 0 then breathe() end
+        end
+        return jumps, drops, rim
+    end
+    
+    -- 4d) WALLRIDE — als Vertikalmittel BEWUSST NICHT VERWENDET.
+    -- Es funktioniert nur an eigens markierten Waenden (Attribut "Wallrun"),
+    -- die in diesen Maps sehr selten sind — auf Area51 keine einzige. Ueberall
+    -- sonst braeuchte es shared.multipliers.EnableWallrunning, und auf einen
+    -- Exploit-Schalter darf sich eine Route nicht stuetzen. Die Funktion bleibt
+    -- fuer spaeter stehen, wird aber von NAV.bake nicht mehr aufgerufen.
+    -- Der Spielcode (Wallrun-Modul) laesst einen Wallrun nur zu, wenn das
+    -- getroffene Teil das Attribut "Wallrun" traegt — oder wenn
+    -- shared.multipliers.EnableWallrunning gesetzt ist, und das ist ein
+    -- Exploit-Schalter, auf den sich eine Route nicht stuetzen darf.
+    -- Ein frueherer Versuch, jede steile Flaeche als kletterbar zu werten,
+    -- hat 401 bis 953 Phantomkanten erzeugt.
+    local function buildWallrun(nodes, grid, bb, cell, mapRoot, prof)
+        local walls = {}
+        for _, d in ipairs(mapRoot:GetDescendants()) do
+            if d:IsA("BasePart") and d:GetAttribute("Wallrun") then
+                walls[#walls+1] = d
+            end
+        end
+        local count = 0
+        for _, w in ipairs(walls) do
+            -- Fusspunkte entlang der Wandbasis abtasten, je Seite
+            local cf, sz = w.CFrame, w.Size
+            local along = (sz.X >= sz.Z) and cf.RightVector or cf.LookVector
+            local len = math.max(sz.X, sz.Z)
+            local normal = (sz.X >= sz.Z) and cf.LookVector or cf.RightVector
+            for _, side in ipairs({ 1, -1 }) do
+                local steps = math.max(1, math.floor(len / 10))
+                for s = 0, steps do
+                    local along_off = (s / math.max(steps,1) - 0.5) * len
+                    local base = w.Position + along * along_off
+                                + normal * side * (math.min(sz.X, sz.Z) * 0.5 + 2.5)
+                    local foot = nearest(grid, bb, cell,
+                                         Vector3.new(base.X, w.Position.Y - sz.Y * 0.5 + 3, base.Z),
+                                         12, 10)
+                    if foot then
+                        local top = nearest(grid, bb, cell,
+                                            Vector3.new(base.X, w.Position.Y + sz.Y * 0.5, base.Z),
+                                            14, 8)
+                        if top and top.id ~= foot.id then
+                            local gain = top.p.Y - foot.p.Y
+                            if gain > CFG.stepUp and gain <= CFG.wallChainMax then
+                                addEdge(foot, top, "wallrun", gain / prof.wallSpeed + 0.5)
+                                addEdge(top, foot, "drop", math.sqrt(2 * gain / prof.g))
+                                count = count + 1
+                            end
+                        end
+                    end
+                end
+            end
+            breathe()
+        end
+        return count, #walls
+    end
+    
+    -- 4e) Zipline und Jumppad
+    local function buildHelpers(nodes, grid, bb, cell, mapRoot, prof)
+        local zips, pads = 0, 0
+        local zipGroups = {}
+        for _, d in ipairs(mapRoot:GetDescendants()) do
+            if d:IsA("BasePart") then
+                if d.Parent and d.Parent:GetAttribute("Zipline") then
+                    local g = zipGroups[d.Parent]
+                    if not g then g = {} zipGroups[d.Parent] = g end
+                    g[#g+1] = d
+                else
+                    local amount = d:GetAttribute("BounceAmount") or d:GetAttribute("RelativeBounceAmount")
+                    if type(amount) == "number" and amount > 0 then
+                        local rise = (amount * amount) / (2 * prof.g)
+                        local air = 2 * amount / prof.g
+                        local src = nearest(grid, bb, cell, d.Position + Vector3.new(0, d.Size.Y*0.5, 0), 10, 8)
+                        if src then
+                            for k = 0, 7 do
+                                local ang = k * math.pi / 4
+                                local land = d.Position + Vector3.new(
+                                    math.cos(ang) * prof.speed * air * 0.5,
+                                    rise * 0.8,
+                                    math.sin(ang) * prof.speed * air * 0.5)
+                                local dst = nearest(grid, bb, cell, land, 14, 12)
+                                if dst and dst.id ~= src.id and dst.p.Y > src.p.Y + CFG.stepUp then
+                                    addEdge(src, dst, "pad", air)
+                                    pads = pads + 1
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        for _, group in pairs(zipGroups) do
+            local lo, hi
+            for _, part in ipairs(group) do
+                if not lo or part.Position.Y < lo.Position.Y then lo = part end
+                if not hi or part.Position.Y > hi.Position.Y then hi = part end
+            end
+            if lo and hi and lo ~= hi then
+                local a = nearest(grid, bb, cell, hi.Position, 22, 14)
+                local b = nearest(grid, bb, cell, lo.Position, 22, 14)
+                if a and b and a.id ~= b.id then
+                    addEdge(a, b, "zip", (hi.Position - lo.Position).Magnitude / prof.zipSpeed)
+                    zips = zips + 1
+                end
+            end
+            breathe()
+        end
+        return zips, pads
+    end
+    
+    ------------------------------------------------------------------
+    -- 5) A* ueber den Graphen. Kosten in Sekunden, Heuristik ebenso.
+    ------------------------------------------------------------------
+    function NAV.findPath(startPos, goalPos)
+        local G = NAV.graph
+        if not G then return nil, "kein Graph" end
+        local s = nearest(G.grid, G.bb, G.cell, startPos, 30, 14)
+        local t = nearest(G.grid, G.bb, G.cell, goalPos, 30, 18)
+        if not s then return nil, "Start nicht im Graph" end
+        if not t then return nil, "Ziel nicht im Graph" end
+        if s.id == t.id then return { s }, nil end
+    
+        local nodes = G.nodes
+        local speed = G.prof.speed
+        local function h(n)
+            return (n.p - t.p).Magnitude / speed
+        end
+    
+        local gScore, came, closed = {}, {}, {}
+        gScore[s.id] = 0
+        -- einfacher binaerer Heap
+        local heap, hn = {}, 0
+        local function push(id, f)
+            hn = hn + 1 ; heap[hn] = { id = id, f = f }
+            local i = hn
+            while i > 1 do
+                local p = math.floor(i/2)
+                if heap[p].f <= heap[i].f then break end
+                heap[p], heap[i] = heap[i], heap[p] ; i = p
+            end
+        end
+        local function pop()
+            if hn == 0 then return nil end
+            local top = heap[1]
+            heap[1] = heap[hn] ; heap[hn] = nil ; hn = hn - 1
+            local i = 1
+            while true do
+                local l, r, m = i*2, i*2+1, i
+                if l <= hn and heap[l].f < heap[m].f then m = l end
+                if r <= hn and heap[r].f < heap[m].f then m = r end
+                if m == i then break end
+                heap[m], heap[i] = heap[i], heap[m] ; i = m
+            end
+            return top.id
+        end
+    
+        push(s.id, h(s))
+        local visited = 0
+        -- Deckel gegen den teuersten Fall: gibt es gar keinen Weg, durchsucht
+        -- A* sonst den kompletten Graphen — auf einer grossen Map ueber 100 ms
+        -- pro vergeblicher Anfrage.
+        local budget = 12000
+        while visited < budget do
+            local cur = pop()
+            if not cur then break end
+            if not closed[cur] then
+                closed[cur] = true
+                visited = visited + 1
+                if cur == t.id then
+                    local path, at = {}, cur
+                    while at do
+                        table.insert(path, 1, { node = nodes[at], kind = came[at] and came[at].k or "walk" })
+                        at = came[at] and came[at].from or nil
+                    end
+                    return path, nil, visited
+                end
+                local n = nodes[cur]
+                for _, e in ipairs(n.e) do
+                    local ng = gScore[cur] + e.c
+                    if not gScore[e.to] or ng < gScore[e.to] then
+                        gScore[e.to] = ng
+                        came[e.to] = { from = cur, k = e.k }
+                        push(e.to, ng + h(nodes[e.to]))
+                    end
+                end
+            end
+        end
+        return nil, "kein Weg im Graphen", visited
+    end
+    
+    ------------------------------------------------------------------
+    -- 6) Backen
+    ------------------------------------------------------------------
+    function NAV.bake(onProgress)
+        local mapRoot = currentMap()
+        if not mapRoot then return nil, "keine Map" end
+        refreshFilter()
+        local prof = profile()
+        local hrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+        local bb = bounds(mapRoot, hrp and hrp.Position.Y or nil)
+        if not bb then return nil, "Map zu klein" end
+    
+        local t0 = os.clock()
+        local nodes, grid, cell = sampleNodes(bb, onProgress)
+        if #nodes < 50 then return nil, "zu wenige Knoten: " .. #nodes end
+    
+        local stats = {}
+        stats.walk, stats.hop, stats.step = buildWalk(nodes, grid, prof)
+        stats.climb = buildClimb(nodes, grid, bb, cell, mapRoot, prof)
+        local j, d, rim = buildJumpDrop(nodes, grid, cell, prof)
+        stats.jump, stats.drop, stats.rim = j, d, #rim
+        stats.wallrun, stats.wallParts = 0, 0   -- siehe 4d: bewusst ausgeschlossen
+        stats.zip, stats.pad = buildHelpers(nodes, grid, bb, cell, mapRoot, prof)
+    
+        NAV.graph = { nodes = nodes, grid = grid, cell = cell, bb = bb,
+                      prof = prof, map = mapRoot.Name, stats = stats }
+        stats.nodes = #nodes
+        stats.secs = os.clock() - t0
+        return NAV.graph
+    end
+    
+    local function navFileName(mapName)
+        return "utg_nav_" .. tostring(mapName):gsub("[^%w_%-]", "_") .. ".json"
+    end
+    
+    -- Graph aus der Datei holen. Der Bake dauert gruendlich ~30 s; das lohnt
+    -- sich einmal pro Map, aber nicht bei jedem Rundenwechsel — und die Maps
+    -- sind ein fester Pool, der sich nicht aendert.
+    -- Kompaktes Textformat statt JSON. Ein gruendlich gebackener Graph hat
+    -- ueber 400.000 Kanten; als JSON sind das zweistellige Megabyte, und
+    -- HttpService:JSONEncode scheitert daran stillschweigend. Hier steht je
+    -- Knoten eine Zeile "x,y,z>ziel:art:kosten,..." mit einem Buchstaben je
+    -- Kantenart — das ist rund ein Viertel so gross und laedt deutlich schneller.
+    local KIND2CH = { walk="w", hop="h", step="s", jump="j", drop="d",
+                      climb="c", zip="z", pad="p", wallrun="r" }
+    local CH2KIND = {}
+    for k, v in pairs(KIND2CH) do CH2KIND[v] = k end
+    
+    function NAV.load(mapName)
+        if type(readfile) ~= "function" or type(isfile) ~= "function" then return nil end
+        local fn = navFileName(mapName)
+        local ok, blob = pcall(function()
+            if not isfile(fn) then return nil end
+            return readfile(fn)
+        end)
+        if not ok or type(blob) ~= "string" or #blob < 50 then return nil end
+    
+        local lines = string.split(blob, "\n")
+        local head = string.split(lines[1] or "", "|")
+        if head[1] ~= "UTGNAV3" then return nil end
+        local cell = tonumber(head[3])
+        local bbv = string.split(head[4] or "", ",")
+        if not cell or #bbv < 6 then return nil end
+        local bb = { min = Vector3.new(tonumber(bbv[1]), tonumber(bbv[2]), tonumber(bbv[3])),
+                     max = Vector3.new(tonumber(bbv[4]), tonumber(bbv[5]), tonumber(bbv[6])) }
+    
+        local nodes, grid = {}, {}
+        for i = 2, #lines do
+            local line = lines[i]
+            if #line > 2 then
+                local cut = string.find(line, ">", 1, true)
+                local posPart = cut and string.sub(line, 1, cut - 1) or line
+                local xyz = string.split(posPart, ",")
+                local p = Vector3.new(tonumber(xyz[1]) or 0, tonumber(xyz[2]) or 0,
+                                      tonumber(xyz[3]) or 0)
+                local ix = math.floor((p.X - bb.min.X) / cell + 0.5)
+                local iz = math.floor((p.Z - bb.min.Z) / cell + 0.5)
+                local e = {}
+                if cut then
+                    for _, chunk in ipairs(string.split(string.sub(line, cut + 1), ",")) do
+                        if #chunk > 3 then
+                            local f = string.split(chunk, ":")
+                            local to = tonumber(f[1])
+                            if to then
+                                e[#e+1] = { to = to, k = CH2KIND[f[2]] or "walk",
+                                            c = tonumber(f[3]) or 1 }
+                            end
+                        end
+                    end
+                end
+                local id = #nodes + 1
+                local nd = { p = p, ix = ix, iz = iz, id = id, e = e }
+                nodes[id] = nd
+                local k = ix .. "," .. iz
+                local b = grid[k] ; if not b then b = {} grid[k] = b end
+                b[#b+1] = nd
+            end
+        end
+        if #nodes < 50 then return nil end
+        NAV.graph = { nodes = nodes, grid = grid, cell = cell, bb = bb,
+                      prof = profile(), map = mapName,
+                      stats = { nodes = #nodes }, fromFile = true }
+        return NAV.graph
+    end
+    
+    function NAV.save()
+        local G = NAV.graph
+        if not G or type(writefile) ~= "function" then return false, "kein writefile" end
+        local function r1(v) return math.floor(v * 10 + 0.5) / 10 end
+        local function r2(v) return math.floor(v * 100 + 0.5) / 100 end
+    
+        -- stueckweise zusammensetzen: ein einzelner String mit Millionen
+        -- Verkettungen sprengt den Speicher
+        local parts = {
+            ("UTGNAV3|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
+                r1(G.bb.min.X), r1(G.bb.min.Y), r1(G.bb.min.Z),
+                r1(G.bb.max.X), r1(G.bb.max.Y), r1(G.bb.max.Z))
+        }
+        local buf = {}
+        for _, n in ipairs(G.nodes) do
+            local es = {}
+            for _, e in ipairs(n.e) do
+                es[#es+1] = e.to .. ":" .. (KIND2CH[e.k] or "w") .. ":" .. r2(e.c)
+            end
+            buf[#buf+1] = r1(n.p.X) .. "," .. r1(n.p.Y) .. "," .. r1(n.p.Z)
+                          .. ">" .. table.concat(es, ",")
+            if #buf >= 2000 then
+                parts[#parts+1] = table.concat(buf, "\n")
+                buf = {}
+            end
+        end
+        if #buf > 0 then parts[#parts+1] = table.concat(buf, "\n") end
+    
+        local blob = table.concat(parts, "\n")
+        local ok, err = pcall(writefile, navFileName(G.map), blob)
+        if not ok then return false, tostring(err) end
+        -- wirklich nachsehen statt dem pcall zu glauben
+        if type(isfile) == "function" and not isfile(navFileName(G.map)) then
+            return false, "Datei nach dem Schreiben nicht vorhanden"
+        end
+        return true, #blob
+    end
+    
+end
+
 local PathfindingService = game:GetService("PathfindingService")
 local PATH = { wps = nil, idx = 1, at = 0, target = nil, busy = false, fails = 0,
                jumped = {} }
 AP.path = PATH
+ENV.ap = AP          -- fuer Diagnose von aussen
 
 -- Ein Pfad direkt zum Gegner scheitert oft (er steht auf einem Dach, auf einer
 -- Leiter, in der Luft). Deshalb wird eine Kette von Zielen probiert: exakt,
 -- auf den Boden projiziert, dann nur noch "in die Naehe" — den Rest macht die
 -- normale Verfolgung.
+-- Der Graph wird einmal pro Map gebacken (dauert gemessen 3.3 s) und
+-- danach nur noch abgefragt. Laeuft im Hintergrund, damit das Spiel
+-- waehrenddessen weiterlaeuft.
+local navBake = { map = nil, busy = false, at = 0, fails = 0 }
+local function ensureGraph()
+    local cm = workspace:FindFirstChild("CurrentMap")
+    local child = cm and cm:GetChildren()[1]
+    if not child then return end
+    if navBake.map == child and NAV.graph then return end
+    if navBake.busy or tick() - navBake.at < 4 then return end
+    navBake.busy, navBake.at = true, tick()
+    task.spawn(function()
+        -- Erst die Datei. Der gruendliche Bake dauert ~30 s und liefert
+        -- 99 % Erreichbarkeit; das muss pro Map genau einmal passieren,
+        -- nicht bei jedem Rundenwechsel.
+        local okL, loaded = pcall(NAV.load, child.Name)
+        if okL and loaded then
+            navBake.map, navBake.fails, navBake.busy = child, 0, false
+            LOG(("Navigationsgraph fuer %s aus Datei geladen: %d Knoten")
+                :format(child.Name, #loaded.nodes))
+            return
+        end
+        local ok, g, err = pcall(NAV.bake)
+        if ok and g then
+            navBake.map, navBake.fails = child, 0
+            local s = g.stats
+            LOG(("Navigationsgraph fuer %s gebaut: %d Knoten in %.1f s — %d gehen, "
+                 .. "%d Stufe hoch, %d Stufe runter, %d springen, %d fallen, "
+                 .. "%d klettern, %d zip, %d pad")
+                :format(g.map, s.nodes, s.secs, s.walk, s.hop or 0, s.step or 0,
+                        s.jump, s.drop, s.climb, s.zip, s.pad))
+            -- pcall allein genuegt hier nicht: NAV.save kann sauber
+            -- zurueckkehren und trotzdem false melden
+            local okCall, saved, info = pcall(NAV.save)
+            if okCall and saved then
+                LOG(("Graph gespeichert (%.1f MB) — naechste Runde auf %s laedt ihn sofort")
+                    :format((tonumber(info) or 0) / 1048576, g.map))
+            else
+                LOG("Graph konnte nicht gespeichert werden: "
+                    .. tostring(okCall and info or saved))
+            end
+        else
+            navBake.fails = navBake.fails + 1
+            if navBake.fails % 3 == 1 then
+                LOG("Navigationsgraph konnte nicht gebaut werden: " .. tostring(g or err))
+            end
+        end
+        navBake.busy = false
+    end)
+end
+
+-- Ersetzt die alte PathfindingService-Anfrage. Das Rueckgabeformat bleibt
+-- gleich (Position/Action), damit der Wegpunkt-Folger unveraendert damit
+-- arbeitet — zusaetzlich traegt jeder Punkt die Kantenart, ueber die er
+-- erreicht wird, damit die Ausfuehrung weiss, was zu tun ist.
+------------------------------------------------------------------
+-- PFAD-ANZEIGE
+--     Macht sichtbar, was der Graph plant: je Wegpunkt ein Wuerfel,
+--     eingefaerbt nach Kantenart. Rein lokal, nichts davon repliziert.
+------------------------------------------------------------------
+local PATHVIS = { folder = nil, on = true }
+local KIND_COLOR = {
+    walk    = Color3.fromRGB(235, 235, 235),
+    hop     = Color3.fromRGB(255, 210,  60),
+    step    = Color3.fromRGB(255, 150,  40),
+    jump    = Color3.fromRGB( 70, 230,  90),
+    drop    = Color3.fromRGB( 70, 150, 255),
+    climb   = Color3.fromRGB(190,  90, 255),
+    zip     = Color3.fromRGB( 60, 230, 230),
+    pad     = Color3.fromRGB(255,  90, 200),
+    wallrun = Color3.fromRGB(255,  70,  70),
+}
+
+local function visClear()
+    if PATHVIS.folder then
+        pcall(function() PATHVIS.folder:Destroy() end)
+        PATHVIS.folder = nil
+    end
+end
+
+local function visPath(wps)
+    visClear()
+    if not PATHVIS.on or not wps or #wps < 2 then return end
+    local ok = pcall(function()
+        local f = Instance.new("Folder")
+        f.Name = "UTG_PathVis"
+        f.Parent = workspace
+        PATHVIS.folder = f
+        for i, wp in ipairs(wps) do
+            local kind = wp.kind or "walk"
+            local p = Instance.new("Part")
+            p.Name = "wp" .. i
+            p.Anchored = true
+            p.CanCollide = false
+            p.CanQuery = false
+            p.CanTouch = false
+            p.Material = Enum.Material.Neon
+            p.Color = KIND_COLOR[kind] or KIND_COLOR.walk
+            -- Wegpunkte, die etwas Besonderes verlangen, deutlich groesser
+            local special = (kind ~= "walk")
+            p.Size = special and Vector3.new(1.6, 1.6, 1.6) or Vector3.new(0.7, 0.7, 0.7)
+            p.Transparency = special and 0.15 or 0.45
+            p.Shape = Enum.PartType.Block
+            p.Position = wp.Position
+            p.Parent = f
+        end
+    end)
+    if not ok then visClear() end
+end
+
+------------------------------------------------------------------
+-- VERFOLGUNGSPUNKT
+--     Ein bewegtes Ziel direkt anzupfaden funktioniert nicht: der Pfad
+--     wird bei jeder groesseren Zielbewegung verworfen und neu gerechnet,
+--     der Bot faehrt nie eine Route zu Ende. Stattdessen wird die
+--     Bodenposition des Ziels als fester Punkt gemerkt und nur alle paar
+--     Sekunden nachgezogen — oder sobald er erreicht ist.
+--     Ein Punkt entsteht NUR, wenn das Ziel Bodenkontakt hat; haengt es
+--     in der Luft, bleibt der alte stehen, bis es wieder landet.
+------------------------------------------------------------------
+local CHASE = { point = nil, at = 0, pl = nil }
+local CHASE_INTERVAL = 3.0
+local CHASE_REACHED  = 9
+
+local function groundedPos(pl)
+    local char = pl and pl.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not (hrp and hum) then return nil end
+    if hum.FloorMaterial == Enum.Material.Air then return nil end
+    local st = hum:GetState()
+    if st == Enum.HumanoidStateType.Freefall or st == Enum.HumanoidStateType.Jumping
+       or st == Enum.HumanoidStateType.Climbing then return nil end
+    return hrp.Position
+end
+
+local function chasePoint(pos, preyPl)
+    if not preyPl then
+        CHASE.point, CHASE.pl = nil, nil
+        return nil
+    end
+    local now = tick()
+    if CHASE.pl ~= preyPl then           -- Zielwechsel: von vorne
+        CHASE.point, CHASE.pl, CHASE.at = nil, preyPl, 0
+    end
+    local reached = CHASE.point
+        and ((CHASE.point - pos) * Vector3.new(1, 0, 1)).Magnitude < CHASE_REACHED
+    if (not CHASE.point) or reached or (now - CHASE.at > CHASE_INTERVAL) then
+        local g = groundedPos(preyPl)
+        if g then CHASE.point, CHASE.at = g, now end
+    end
+    return CHASE.point
+end
+
+local computeEngine        -- weiter unten definiert
+local function computeGraph(fromPos, toPos)
+    if not NAV.graph then return nil end
+    local ok, path = pcall(NAV.findPath, fromPos, toPos)
+    if not ok or type(path) ~= "table" or #path < 2 then return nil end
+    local wps = {}
+    for i, step in ipairs(path) do
+        local kind = step.kind
+        wps[i] = {
+            Position = step.node.p,
+            Action = (kind == "jump" or kind == "pad" or kind == "hop")
+                     and Enum.PathWaypointAction.Jump
+                     or Enum.PathWaypointAction.Walk,
+            kind = kind,
+        }
+    end
+    return wps
+end
+
+-- Beide Verfahren, jedes fuer das, was es nachweislich kann. Gemessen auf
+-- MedievalGlassHouses ueber Hoehenbaender (je 4 Ziele):
+--        Hoehe ueber Bot   PathfindingService   Graph
+--           0..15 Studs          4/4             4/4
+--          15..45 Studs          0/8             8/8   <- nur der Graph
+--          45..90 Studs         10/12            1/12  <- nur die Engine
+-- Der Graph kommt zuerst, weil er die Fortbewegungsarten des Spiels kennt
+-- und mit 12 ms statt 100-160 ms antwortet; die Engine faengt die Faelle
+-- ab, an denen das Raster des Graphen an schmalen Rampen zerreisst.
 local function computeOnce(fromPos, toPos, radius)
+    local wps = computeGraph(fromPos, toPos)
+    if wps then return wps end
+    return computeEngine(fromPos, toPos, radius or 1.8)
+end
+
+computeEngine = function(fromPos, toPos, radius)
     local ok, res = pcall(function()
         local path = PathfindingService:CreatePath({
             -- AgentRadius: die Doku nennt ihn ganzzahlig, die Engine wertet
@@ -640,19 +1552,11 @@ local function requestPath(fromPos, candidates)
     PATH.busy = true
     task.spawn(function()
         local wps, used
-        -- Ein ComputeAsync kostet auf dieser Map GEMESSEN 100-160 ms. Die
-        -- alte Kette (5 Kandidaten x 3 Radien) konnte damit ueber zwei
-        -- Sekunden blockieren — in der Zeit laeuft der Bot 70 Studs und der
-        -- Pfad ist bei Ankunft wertlos. Darum ein hartes Budget.
-        local budgetCalls = 4
+        -- Eine Graph-Anfrage kostet gemessen 12 ms statt 100-160 ms bei
+        -- PathfindingService — die alten Budgets und Radien-Ketten sind
+        -- damit hinfaellig.
         for _, t in ipairs(candidates) do
-            if budgetCalls <= 0 then break end
-            wps = computeOnce(fromPos, t, 1.8)
-            budgetCalls = budgetCalls - 1
-            if not wps and budgetCalls > 0 then
-                wps = computeOnce(fromPos, t, 1.2)
-                budgetCalls = budgetCalls - 1
-            end
+            wps = computeOnce(fromPos, t)
             if wps then used = t break end
         end
         if wps then
@@ -662,25 +1566,13 @@ local function requestPath(fromPos, candidates)
             -- x2.03, weil die Luftlinie durch Beton geht und der echte Weg
             -- ueber Treppen und Leitern fuehrt. Hoehenunterschied kostet nun
             -- ausdruecklich Weglaenge, statt als Umweg zu gelten.
-            local len, prev = 0, nil
-            for _, w in ipairs(wps) do
-                if prev then len = len + (w.Position - prev).Magnitude end
-                prev = w.Position
-            end
-            local delta = used - fromPos
-            local flat = (delta * Vector3.new(1, 0, 1)).Magnitude
-            local budget = (flat + 4 * math.abs(delta.Y) + 20) * 2.0
-            if len > budget then
-                PATH.wps, PATH.at, PATH.fails = nil, tick(), PATH.fails + 1
-                PATH.nextAllowed = tick() + math.min(1.5 + PATH.fails * 0.5, 6)
-                if PATH.fails % 4 == 1 then
-                    LOG(("Pfad verworfen: %.0f Studs fuer %.0f flach / %.0f hoch (Budget %.0f)")
-                        :format(len, flat, delta.Y, budget))
-                end
-                PATH.busy = false
-                return
-            end
-            PATH.jumped, PATH.idxAt = {}, tick()
+            -- Die Laengenpruefung ist entfallen. Sie stammte aus der Zeit von
+            -- PathfindingService, wo ein langer Weg ein Umweg war. Der Graph
+            -- rechnet in SEKUNDEN: ein Weg ueber Zipline und Wallrun kann
+            -- weit aussehen und trotzdem der schnellste sein — genau solche
+            -- Wege hat die alte Regel zuverlaessig weggeworfen.
+            PATH.jumped, PATH.idxAt, PATH.from = {}, tick(), fromPos
+            visPath(wps)
             PATH.wps, PATH.idx, PATH.at, PATH.target, PATH.fails = wps, 2, tick(), used, 0
             PATH.nextAllowed = nil
         else
@@ -717,17 +1609,26 @@ local function followPath(pos)
         local wp = wps[PATH.idx]
         local flat = (wp.Position - pos) * Vector3.new(1, 0, 1)
         local dy = math.abs(wp.Position.Y - pos.Y)
-        local reached = flat.Magnitude < 3.0 and dy < 12
-        -- oder schon daran vorbei: hinter der Ebene senkrecht zum Wegstueck
-        if not reached and PATH.idx > 1 and flat.Magnitude < 7.2 and dy < 12 then
-            local seg = (wp.Position - wps[PATH.idx - 1].Position) * Vector3.new(1, 0, 1)
-            if seg.Magnitude > 0.1 and seg.Unit:Dot(-flat) > 0 then reached = true end
-        end
-        -- Notausgang: haengt er eine halbe Sekunde am selben Punkt und ist
-        -- horizontal laengst da, gilt der Punkt als erledigt
-        if not reached and flat.Magnitude < 7.2
-           and now - (PATH.idxAt or now) > 0.5 then
-            reached = true
+        local reached
+        if wp.kind == "climb" then
+            -- Der Kopf einer Leiter liegt bis zu 45 Studs ueber dem Fuss.
+            -- Hier darf weder die Y-Toleranz noch der Notausgang greifen,
+            -- sonst gilt der Punkt als erledigt, bevor ueberhaupt geklettert
+            -- wurde — der Bot laeuft dann unten daran vorbei.
+            reached = flat.Magnitude < 5.0 and dy < 5
+        else
+            reached = flat.Magnitude < 3.0 and dy < 12
+            -- oder schon daran vorbei: hinter der Ebene senkrecht zum Wegstueck
+            if not reached and PATH.idx > 1 and flat.Magnitude < 7.2 and dy < 12 then
+                local seg = (wp.Position - wps[PATH.idx - 1].Position) * Vector3.new(1, 0, 1)
+                if seg.Magnitude > 0.1 and seg.Unit:Dot(-flat) > 0 then reached = true end
+            end
+            -- Notausgang: haengt er eine halbe Sekunde am selben Punkt und ist
+            -- horizontal laengst da, gilt der Punkt als erledigt
+            if not reached and flat.Magnitude < 7.2
+               and now - (PATH.idxAt or now) > 0.5 then
+                reached = true
+            end
         end
         if not reached then break end
         PATH.idx = PATH.idx + 1
@@ -738,12 +1639,45 @@ local function followPath(pos)
     if PATH.idx > #wps then PATH.wps = nil return nil end
     local wp = wps[PATH.idx]
 
+    -- KLETTERN. Der Spielcode (Parkour-Modul) setzt shared.touchingTruss nur,
+    -- wenn ein Strahl aus der BLICKRICHTUNG des Charakters (LookVector * 4)
+    -- einen TrussPart trifft, bei 6 Studs Reichweite. Der Blick folgt der
+    -- Laufrichtung, also muss exakt auf die Leiter zugehalten werden — auf
+    -- den Zielknoten oben zuzulaufen reicht nicht, seitlich daneben klettert
+    -- er nie. Gesprungen wird dabei nicht: ein Sprung an der Leiter heisst
+    -- loslassen (das faengt tryJump bereits ab).
+    if wp.kind == "climb" then
+        local best, bd
+        for _, l in ipairs(ladders()) do
+            if l.Parent then
+                local d = ((l.Position - pos) * Vector3.new(1, 0, 1)).Magnitude
+                local top = l.Position.Y + l.Size.Y * 0.5
+                -- nur Leitern, die uns tatsaechlich zu diesem Wegpunkt bringen
+                if d < 16 and top > pos.Y + 2 and (not bd or d < bd) then
+                    best, bd = l, d
+                end
+            end
+        end
+        if best then
+            AP.ladder = best
+            local v = (best.Position - pos) * Vector3.new(1, 0, 1)
+            if v.Magnitude > 0.1 then return v.Unit end
+        end
+    end
+
     -- Sprung beim ANLAUF ausloesen statt beim Erreichen: bei ~30 Studs/s ist
     -- der Absprungpunkt sonst schon ueberlaufen. Pro Wegpunkt genau einmal,
     -- sonst haengt der Tap-Timer dauerhaft fest.
+    -- Die Ausloesedistanz muss mit dem Tempo mitwachsen, sonst ist sie eine
+    -- feste Strecke bei variabler Geschwindigkeit: 4.5 Studs sind bei
+    -- WalkSpeed 16 ein Vorlauf von 280 ms (er springt viel zu frueh und
+    -- landet vor der Luecke), bei 37 nur noch 120 ms (zu spaet). Konstant
+    -- gehalten wird deshalb die ZEIT bis zum Absprungpunkt.
     if wp.Action == Enum.PathWaypointAction.Jump and not PATH.jumped[PATH.idx] then
         local toWp = (wp.Position - pos) * Vector3.new(1, 0, 1)
-        if toWp.Magnitude < 4.5 then
+        local humNow = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+        local spdNow = humNow and math.max(humNow.WalkSpeed, 8) or 32
+        if toWp.Magnitude < math.clamp(spdNow * 0.16, 2.5, 7) then
             PATH.jumped[PATH.idx] = true
             tryJump()
         end
@@ -2055,6 +2989,8 @@ local function autopilotStep(threat, threatD, prey, preyD)
             climbGoal = nil
         end
     elseif wantUp then
+        -- Nahbereichs-Notloesung. Die eigentliche Vertikalplanung macht der
+        -- Navigationsgraph; das hier greift nur, wenn gerade kein Weg laeuft.
         -- Eine Leiter wird NUR benutzt, wenn sie wirklich hilft: grob in
         -- Zielrichtung, naeher als das Ziel, hoch genug — und nur, wenn der
         -- direkte Weg zum Ziel tatsaechlich blockiert ist. Sonst klettert er
@@ -2202,6 +3138,10 @@ local function autopilotStep(threat, threatD, prey, preyD)
     ---------------------------------------------------------------
     -- Pfad statt Gier: bei weiten Wegen und beim Haengenbleiben
     ---------------------------------------------------------------
+    -- Jeden Frame zuruecksetzen: der Jagdzweig setzt es gleich wieder, aber
+    -- beim Wechsel in die Flucht bliebe es sonst dauerhaft haengen und die
+    -- Finten waeren fuer den Rest der Runde aus.
+    rawset(CFG, "__chasing", false)
     local wantPath = false
     local pathTarget = nil
     if mode == "JAGD" and prey and preyD then
@@ -2270,8 +3210,15 @@ local function autopilotStep(threat, threatD, prey, preyD)
         end
         if preyTarget and not closeDanger then
             AP.escNode = nil
-            wantPath, pathTarget = true, preyTarget.pos
+            -- fester Verfolgungspunkt statt der zappelnden Live-Position
+            local cp = chasePoint(pos, preyTarget.pl)
+            wantPath, pathTarget = true, cp or preyTarget.pos
+            AP.chasePoint = cp
             AP.routeTo = preyTarget.pl and preyTarget.pl.Name or nil
+            rawset(CFG, "__chasing", true)    -- schaltet AYIP ab
+        else
+            AP.chasePoint = nil
+            rawset(CFG, "__chasing", false)
         end
 
         local needNew = not AP.escNode
@@ -2327,7 +3274,12 @@ local function autopilotStep(threat, threatD, prey, preyD)
         local moved = PATH.target and (PATH.target - pathTarget).Magnitude or math.huge
         -- nach mehreren Fehlschlaegen seltener neu rechnen (spart Last)
         local minAge = (PATH.fails >= 3) and 4.0 or 0.8
-        if (not PATH.wps and age > minAge) or age > 2.5 or moved > 18 then
+        -- Alter allein reicht als Ausloeser nicht: bei Vollgas (37 Studs/s)
+        -- sind 2.5 s ganze 92 Studs Fahrt, der Pfad ist dann laengst Makulatur
+        -- — bei WalkSpeed 16 dagegen nur 40. Darum zusaetzlich die seit der
+        -- letzten Rechnung zurueckgelegte Strecke pruefen.
+        local runSince = PATH.from and (pos - PATH.from).Magnitude or math.huge
+        if (not PATH.wps and age > minAge) or age > 2.5 or moved > 18 or runSince > 55 then
             local v = pathTarget - pos
             local cands = { pathTarget }
             local down = workspace:Raycast(pathTarget + Vector3.new(0, 4, 0), Vector3.new(0, -80, 0), AP.rp)
@@ -2632,6 +3584,7 @@ local function assistStep(dt)
         buildNodes()
         helpers()
         ladders()
+        ensureGraph()
     end
 
     -- Anzeige-Flags gehoeren zum Fluchtzweig; ohne Ruecksetzen bleiben sie
@@ -3264,6 +4217,7 @@ function ENV.cleanup()
     ENV.alive = false
     pcall(function() RunService:UnbindFromRenderStep(RENDER_NAME) end)
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+    pcall(visClear)     -- nur der eigene Ordner, sonst nichts in workspace
     AP.mode, AP.vec = nil, nil
     if CFG.thirdPerson then CFG.thirdPerson = false pcall(thirdStop) end
     -- Hooks zurueckbauen

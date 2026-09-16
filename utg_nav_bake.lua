@@ -51,15 +51,19 @@ local function profile()
 end
 
 local CFG = {
-    cell = 8,            -- Rasterweite; groeber als die Probe, der Graph
-                         -- muss zur Laufzeit durchsuchbar bleiben
-    maxLevels = 10,
+    -- Der Bake laeuft EINMAL pro Map und beeinflusst die Laufzeit nicht —
+    -- die Maps sind ein fester Pool in Rotation. Also wird gruendlich
+    -- abgetastet statt sparsam: mit Raster 8 zerriss der Graph an schmalen
+    -- Rampen (ueber 45 Studs Hoehe nur 1 von 12 Zielen erreicht), mit 6
+    -- waren immer noch 35 % der Innenraum-Knoten unverbunden.
+    cell = 4,
+    maxLevels = 14,      -- Stockwerke pro Saeule
     agentHeight = 5,
     maxSlope = 50,
     stepUp = 3.0,        -- Hoehe, die Gehen noch schafft
     wallChainMax = 25,   -- wie hoch eine Wallride-Kette traegt
-    nodeCap = 9000,
-    rayBudget = 600,
+    nodeCap = 120000,   -- TeapotTemple riss 45000 -> Bake brach mittendrin ab
+    rayBudget = 2500,    -- darf beim Backen ruckeln, laeuft ja nur einmal
 }
 
 ------------------------------------------------------------------
@@ -122,7 +126,12 @@ end
 
 local function sampleNodes(bb, onProgress)
     local nodes, grid = {}, {}
-    local cell = CFG.cell
+    -- Rasterweite an die Mapgroesse koppeln. Feiner ist nicht besser:
+    -- mit festem Raster 4 kam TeapotTemple auf 51244 Knoten, und A* fand
+    -- danach nur noch 4 von 15 Wegen bei 111 ms — gegenueber 20/20 bei
+    -- 30 ms und 18000 Knoten. Ziel sind daher rund 20000 Knoten.
+    local area = math.max((bb.max.X - bb.min.X) * (bb.max.Z - bb.min.Z), 1)
+    local cell = math.clamp(math.sqrt(area / 8000), CFG.cell, 9)
     local nx = math.floor((bb.max.X - bb.min.X) / cell)
     local nz = math.floor((bb.max.Z - bb.min.Z) / cell)
     local cosLimit = math.cos(math.rad(CFG.maxSlope))
@@ -191,22 +200,67 @@ local function nearest(grid, bb, cell, pos, maxDist, maxDy)
     return best
 end
 
--- 4a) GEHEN
+-- 4a) GEHEN, STUFEN und ABSAETZE zwischen benachbarten Zellen.
+-- Wichtig: Sprungkanten entstehen sonst nur zwischen RANDknoten. Eine
+-- Treppenstufe mitten in einer Treppe ist kein Randknoten — Hoehen
+-- zwischen stepUp und Sprunghoehe bekamen dadurch GAR KEINE Kante, und
+-- genau daran zerreisst der Graph an jeder Treppe. Darum hier zusaetzlich
+-- "hop" nach oben und "step" nach unten fuer alle Nachbarn.
+-- Ist der Weg zwischen zwei Knoten begehbar? Ein einzelner Strahl von
+-- Zellenmitte zu Zellenmitte reicht dafuer NICHT: eine Tuer ist schmaler
+-- als das Raster und liegt selten genau auf der Verbindungslinie. Gemessen
+-- auf CrossRoads waren dadurch nur 65 % der Innenknoten erreichbar
+-- gegenueber 88 % draussen — ganze Raeume hingen unverbunden im Graphen.
+-- Darum bei Blockade zusaetzlich quer versetzte Strahlen: findet den
+-- Durchgang auch dann, wenn er seitlich der Ideallinie liegt.
+local function passable(a, c)
+    if not cast(a, c - a) then return true end
+    local flat = (c - a) * Vector3.new(1, 0, 1)
+    if flat.Magnitude < 0.1 then return false end
+    local side = Vector3.new(-flat.Unit.Z, 0, flat.Unit.X)
+    -- quer versetzt UND auf mehreren Hoehen: eine Tuerschwelle blockiert
+    -- unten, ein Sturz oben, und die Oeffnung liegt selten mittig
+    for _, off in ipairs({ 0, 1.2, -1.2, 2.0, -2.0 }) do
+        for _, up in ipairs({ 0, -1.4, 1.2 }) do
+            if not (off == 0 and up == 0) then
+                local lift = Vector3.new(0, up, 0)
+                local a2, c2 = a + side * off + lift, c + side * off + lift
+                if not cast(a2, c2 - a2) then return true end
+            end
+        end
+    end
+    return false
+end
+
 local function buildWalk(nodes, grid, prof)
     local dirs = { {1,0}, {0,1}, {1,1}, {1,-1}, {-1,1}, {-1,0}, {0,-1}, {-1,-1} }
-    local count = 0
+    local walk, hop, step = 0, 0, 0
     for i, n in ipairs(nodes) do
         for _, d in ipairs(dirs) do
             local b = grid[(n.ix+d[1]) .. "," .. (n.iz+d[2])]
             if b then
                 for _, o in ipairs(b) do
                     local dy = o.p.Y - n.p.Y
+                    local dist = (o.p - n.p).Magnitude
+                    local a = n.p + Vector3.new(0, 2.2, 0)
+                    local c = o.p + Vector3.new(0, 2.2, 0)
                     if math.abs(dy) <= CFG.stepUp then
-                        local a = n.p + Vector3.new(0, 2.2, 0)
-                        local c = o.p + Vector3.new(0, 2.2, 0)
-                        if not cast(a, c - a) then
-                            addEdge(n, o, "walk", (o.p - n.p).Magnitude / prof.speed)
-                            count = count + 1
+                        if passable(a, c) then
+                            addEdge(n, o, "walk", dist / prof.speed)
+                            walk = walk + 1
+                        end
+                    elseif dy > CFG.stepUp and dy <= prof.rise then
+                        -- Stufe hoch: braucht einen Sprung, ist aber kurz
+                        if passable(a, c) then
+                            addEdge(n, o, "hop", dist / prof.speed + 0.15)
+                            hop = hop + 1
+                        end
+                    elseif dy < -CFG.stepUp and dy > -30 then
+                        -- Stufe runter: einfach fallen lassen
+                        if passable(a, c) then
+                            addEdge(n, o, "step",
+                                    dist / prof.speed + math.sqrt(2 * math.abs(dy) / prof.g))
+                            step = step + 1
                         end
                     end
                 end
@@ -214,7 +268,7 @@ local function buildWalk(nodes, grid, prof)
         end
         if i % 300 == 0 then breathe() end
     end
-    return count
+    return walk, hop, step
 end
 
 -- 4b) KLETTERN an Leitern — das, was PathfindingService gar nicht kann
@@ -320,40 +374,59 @@ local function buildJumpDrop(nodes, grid, cell, prof)
     return jumps, drops, rim
 end
 
--- 4d) WALLRIDE-STEIGKETTE — der eigentliche Vertikal-Motor dieses Spiels.
--- Jeder Wallrun-Start gibt Auftrieb; die Kette traegt gemessen bis ~25 Studs.
-local function buildWallrun(nodes, grid, bb, cell, rim, prof)
-    local count = 0
-    for i, n in ipairs(rim) do
-        -- steile Wand in Reichweite?
-        local wallAt
-        for k = 0, 7 do
-            local ang = k * math.pi / 4
-            local dir = Vector3.new(math.cos(ang), 0, math.sin(ang)) * 5
-            local h = cast(n.p + Vector3.new(0, 3, 0), dir)
-            if h and math.abs(h.Normal.Y) < 0.25 then wallAt = h break end
+-- 4d) WALLRIDE — als Vertikalmittel BEWUSST NICHT VERWENDET.
+-- Es funktioniert nur an eigens markierten Waenden (Attribut "Wallrun"),
+-- die in diesen Maps sehr selten sind — auf Area51 keine einzige. Ueberall
+-- sonst braeuchte es shared.multipliers.EnableWallrunning, und auf einen
+-- Exploit-Schalter darf sich eine Route nicht stuetzen. Die Funktion bleibt
+-- fuer spaeter stehen, wird aber von NAV.bake nicht mehr aufgerufen.
+-- Der Spielcode (Wallrun-Modul) laesst einen Wallrun nur zu, wenn das
+-- getroffene Teil das Attribut "Wallrun" traegt — oder wenn
+-- shared.multipliers.EnableWallrunning gesetzt ist, und das ist ein
+-- Exploit-Schalter, auf den sich eine Route nicht stuetzen darf.
+-- Ein frueherer Versuch, jede steile Flaeche als kletterbar zu werten,
+-- hat 401 bis 953 Phantomkanten erzeugt.
+local function buildWallrun(nodes, grid, bb, cell, mapRoot, prof)
+    local walls = {}
+    for _, d in ipairs(mapRoot:GetDescendants()) do
+        if d:IsA("BasePart") and d:GetAttribute("Wallrun") then
+            walls[#walls+1] = d
         end
-        if wallAt then
-            -- gibt es oberhalb eine Standflaeche in Kettenreichweite?
-            for _, up in ipairs({ 10, 16, 22, CFG.wallChainMax }) do
-                local probe = n.p + Vector3.new(0, up, 0)
-                local o = nearest(grid, bb, cell, probe, 14, 6)
-                if o and o.id ~= n.id then
-                    local gain = o.p.Y - n.p.Y
-                    if gain > CFG.stepUp and gain <= CFG.wallChainMax then
-                        -- Weg an der Wand hoch muss frei sein
-                        if not cast(n.p + Vector3.new(0, 2, 0), Vector3.new(0, gain, 0)) then
-                            addEdge(n, o, "wallrun", gain / prof.wallSpeed + 0.5)
+    end
+    local count = 0
+    for _, w in ipairs(walls) do
+        -- Fusspunkte entlang der Wandbasis abtasten, je Seite
+        local cf, sz = w.CFrame, w.Size
+        local along = (sz.X >= sz.Z) and cf.RightVector or cf.LookVector
+        local len = math.max(sz.X, sz.Z)
+        local normal = (sz.X >= sz.Z) and cf.LookVector or cf.RightVector
+        for _, side in ipairs({ 1, -1 }) do
+            local steps = math.max(1, math.floor(len / 10))
+            for s = 0, steps do
+                local along_off = (s / math.max(steps,1) - 0.5) * len
+                local base = w.Position + along * along_off
+                            + normal * side * (math.min(sz.X, sz.Z) * 0.5 + 2.5)
+                local foot = nearest(grid, bb, cell,
+                                     Vector3.new(base.X, w.Position.Y - sz.Y * 0.5 + 3, base.Z),
+                                     12, 10)
+                if foot then
+                    local top = nearest(grid, bb, cell,
+                                        Vector3.new(base.X, w.Position.Y + sz.Y * 0.5, base.Z),
+                                        14, 8)
+                    if top and top.id ~= foot.id then
+                        local gain = top.p.Y - foot.p.Y
+                        if gain > CFG.stepUp and gain <= CFG.wallChainMax then
+                            addEdge(foot, top, "wallrun", gain / prof.wallSpeed + 0.5)
+                            addEdge(top, foot, "drop", math.sqrt(2 * gain / prof.g))
                             count = count + 1
-                            break
                         end
                     end
                 end
             end
         end
-        if i % 60 == 0 then breathe() end
+        breathe()
     end
-    return count
+    return count, #walls
 end
 
 -- 4e) Zipline und Jumppad
@@ -457,7 +530,11 @@ function NAV.findPath(startPos, goalPos)
 
     push(s.id, h(s))
     local visited = 0
-    while true do
+    -- Deckel gegen den teuersten Fall: gibt es gar keinen Weg, durchsucht
+    -- A* sonst den kompletten Graphen — auf einer grossen Map ueber 100 ms
+    -- pro vergeblicher Anfrage.
+    local budget = 12000
+    while visited < budget do
         local cur = pop()
         if not cur then break end
         if not closed[cur] then
@@ -502,11 +579,11 @@ function NAV.bake(onProgress)
     if #nodes < 50 then return nil, "zu wenige Knoten: " .. #nodes end
 
     local stats = {}
-    stats.walk = buildWalk(nodes, grid, prof)
+    stats.walk, stats.hop, stats.step = buildWalk(nodes, grid, prof)
     stats.climb = buildClimb(nodes, grid, bb, cell, mapRoot, prof)
     local j, d, rim = buildJumpDrop(nodes, grid, cell, prof)
     stats.jump, stats.drop, stats.rim = j, d, #rim
-    stats.wallrun = buildWallrun(nodes, grid, bb, cell, rim, prof)
+    stats.wallrun, stats.wallParts = 0, 0   -- siehe 4d: bewusst ausgeschlossen
     stats.zip, stats.pad = buildHelpers(nodes, grid, bb, cell, mapRoot, prof)
 
     NAV.graph = { nodes = nodes, grid = grid, cell = cell, bb = bb,
@@ -516,24 +593,116 @@ function NAV.bake(onProgress)
     return NAV.graph
 end
 
+local function navFileName(mapName)
+    return "utg_nav_" .. tostring(mapName):gsub("[^%w_%-]", "_") .. ".json"
+end
+
+-- Graph aus der Datei holen. Der Bake dauert gruendlich ~30 s; das lohnt
+-- sich einmal pro Map, aber nicht bei jedem Rundenwechsel — und die Maps
+-- sind ein fester Pool, der sich nicht aendert.
+-- Kompaktes Textformat statt JSON. Ein gruendlich gebackener Graph hat
+-- ueber 400.000 Kanten; als JSON sind das zweistellige Megabyte, und
+-- HttpService:JSONEncode scheitert daran stillschweigend. Hier steht je
+-- Knoten eine Zeile "x,y,z>ziel:art:kosten,..." mit einem Buchstaben je
+-- Kantenart — das ist rund ein Viertel so gross und laedt deutlich schneller.
+local KIND2CH = { walk="w", hop="h", step="s", jump="j", drop="d",
+                  climb="c", zip="z", pad="p", wallrun="r" }
+local CH2KIND = {}
+for k, v in pairs(KIND2CH) do CH2KIND[v] = k end
+
+function NAV.load(mapName)
+    if type(readfile) ~= "function" or type(isfile) ~= "function" then return nil end
+    local fn = navFileName(mapName)
+    local ok, blob = pcall(function()
+        if not isfile(fn) then return nil end
+        return readfile(fn)
+    end)
+    if not ok or type(blob) ~= "string" or #blob < 50 then return nil end
+
+    local lines = string.split(blob, "\n")
+    local head = string.split(lines[1] or "", "|")
+    if head[1] ~= "UTGNAV3" then return nil end
+    local cell = tonumber(head[3])
+    local bbv = string.split(head[4] or "", ",")
+    if not cell or #bbv < 6 then return nil end
+    local bb = { min = Vector3.new(tonumber(bbv[1]), tonumber(bbv[2]), tonumber(bbv[3])),
+                 max = Vector3.new(tonumber(bbv[4]), tonumber(bbv[5]), tonumber(bbv[6])) }
+
+    local nodes, grid = {}, {}
+    for i = 2, #lines do
+        local line = lines[i]
+        if #line > 2 then
+            local cut = string.find(line, ">", 1, true)
+            local posPart = cut and string.sub(line, 1, cut - 1) or line
+            local xyz = string.split(posPart, ",")
+            local p = Vector3.new(tonumber(xyz[1]) or 0, tonumber(xyz[2]) or 0,
+                                  tonumber(xyz[3]) or 0)
+            local ix = math.floor((p.X - bb.min.X) / cell + 0.5)
+            local iz = math.floor((p.Z - bb.min.Z) / cell + 0.5)
+            local e = {}
+            if cut then
+                for _, chunk in ipairs(string.split(string.sub(line, cut + 1), ",")) do
+                    if #chunk > 3 then
+                        local f = string.split(chunk, ":")
+                        local to = tonumber(f[1])
+                        if to then
+                            e[#e+1] = { to = to, k = CH2KIND[f[2]] or "walk",
+                                        c = tonumber(f[3]) or 1 }
+                        end
+                    end
+                end
+            end
+            local id = #nodes + 1
+            local nd = { p = p, ix = ix, iz = iz, id = id, e = e }
+            nodes[id] = nd
+            local k = ix .. "," .. iz
+            local b = grid[k] ; if not b then b = {} grid[k] = b end
+            b[#b+1] = nd
+        end
+    end
+    if #nodes < 50 then return nil end
+    NAV.graph = { nodes = nodes, grid = grid, cell = cell, bb = bb,
+                  prof = profile(), map = mapName,
+                  stats = { nodes = #nodes }, fromFile = true }
+    return NAV.graph
+end
+
 function NAV.save()
     local G = NAV.graph
-    if not G then return false end
-    local function r1(v) return math.floor(v*10+0.5)/10 end
-    local out = { map = G.map, cell = G.cell, version = 2,
-                  bb = { r1(G.bb.min.X), r1(G.bb.min.Y), r1(G.bb.min.Z),
-                         r1(G.bb.max.X), r1(G.bb.max.Y), r1(G.bb.max.Z) },
-                  nodes = {}, stats = G.stats }
+    if not G or type(writefile) ~= "function" then return false, "kein writefile" end
+    local function r1(v) return math.floor(v * 10 + 0.5) / 10 end
+    local function r2(v) return math.floor(v * 100 + 0.5) / 100 end
+
+    -- stueckweise zusammensetzen: ein einzelner String mit Millionen
+    -- Verkettungen sprengt den Speicher
+    local parts = {
+        ("UTGNAV3|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
+            r1(G.bb.min.X), r1(G.bb.min.Y), r1(G.bb.min.Z),
+            r1(G.bb.max.X), r1(G.bb.max.Y), r1(G.bb.max.Z))
+    }
+    local buf = {}
     for _, n in ipairs(G.nodes) do
         local es = {}
-        for _, e in ipairs(n.e) do es[#es+1] = { e.to, e.k, r1(e.c) } end
-        out.nodes[#out.nodes+1] = { r1(n.p.X), r1(n.p.Y), r1(n.p.Z), es }
+        for _, e in ipairs(n.e) do
+            es[#es+1] = e.to .. ":" .. (KIND2CH[e.k] or "w") .. ":" .. r2(e.c)
+        end
+        buf[#buf+1] = r1(n.p.X) .. "," .. r1(n.p.Y) .. "," .. r1(n.p.Z)
+                      .. ">" .. table.concat(es, ",")
+        if #buf >= 2000 then
+            parts[#parts+1] = table.concat(buf, "\n")
+            buf = {}
+        end
     end
-    local ok = pcall(function()
-        writefile("utg_nav_" .. G.map:gsub("[^%w_%-]", "_") .. ".json",
-                  HttpService:JSONEncode(out))
-    end)
-    return ok
+    if #buf > 0 then parts[#parts+1] = table.concat(buf, "\n") end
+
+    local blob = table.concat(parts, "\n")
+    local ok, err = pcall(writefile, navFileName(G.map), blob)
+    if not ok then return false, tostring(err) end
+    -- wirklich nachsehen statt dem pcall zu glauben
+    if type(isfile) == "function" and not isfile(navFileName(G.map)) then
+        return false, "Datei nach dem Schreiben nicht vorhanden"
+    end
+    return true, #blob
 end
 
 return NAV
