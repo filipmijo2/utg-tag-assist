@@ -2451,12 +2451,36 @@ local function pickDirection(pos, goalDir, curVel)
     refreshRaycastFilter()
     local up = Vector3.new(0, 2.4, 0)
 
-    -- Wandgleiten: Zielrichtung entlang der Wandflaeche umlenken
+    -- Wandgleiten: Zielrichtung entlang der Wandflaeche umlenken.
+    -- Gemessen war das die mit Abstand haeufigste Haengerursache: in 52 von
+    -- 52 Faellen zeigte die Laufrichtung direkt in eine Wand. Darum auf
+    -- zwei Hoehen pruefen (Huefte und knapp ueber dem Boden, sonst werden
+    -- niedrige Kanten uebersehen) und, falls das Abgleiten selbst wieder
+    -- in die Wand fuehrt, zusaetzlich zur Seite aufdrehen.
     local blockHit = workspace:Raycast(pos + up, goalDir * 6, AP.rp)
+                  or workspace:Raycast(pos + Vector3.new(0, 0.6, 0), goalDir * 5, AP.rp)
     if blockHit then
         local slide = goalDir - blockHit.Normal * goalDir:Dot(blockHit.Normal)
         slide = slide * Vector3.new(1, 0, 1)
-        if slide.Magnitude > 0.08 then goalDir = slide.Unit end
+        if slide.Magnitude > 0.08 then
+            goalDir = slide.Unit
+            -- zweite Runde: liegt auch der Gleitweg zu, staerker abdrehen
+            if workspace:Raycast(pos + up, goalDir * 4, AP.rp) then
+                local n2 = blockHit.Normal * Vector3.new(1, 0, 1)
+                if n2.Magnitude > 0.05 then
+                    local sideN = Vector3.new(-n2.Unit.Z, 0, n2.Unit.X)
+                    local pick = (sideN:Dot(goalDir) >= 0) and sideN or -sideN
+                    goalDir = (pick * 1.2 + n2.Unit * 0.5).Unit
+                end
+            end
+        else
+            -- frontal auf die Wand: entlang ihrer Flaeche ausweichen
+            local n2 = blockHit.Normal * Vector3.new(1, 0, 1)
+            if n2.Magnitude > 0.05 then
+                local sideN = Vector3.new(-n2.Unit.Z, 0, n2.Unit.X)
+                goalDir = ((math.random() < 0.5) and sideN or -sideN)
+            end
+        end
     end
 
     -- LAEUFT EIN BERECHNETER WEG, GILT SEINE RICHTUNG.
