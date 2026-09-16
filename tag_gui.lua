@@ -2040,7 +2040,10 @@ local function followPath(pos)
             -- Hier darf weder die Y-Toleranz noch der Notausgang greifen,
             -- sonst gilt der Punkt als erledigt, bevor ueberhaupt geklettert
             -- wurde — der Bot laeuft dann unten daran vorbei.
-            reached = flat.Magnitude < 5.0 and dy < 5
+            -- eng greifen: bei 5 Studs galt die Leiter als erreicht,
+            -- obwohl er noch gar nicht an ihr haengt — er lief dann
+            -- seitlich daran vorbei
+            reached = flat.Magnitude < 2.0 and dy < 5
         else
             -- Die Hoehentoleranz muss ASYMMETRISCH sein. Mit einem
             -- symmetrischen Fenster von 12 Studs hakt der Bot einen
@@ -2058,7 +2061,10 @@ local function followPath(pos)
             -- erlaubt ist und er sonst beim Absteigen klebt.
             local up = wp.Position.Y - pos.Y
             local heightOk = up < 2.5 and up > -12
-            reached = flat.Magnitude < 3.0 and heightOk
+            -- Tuerdurchgaenge muessen genau getroffen werden: bei 3 Studs
+            -- Toleranz schneidet er die Ecke und laeuft in den Rahmen.
+            local tight = (wp.kind == "via") and 1.6 or 3.0
+            reached = flat.Magnitude < tight and heightOk
             -- oder schon daran vorbei: hinter der Ebene senkrecht zum Wegstueck
             if not reached and PATH.idx > 1 and flat.Magnitude < 7.2 and heightOk then
                 local seg = (wp.Position - wps[PATH.idx - 1].Position) * Vector3.new(1, 0, 1)
@@ -3841,7 +3847,13 @@ local function autopilotStep(threat, threatD, prey, preyD)
         -- — bei WalkSpeed 16 dagegen nur 40. Darum zusaetzlich die seit der
         -- letzten Rechnung zurueckgelegte Strecke pruefen.
         local runSince = PATH.from and (pos - PATH.from).Magnitude or math.huge
-        if (not PATH.wps and age > minAge) or age > 2.5 or moved > 18 or runSince > 55 then
+        -- Ein STEHENDES Ziel braucht keine Neuberechnung. Beim Weglaufen ist
+        -- der Fluchtpunkt fix, da war "alle 2.5 s neu" reine Last — genau
+        -- daher kamen 50 Anfragen in 30 s. Neu gerechnet wird jetzt nur bei
+        -- fehlendem Weg, bewegtem Ziel (Jagd) oder viel gelaufener Strecke;
+        -- die 8 s sind nur noch ein Sicherheitsnetz gegen veraltete Wege.
+        if (not PATH.wps and age > minAge) or moved > 18 or runSince > 70
+           or age > 8 then
             local v = pathTarget - pos
             local cands = { pathTarget }
             local down = workspace:Raycast(pathTarget + Vector3.new(0, 4, 0), Vector3.new(0, -80, 0), AP.rp)
