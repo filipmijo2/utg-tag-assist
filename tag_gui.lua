@@ -3882,11 +3882,16 @@ local function autopilotStep(threat, threatD, prey, preyD)
     -- Grenzen: ab 70 Studs wird geplant, erst unter 45 wieder direkt
     -- gesteuert.
     if wantPath and pathTarget then
-        local toGoal = ((pathTarget - pos) * Vector3.new(1, 0, 1)).Magnitude
+        -- ECHTE Entfernung, nicht nur die horizontale. Ein Ziel 30 Studs
+        -- unter einem, aber nur 10 Studs seitlich, galt sonst als "nah":
+        -- die freie Steuerung lief dann auf die Position ueber ihm zu und
+        -- kreiste dort, weil sie da nie ankommt. Wer in einer Hoehle oder
+        -- einem Stockwerk darunter sitzt, braucht immer eine Route.
+        local toGoal = (pathTarget - pos).Magnitude
         -- Hoehenunterschied bleibt Sache des Graphen, auch auf kurze
         -- Distanz: eine Leiter direkt vor der Nase findet die freie
         -- Steuerung nie.
-        local climbNeed = math.abs(pathTarget.Y - pos.Y) > 14
+        local climbNeed = math.abs(pathTarget.Y - pos.Y) > 8
         -- Gemessen nach Modus getrennt (GlassHouses, je Minute):
         --   FLUCHT   mit Route 337 Fehler, ohne Route  96
         --   STREIFEN mit Route  34 Fehler, ohne Route  29
