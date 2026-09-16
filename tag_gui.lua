@@ -2187,12 +2187,19 @@ local function followPath(pos)
     -- WalkSpeed 16 ein Vorlauf von 280 ms (er springt viel zu frueh und
     -- landet vor der Luecke), bei 37 nur noch 120 ms (zu spaet). Konstant
     -- gehalten wird deshalb die ZEIT bis zum Absprungpunkt.
-    if wp.Action == Enum.PathWaypointAction.Jump and not PATH.jumped[PATH.idx] then
+    -- NACHFASSEN: ein einziger Versuch je Wegpunkt reicht nicht. Klappt der
+    -- Sprung nicht (Kante gestreift, zu frueh abgesprungen), blieb der Bot
+    -- vor kniehohen Erhoehungen stehen, ueber die er locker kommt — der
+    -- Punkt galt wegen der Fusshoehen-Pruefung nie als erreicht. Darum alle
+    -- 0.45 s erneut, solange er noch davorsteht.
+    if wp.Action == Enum.PathWaypointAction.Jump then
         local toWp = (wp.Position - pos) * Vector3.new(1, 0, 1)
         local humNow = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
         local spdNow = humNow and math.max(humNow.WalkSpeed, 8) or 32
-        if toWp.Magnitude < math.clamp(spdNow * 0.16, 2.5, 7) then
-            PATH.jumped[PATH.idx] = true
+        local lastTry = PATH.jumped[PATH.idx] or 0
+        if toWp.Magnitude < math.clamp(spdNow * 0.16, 2.5, 7)
+           and now - lastTry > 0.45 then
+            PATH.jumped[PATH.idx] = now
             tryJump()
         end
     end
