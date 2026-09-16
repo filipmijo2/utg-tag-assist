@@ -3059,7 +3059,7 @@ end
 
 local JUKE_MOVES = {
     -- 180 Grad antaeuschen und sofort wieder zurueck
-    {   name = "double180", cd = 3, minLevel = 1, maxD = 25,
+    {   name = "double180", cd = 5, minLevel = 1, maxD = 25,
         init = function(ctx, m)
             m.back = ctx.facing
             m.s = (math.random() < 0.5) and 1 or -1
@@ -3084,7 +3084,7 @@ local JUKE_MOVES = {
         end },
 
     -- 180 Grad wirklich durchziehen und am Verfolger vorbeilaufen
-    {   name = "commit180", cd = 3, minLevel = 2, maxD = 23,
+    {   name = "commit180", cd = 5, minLevel = 2, maxD = 23,
         init = function(ctx, m)
             m.s = (math.random() < 0.5) and 1 or -1
         end,
@@ -3108,7 +3108,7 @@ local JUKE_MOVES = {
     -- kostet (das Spiel setzt es auf 0, sobald die Seitgeschwindigkeit
     -- unter 6.8 faellt) und der Verfolger einen harten Knick ohnehin
     -- mitgeht. Ein Bogen laesst ihn dagegen aussen vorbeilaufen.
-    {   name = "circle", cd = 3, minLevel = 1, maxD = 25, skipWall = true,
+    {   name = "circle", cd = 5, minLevel = 1, maxD = 25, skipWall = true,
         init = function(ctx, m)
             m.s = (math.random() < 0.5) and 1 or -1
             -- 270 Grad reicht meist, 450 ist die anderthalbfache Runde
@@ -3126,7 +3126,7 @@ local JUKE_MOVES = {
             return nil
         end },
     -- wieder auf dem Ausgangspunkt landen
-    {   name = "bamboozle", cd = 5, minLevel = 2, maxD = 25, mapMove = true,
+    {   name = "bamboozle", cd = 8, minLevel = 2, maxD = 25, mapMove = true,
         ready = function(ctx)
             local near = groundAt(ctx.pos, ctx.facing, 4, 10)
             local far = groundAt(ctx.pos, ctx.facing, 11, 14)
@@ -3147,7 +3147,7 @@ local JUKE_MOVES = {
 
     -- Treppen-/Leiterfinte: Aufstieg antaeuschen, dann abspringen.
     -- Entweder zurueck zum Ausgangspunkt oder seitlich weiter.
-    {   name = "stairJuke", cd = 5, minLevel = 2, maxD = 34, mapMove = true,
+    {   name = "stairJuke", cd = 8, minLevel = 2, maxD = 34, mapMove = true,
         ready = function(ctx) return findRise(ctx.pos, ctx.facing) ~= nil end,
         init = function(ctx, m)
             local dir, kind = findRise(ctx.pos, ctx.facing)
@@ -3172,7 +3172,7 @@ local JUKE_MOVES = {
         end },
 
     -- Rollfinte: waehrend der Rolle die Richtung wechseln
-    {   name = "rollFeint", cd = 3, minLevel = 1, maxD = 25,
+    {   name = "rollFeint", cd = 5, minLevel = 1, maxD = 25,
         init = function(ctx, m)
             m.dir = turn(ctx.facing, (math.random() < 0.5) and 70 or -70)
             m.fired = false
@@ -3192,9 +3192,11 @@ local JUKE_MOVES = {
 
 }
 
--- Abstand bis zum naechsten Manoever, je Stufe
+-- Abstand bis zum naechsten Manoever, je Stufe. Deutlich groesser als
+-- vorher (2.6/1.8/1.2): dauernde Tricks sehen nicht nach Koennen aus,
+-- sondern nach Zappeln, und kosten jedes Mal Strecke.
 local function jukeGap(level)
-    return ({ 2.6, 1.8, 1.2 })[level] or 2.6
+    return ({ 4.5, 3.4, 2.4 })[level] or 4.5
 end
 
 -- Waehlt ein Manoever und fuehrt es aus. Rueckgabe: Richtung oder nil.
@@ -5268,7 +5270,7 @@ ayipBtn.Activated:Connect(function()
 end)
 refreshAyip()
 
-local _, rThird = makeButton("3rd Person  [T]", function() return CFG.thirdPerson end,
+local _, rThird = makeButton("3rd Person  [RightAlt]", function() return CFG.thirdPerson end,
                       function() ENV.toggleThird() end)
 rFree = rThird
 
@@ -5426,7 +5428,11 @@ conns[#conns + 1] = UserInputService.InputBegan:Connect(function(i, gp)
     if gp then return end
     if i.KeyCode == Enum.KeyCode.RightControl then
         main.Visible = not main.Visible
-    elseif i.KeyCode == Enum.KeyCode.T then
+    elseif i.KeyCode == Enum.KeyCode.RightAlt then
+        -- Frueher lag das auf T. Die Taste wird im Spiel anderweitig
+        -- gebraucht, und jeder Druck hat unbemerkt die Verfolgerkamera
+        -- eingeschaltet - die haengt hinter dem Charakter und wirkt wie
+        -- eine Kopplung von Kamera und Spieler. Jetzt auf RightAlt.
         task.spawn(function()
             ENV.toggleThird()
             if rFree then rFree() end
