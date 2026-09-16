@@ -1667,10 +1667,10 @@ end
 --     Macht sichtbar, was der Graph plant: je Wegpunkt ein Wuerfel,
 --     eingefaerbt nach Kantenart. Rein lokal, nichts davon repliziert.
 ------------------------------------------------------------------
--- Die Anzeige baut bei jedem neuen Weg bis zu 50 Parts neu auf. Das ist
--- zum Nachvollziehen nuetzlich, kostet aber Bildrate — daher aus, bis
--- sie ueber die GUI eingeschaltet wird.
-local PATHVIS = { folder = nil, on = false }
+-- Die Anzeige baut bei jedem neuen Weg Parts neu auf. Das war einmal ein
+-- Bildratenproblem, weil der Weg 50 mal in 30 s berechnet wurde; seit der
+-- Drosselung sind es 4, damit ist sie wieder tragbar.
+local PATHVIS = { folder = nil, on = true, dirPart = nil }
 local KIND_COLOR = {
     walk    = Color3.fromRGB(235, 235, 235),
     hop     = Color3.fromRGB(255, 210,  60),
@@ -1690,6 +1690,38 @@ local function visClear()
         pcall(function() PATHVIS.folder:Destroy() end)
         PATHVIS.folder = nil
     end
+    if PATHVIS.dirPart then
+        pcall(function() PATHVIS.dirPart:Destroy() end)
+        PATHVIS.dirPart = nil
+    end
+end
+
+-- Im Nahbereich gibt es keinen Weg, sondern nur eine Richtung. Damit auch
+-- dort sichtbar ist, wohin gesteuert wird, zeigt ein flacher Balken die
+-- aktuelle Laufrichtung an.
+local function visDirection(pos, dir)
+    if not PATHVIS.on or not dir then
+        if PATHVIS.dirPart then
+            pcall(function() PATHVIS.dirPart:Destroy() end)
+            PATHVIS.dirPart = nil
+        end
+        return
+    end
+    pcall(function()
+        local p = PATHVIS.dirPart
+        if not p or not p.Parent then
+            p = Instance.new("Part")
+            p.Name = "UTG_Dir"
+            p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch = true, false, false, false
+            p.Material = Enum.Material.Neon
+            p.Color = Color3.fromRGB(120, 255, 180)
+            p.Transparency = 0.35
+            p.Size = Vector3.new(0.5, 0.2, 14)
+            p.Parent = workspace
+            PATHVIS.dirPart = p
+        end
+        p.CFrame = CFrame.lookAt(pos + Vector3.new(0, -2.4, 0) + dir * 7, pos + dir * 14)
+    end)
 end
 
 local function visPath(wps)
@@ -2567,6 +2599,40 @@ local function pickDirection(pos, goalDir, curVel)
                         end
                     end
                 end
+                -- Wissen aus dem Map-Scan einbeziehen: der Graph kennt zu
+                -- jeder Stelle die Zahl der Wege und ob dort Leitern oder
+                -- Stufen ansetzen. Die freie Nahbereichssteuerung hatte das
+                -- bisher nicht - sie sah nur Strahlen.
+                local gBonus = 0
+                do
+                    local NG = getgenv().__UTG_NAV_GRAPH
+                    local G = NG and NG.graph
+                    if G then
+                        local probe = pos + dir * 10
+                        local ix = math.floor((probe.X - G.bb.min.X) / G.cell + 0.5)
+                        local iz = math.floor((probe.Z - G.bb.min.Z) / G.cell + 0.5)
+                        local bucket = G.grid[ix .. "," .. iz]
+                        if bucket then
+                            local best
+                            for _, nd in ipairs(bucket) do
+                                if math.abs(nd.p.Y - pos.Y) < 9
+                                   and (not best or #nd.e > #best.e) then best = nd end
+                            end
+                            if best then
+                                -- wenige Wege = Ecke oder Innenraum, teuer
+                                gBonus = gBonus + (math.min(#best.e, 10) - 5) * 0.45
+                                if best.bad then gBonus = gBonus - 4 end
+                                -- Leitern und Stufen ausdruecklich belohnen
+                                for _, e in ipairs(best.e) do
+                                    if e.k == "climb" then gBonus = gBonus + 2.5 break
+                                    elseif e.k == "hop" then gBonus = gBonus + 0.8 break end
+                                end
+                            else
+                                gBonus = gBonus - 1.5   -- dort kennt der Scan gar nichts
+                            end
+                        end
+                    end
+                end
                 local s = align * (AP.mode == "JAGD" and 3.2 or 1.5)
                         - threatPen
                         + (clear[i] or 0) * 1.8
@@ -2582,6 +2648,7 @@ local function pickDirection(pos, goalDir, curVel)
                         -- Zielrichtung schwerer wog als der fehlende Ausweg.
                         + open * 3.2
                         + ((open < 0.35) and -3.5 or 0)
+                        + gBonus
                         + mid                   -- am Rand zur Mitte ziehen
                         + keep
                 ranked[#ranked + 1] = { dir = dir, s = s, jump = jump[i] }
@@ -4407,6 +4474,9 @@ local function autopilotStep(threat, threatD, prey, preyD)
         end
     end
 
+    -- auch die Nahbereichsrichtung sichtbar machen, nicht nur geplante Wege
+    pcall(visDirection, pos, (not AP.usingPath) and goal or nil)
+
     pcall(failTick, pos, hum, goal ~= nil)
 
     -- AUSBRUCH: steckt er beim Jagen in einer Kammer/Hoehle fest (kein Pfad,
@@ -4623,6 +4693,17 @@ local function assistStep(dt)
         S.boosts.__utg = nil
     else
         S.boosts.__utg = { Speed = state.speedMul, Accel = wantAccel, Jump = wantJump }
+    end
+    -- Waehrend einer Finte zusaetzlich Tempo geben: das Manoever soll den
+    -- Verfolger abhaengen, und der Umweg, den ein Bogen kostet, muss
+    -- wieder hereingeholt werden. Eigener Boost-Eintrag, damit er den
+    -- normalen nicht ueberschreibt und mit dem Manoever endet.
+    if S.boosts then
+        if AP.jukeName then
+            S.boosts.__utgjuke = { Speed = 1.18, Accel = 1.5, Jump = 1 }
+        else
+            S.boosts.__utgjuke = nil
+        end
     end
 
     ---------------------------------------------------------------
@@ -5102,7 +5183,10 @@ local _, rAuto = makeButton("Autopilot (alles)", function() return CFG.autopilot
                 m.RangeMultiplier, m.TagRaySpread = 1, 1
                 m.RotateInMoveDirection, m.RunInAllDirections = false, false
             end
-            if RENV.shared.boosts then RENV.shared.boosts.__utg = nil end
+            if RENV.shared.boosts then
+                RENV.shared.boosts.__utg = nil
+                RENV.shared.boosts.__utgjuke = nil
+            end
         end
     end)
 
@@ -5334,7 +5418,7 @@ function ENV.cleanup()
         hookedCM = nil
     end
     local S = RENV.shared
-    if S and S.boosts then S.boosts.__utg = nil end
+    if S and S.boosts then S.boosts.__utg = nil ; S.boosts.__utgjuke = nil end
     if S and S.multipliers then
         S.multipliers.RangeMultiplier = 1
         S.multipliers.TagRaySpread = 1
