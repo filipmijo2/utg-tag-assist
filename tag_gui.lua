@@ -645,6 +645,17 @@ local function tryJump(force)
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     if hum and hum:GetState() == Enum.HumanoidStateType.Climbing and not force then return end
     if RENV.shared.touchingTruss and not force then return end
+    -- Gemessen: 22 Spruenge pro Minute, davon 20 von 29 ohne jeden
+    -- Wegbezug — die freie Steuerung sprang praktisch dauernd. Ergebnis
+    -- waren 42 % Luftzeit, und in der Luft ist die Steuerung traege: genau
+    -- daher die vielen kleinen Haenger. Ein Sprung ohne konkreten Anlass
+    -- braucht deshalb Abstand zum vorigen; erzwungene Spruenge (Parkour,
+    -- Wegpunkte mit Sprungmarke) bleiben unberuehrt.
+    if not force then
+        local nowJ = time()
+        if AP.lastFreeJump and nowJ - AP.lastFreeJump < 0.85 then return end
+        AP.lastFreeJump = nowJ
+    end
     RENV.shared.jumpMobileTap = time() + 0.12
 end
 
