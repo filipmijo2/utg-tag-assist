@@ -5012,6 +5012,19 @@ end
 
 local function thirdStop()
     pcall(function() RunService:UnbindFromRenderStep(TP_STEP) end)
+    -- Die Kamera zurueckgeben: der Modus setzt sie auf Scriptable, und
+    -- ohne Ruecksetzen bleibt sie daran haengen. Sie folgt dann weiter dem
+    -- Charakter und laesst sich nicht mehr frei drehen - genau das war als
+    -- "Kamera ist an den Spieler gekoppelt" sichtbar.
+    pcall(function()
+        local cam = workspace.CurrentCamera
+        if cam then
+            cam.CameraType = Enum.CameraType.Custom
+            local ch = LP.Character
+            local h = ch and ch:FindFirstChildOfClass("Humanoid")
+            if h then cam.CameraSubject = h end
+        end
+    end)
     LOG("3rd Person AUS")
 end
 
