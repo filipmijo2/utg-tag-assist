@@ -2955,29 +2955,28 @@ local JUKE_MOVES = {
 
     -- Knoechelbrecher: 12 Uhr -> 9 Uhr -> 3 Uhr, ab Stufe 2 auch
     -- zurueck auf 9 Uhr und dort bleiben
-    {   name = "ankleBreaker", cd = 3, minLevel = 1, maxD = 25,
+    -- Vollkreis-Manoever: 270 oder 450 Grad am Stueck, kontinuierlich
+    -- gedreht. Kein Umschnappen zwischen festen Richtungen — der Bot
+    -- laeuft wirklich einen Kreis, weil eine Sprungdrehung das Momentum
+    -- kostet (das Spiel setzt es auf 0, sobald die Seitgeschwindigkeit
+    -- unter 6.8 faellt) und der Verfolger einen harten Knick ohnehin
+    -- mitgeht. Ein Bogen laesst ihn dagegen aussen vorbeilaufen.
+    {   name = "circle", cd = 3, minLevel = 1, maxD = 25,
         init = function(ctx, m)
-            -- Seitwaerts MIT Vorwaertsanteil, so wie es die alte Mechanik
-            -- gemacht hat: ein harter 85-Grad-Knick bremst den Bot aus und
-            -- sieht abgehackt aus, waehrend eine Mischung das Momentum
-            -- mitnimmt und trotzdem den Haken setzt.
-            local s = (math.random() < 0.5) and 1 or -1
-            local fwd = ctx.facing
-            local side = Vector3.new(-fwd.Z, 0, fwd.X) * s
-            m.a = (side * 1.15 + fwd * 0.35).Unit
-            m.b = (-side * 1.25 + fwd * 0.3).Unit
-            m.third = (ctx.level >= 2) and (math.random() < 0.5)
+            m.s = (math.random() < 0.5) and 1 or -1
+            -- 270 Grad reicht meist, 450 ist die anderthalbfache Runde
+            m.total = (ctx.level >= 2 and math.random() < 0.4) and 450 or 270
+            -- so lang, dass es eine gefahrene Kurve wird und kein Drehen
+            -- auf der Stelle: rund 210 Grad pro Sekunde
+            m.dur = m.total / 210
         end,
         run = function(ctx, m, t)
-            -- Jede Richtung lange genug halten, sonst wirkt es wie Zittern
-            -- statt wie ein Haken: 0.26 s waren gerade acht Studs.
-            if t < 0.5 then return m.a end
-            if t < 1.05 then return m.b end
-            if m.third and t < 1.75 then return m.a end
+            if t < m.dur then
+                -- gleichmaessig aufdrehen statt springen
+                return turn(ctx.facing, m.s * m.total * (t / m.dur))
+            end
             return nil
         end },
-
-    -- Kanten-Finte: an der Klippe abspringen und im selben Sprung
     -- wieder auf dem Ausgangspunkt landen
     {   name = "bamboozle", cd = 5, minLevel = 2, maxD = 25, mapMove = true,
         ready = function(ctx)
