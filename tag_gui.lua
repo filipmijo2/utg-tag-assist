@@ -2928,11 +2928,14 @@ local JUKE_MOVES = {
             -- dann zunehmend nach hinten. Das haelt das Tempo (das Spiel
             -- setzt Momentum auf 0, sobald die Seitgeschwindigkeit unter
             -- 6.8 faellt) und sieht aus wie ein Bogen statt wie ein Knick.
-            if t < 0.55 then
-                local p = t / 0.55
+            -- Kuerzer gehalten als commit180: das Double-Back lebt davon,
+            -- schnell wieder zurueck zu sein, sonst ist es kein Antaeuschen
+            -- mehr, sondern ein halber Umweg.
+            if t < 0.38 then
+                local p = t / 0.38
                 return turn(ctx.facing, m.s * (75 + 95 * p))
             end
-            if t < 1.25 then return m.back end
+            if t < 0.85 then return m.back end
             return nil
         end },
 
@@ -2961,7 +2964,7 @@ local JUKE_MOVES = {
     -- kostet (das Spiel setzt es auf 0, sobald die Seitgeschwindigkeit
     -- unter 6.8 faellt) und der Verfolger einen harten Knick ohnehin
     -- mitgeht. Ein Bogen laesst ihn dagegen aussen vorbeilaufen.
-    {   name = "circle", cd = 3, minLevel = 1, maxD = 25,
+    {   name = "circle", cd = 3, minLevel = 1, maxD = 25, skipWall = true,
         init = function(ctx, m)
             m.s = (math.random() < 0.5) and 1 or -1
             -- 270 Grad reicht meist, 450 ist die anderthalbfache Runde
@@ -3105,7 +3108,11 @@ local function jukeStep(pos, facing, toThreat, threatD, level)
             -- Keine Finte in eine Wand: das kostet das gesamte Tempo und
             -- bringt nichts. Ist die Richtung zu, wird abgebrochen statt
             -- dagegenzulaufen.
-            if rayClear(pos, dir, 2.4, 9) < 0.7 then
+            -- Ausgenommen sind Kreise: wer sich 270 bis 450 Grad dreht,
+            -- zeigt zwangslaeufig zwischendurch auf eine Wand, ohne je
+            -- hineinzulaufen. Dort zaehlt allein die Zielrichtung, die
+            -- beim Start geprueft wird.
+            if not a.def.skipWall and rayClear(pos, dir, 2.4, 9) < 0.7 then
                 JUKE.cd[a.def.name] = now
                 JUKE.lastAny = now
                 JUKE.wallAborts = (JUKE.wallAborts or 0) + 1
@@ -3163,7 +3170,12 @@ local function jukeStep(pos, facing, toThreat, threatD, level)
     if def.init then def.init(ctx, m) end
     -- Startrichtung vorab pruefen, damit das Manoever gar nicht erst in
     -- eine Wand beginnt
+    -- Beim Kreis zaehlt die Richtung, in der er ENDET, nicht die, mit der
+    -- er beginnt
     local first = def.run(ctx, m, 0)
+    if def.skipWall and m.total and m.s then
+        first = turn(ctx.facing, m.s * m.total)
+    end
     if first and rayClear(pos, first, 2.4, 9) < 0.7 then
         JUKE.cd[def.name] = now
         JUKE.wallAborts = (JUKE.wallAborts or 0) + 1
