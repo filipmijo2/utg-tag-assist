@@ -2372,7 +2372,9 @@ local function probeDir(pos, dir)
     end
     local groundScore
     if gNear and gFar then groundScore = 1
-    elseif gNear then groundScore = 0.7   -- Schritt sicher, dahinter Kante
+    elseif gNear then groundScore = 0.25  -- Schritt sicher, dahinter Kante:
+                                          -- klar abwerten, sonst laeuft er
+                                          -- wissentlich darueber und faellt
     elseif gap then groundScore = 0.5     -- ueberspringbare Luecke
     else groundScore = -2.5 end           -- echter Abgrund direkt voraus
     -- Eis/rutschiges Zeug klar abwerten: dort ist die Steuerung weg
@@ -2507,7 +2509,12 @@ local function pickDirection(pos, goalDir, curVel)
                 local s = align * (AP.mode == "JAGD" and 3.2 or 1.5)
                         - threatPen
                         + (clear[i] or 0) * 1.8
-                        + (ground[i] or 0) * 1.6
+                        -- Boden deutlich staerker gewichten: mit 1.6 stand
+                        -- "sicherer Boden" gegen "dahinter Kante" nur 0.48
+                        -- auseinander, waehrend die Zielrichtung bis 3.2
+                        -- zaehlte. Ergebnis waren 43 Landungen bei 25
+                        -- Spruengen — er lief laufend ueber Kanten.
+                        + (ground[i] or 0) * 2.6
                         + open * 1.7            -- Ecken/Sackgassen abwerten
                         + mid                   -- am Rand zur Mitte ziehen
                         + keep
