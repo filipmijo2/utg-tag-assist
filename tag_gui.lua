@@ -117,14 +117,17 @@ local function ankles()
         -- die AYIP-Stufe aendert daran bewusst nichts.
         minDist  = CFG.feintDist or 15,
         cross    = a >= 6,               -- darf quer am Verfolger vorbei
-        burner   = a >= 6,               -- harte 180er direkt auf ihn zu
+        -- Die folgenden Einzelmanoever sind durch das Juke-Repertoire
+        -- (Abschnitt 5b) abgeloest und bleiben aus, damit sich beide
+        -- Systeme nicht gegenseitig die Richtung ueberschreiben.
+        burner   = false,
         -- Mischung: rund die Haelfte Kehren, der Rest Seitenfinten
         burnerP  = math.min(0.28 + 0.032 * a, 0.62),
-        doubleBack = a >= 6,             -- antaeuschen und scharf zurueck
-        squeeze  = a >= 6,               -- durch enge Luecken schluepfen
-        rollcut  = a >= 6,               -- mitten in der Rolle die Richtung wechseln
+        doubleBack = false,
+        squeeze  = false,
+        rollcut  = false,
         cornerPeel = a >= 6,             -- eng um die Ecke und dahinter abbiegen
-        bamboozle = a >= 6,              -- an der Kante 180 statt runter
+        bamboozle = false,
     }
 end
 
@@ -1570,6 +1573,7 @@ local PATH = { wps = nil, idx = 1, at = 0, target = nil, busy = false, fails = 0
                jumped = {} }
 AP.path = PATH
 ENV.ap = AP          -- fuer Diagnose von aussen
+ENV.cfg = CFG        -- dito: erlaubt Messlaeufe mit gesetzter AYIP-Stufe
 
 -- Ein Pfad direkt zum Gegner scheitert oft (er steht auf einem Dach, auf einer
 -- Leiter, in der Luft). Deshalb wird eine Kette von Zielen probiert: exakt,
@@ -2798,6 +2802,232 @@ local function findHighSpot(pos, dirHint)
     return best, bestPos
 end
 
+
+------------------------------------------------------------------
+-- 5b) AYIP — Juke-Repertoire
+--     Jeder Move ist ein eigener Eintrag mit Vorbedingung, Phasen und
+--     eigenem Cooldown. Frueher lagen die Manoever als lose Variablen
+--     (peelUntil, squeezeUntil, bamboozleUntil ...) im Autopilot
+--     verteilt; dadurch konnten sie einander ueberschreiben, und einen
+--     gemeinsamen Takt gab es nicht.
+--     Richtungen sind relativ zur Laufrichtung gedacht: 12 Uhr ist
+--     voraus, 9 und 3 Uhr sind die Seiten.
+------------------------------------------------------------------
+local JUKE = { active = nil, cd = {}, lastAny = 0, count = 0, log = {} }
+AP.juke = JUKE
+
+local function turn(dir, deg)
+    local a = math.rad(deg)
+    local c, s = math.cos(a), math.sin(a)
+    local v = Vector3.new(dir.X * c - dir.Z * s, 0, dir.X * s + dir.Z * c)
+    return v.Magnitude > 0.01 and v.Unit or dir
+end
+
+-- Treppe, Rampe oder Leiter in der Naehe — Grundlage der mapbezogenen
+-- Finten. Rueckgabe: Richtung dorthin und Art.
+local function findRise(pos, facing)
+    for _, l in ipairs(ladders()) do
+        if l.Parent then
+            local v = (l.Position - pos) * Vector3.new(1, 0, 1)
+            local d = v.Magnitude
+            if d > 3 and d < 22 and v.Unit:Dot(facing) > -0.2 then
+                return v.Unit, "leiter"
+            end
+        end
+    end
+    for _, deg in ipairs({ 0, -30, 30, -60, 60 }) do
+        local dir = turn(facing, deg)
+        local gNear, hNear = groundAt(pos, dir, 4, 12)
+        local gFar, hFar = groundAt(pos, dir, 10, 12)
+        if gNear and gFar and hNear and hFar
+           and (hFar - hNear) > 2.5
+           and rayClear(pos, dir, 2.4, 10) > 0.7 then
+            return dir, "rampe"
+        end
+    end
+    return nil
+end
+
+local JUKE_MOVES = {
+    -- 180 Grad antaeuschen und sofort wieder zurueck
+    {   name = "double180", cd = 3, minLevel = 1, maxD = 26,
+        init = function(ctx, m) m.back = ctx.facing end,
+        run = function(ctx, m, t)
+            if t < 0.32 then return turn(ctx.facing, 180) end
+            if t < 0.75 then return m.back end
+            return nil
+        end },
+
+    -- 180 Grad wirklich durchziehen und am Verfolger vorbeilaufen
+    {   name = "commit180", cd = 3, minLevel = 2, maxD = 22,
+        init = function(ctx, m)
+            -- leicht versetzt, sonst laeuft er frontal hinein
+            local side = (math.random() < 0.5) and 28 or -28
+            m.dir = turn(ctx.facing, 180 + side)
+        end,
+        run = function(ctx, m, t)
+            if t < 0.95 then return m.dir end
+            return nil
+        end },
+
+    -- Knoechelbrecher: 12 Uhr -> 9 Uhr -> 3 Uhr, ab Stufe 2 auch
+    -- zurueck auf 9 Uhr und dort bleiben
+    {   name = "ankleBreaker", cd = 3, minLevel = 1, maxD = 30,
+        init = function(ctx, m)
+            local s = (math.random() < 0.5) and 1 or -1
+            m.a = turn(ctx.facing, -85 * s)
+            m.b = turn(ctx.facing, 85 * s)
+            m.third = (ctx.level >= 2) and (math.random() < 0.5)
+        end,
+        run = function(ctx, m, t)
+            if t < 0.26 then return m.a end
+            if t < 0.54 then return m.b end
+            if m.third and t < 0.95 then return m.a end
+            return nil
+        end },
+
+    -- Kanten-Finte: an der Klippe abspringen und im selben Sprung
+    -- wieder auf dem Ausgangspunkt landen
+    {   name = "bamboozle", cd = 5, minLevel = 2, maxD = 24, mapMove = true,
+        ready = function(ctx)
+            local near = groundAt(ctx.pos, ctx.facing, 4, 10)
+            local far = groundAt(ctx.pos, ctx.facing, 11, 14)
+            return (near and not far) and true or false
+        end,
+        init = function(ctx, m) m.back = turn(ctx.facing, 180) end,
+        run = function(ctx, m, t)
+            if t < 0.18 then return ctx.facing end
+            if t < 0.26 then
+                tryJump(true)
+                return ctx.facing
+            end
+            -- noch in der Luft kehrt machen, damit er wieder auf der
+            -- Ausgangsflaeche landet statt unten
+            if t < 0.9 then return m.back end
+            return nil
+        end },
+
+    -- Treppen-/Leiterfinte: Aufstieg antaeuschen, dann abspringen.
+    -- Entweder zurueck zum Ausgangspunkt oder seitlich weiter.
+    {   name = "stairJuke", cd = 5, minLevel = 2, maxD = 34, mapMove = true,
+        ready = function(ctx) return findRise(ctx.pos, ctx.facing) ~= nil end,
+        init = function(ctx, m)
+            local dir, kind = findRise(ctx.pos, ctx.facing)
+            m.up, m.kind = dir or ctx.facing, kind
+            m.commit = (math.random() < 0.5)
+            if m.commit then
+                m.away = turn(ctx.facing, (math.random() < 0.5) and 100 or -100)
+            else
+                m.away = turn(ctx.facing, 180)
+            end
+        end,
+        run = function(ctx, m, t)
+            if t < 0.55 then return m.up end
+            if t < 0.64 then
+                tryJump(true)
+                return m.up
+            end
+            if t < 1.25 then return m.away end
+            return nil
+        end },
+
+    -- Rollfinte: waehrend der Rolle die Richtung wechseln
+    {   name = "rollFeint", cd = 3, minLevel = 1, maxD = 26,
+        init = function(ctx, m)
+            m.dir = turn(ctx.facing, (math.random() < 0.5) and 70 or -70)
+            m.fired = false
+        end,
+        run = function(ctx, m, t)
+            if not m.fired and type(keypress) == "function" then
+                m.fired = true
+                task.spawn(function()
+                    pcall(keypress, 0x43)          -- C ist der Slide-Keybind
+                    task.wait(0.16)
+                    pcall(keyrelease, 0x43)
+                end)
+            end
+            if t < 0.7 then return m.dir end
+            return nil
+        end },
+
+    -- Squeeze: durch eine Luecke, die nur von vorn passierbar ist
+    {   name = "squeeze", cd = 5, minLevel = 3, maxD = 32, mapMove = true,
+        ready = function(ctx)
+            for _, deg in ipairs({ -50, -25, 25, 50 }) do
+                local d = turn(ctx.facing, deg)
+                if rayClear(ctx.pos, d, 2.4, 12) > 0.85
+                   and rayClear(ctx.pos, turn(d, 22), 2.4, 7) < 0.5
+                   and rayClear(ctx.pos, turn(d, -22), 2.4, 7) < 0.5 then
+                    return true
+                end
+            end
+            return false
+        end,
+        init = function(ctx, m)
+            m.dir = ctx.facing
+            for _, deg in ipairs({ -50, -25, 25, 50 }) do
+                local d = turn(ctx.facing, deg)
+                if rayClear(ctx.pos, d, 2.4, 12) > 0.85
+                   and rayClear(ctx.pos, turn(d, 22), 2.4, 7) < 0.5
+                   and rayClear(ctx.pos, turn(d, -22), 2.4, 7) < 0.5 then
+                    m.dir = d
+                    return
+                end
+            end
+        end,
+        run = function(ctx, m, t)
+            if t < 1.0 then return m.dir end
+            return nil
+        end },
+}
+
+-- Abstand bis zum naechsten Manoever, je Stufe
+local function jukeGap(level)
+    return ({ 2.6, 1.8, 1.2 })[level] or 2.6
+end
+
+-- Waehlt ein Manoever und fuehrt es aus. Rueckgabe: Richtung oder nil.
+local function jukeStep(pos, facing, toThreat, threatD, level)
+    local now = tick()
+    local ctx = { pos = pos, facing = facing, toThreat = toThreat,
+                  threatD = threatD, level = level }
+
+    local a = JUKE.active
+    if a then
+        local dir = a.def.run(ctx, a, now - a.t0)
+        if dir then
+            AP.jukeName = a.def.name
+            return dir
+        end
+        JUKE.cd[a.def.name] = now
+        JUKE.lastAny = now
+        JUKE.active, AP.jukeName = nil, nil
+        return nil
+    end
+
+    if level < 1 or not toThreat then return nil end
+    if now - JUKE.lastAny < jukeGap(level) then return nil end
+    if threatD > 34 then return nil end
+
+    local pool = {}
+    for _, def in ipairs(JUKE_MOVES) do
+        if level >= def.minLevel and threatD <= def.maxD
+           and now - (JUKE.cd[def.name] or -99) >= def.cd
+           and ((not def.ready) or def.ready(ctx)) then
+            pool[#pool + 1] = def
+        end
+    end
+    if #pool == 0 then return nil end
+
+    local def = pool[math.random(1, #pool)]
+    local m = { def = def, t0 = now }
+    if def.init then def.init(ctx, m) end
+    JUKE.active = m
+    JUKE.count = JUKE.count + 1
+    JUKE.log[def.name] = (JUKE.log[def.name] or 0) + 1
+    AP.jukeName = def.name
+    return def.run(ctx, m, 0) or facing
+end
 local function autopilotStep(threat, threatD, prey, preyD)
     refreshRaycastFilter()      -- Filter aktuell halten, bevor irgendwer strahlt
     local p = P()
@@ -3960,6 +4190,35 @@ local function autopilotStep(threat, threatD, prey, preyD)
     else
         AP.usingPath = false
         PATH.wps = nil
+    end
+
+    -- AYIP: das Juke-Repertoire hat Vorrang vor der normalen Richtung,
+    -- solange ein Manoever laeuft. Nur beim Weglaufen und Streifen —
+    -- wer jagt, soll nicht vor seinem eigenen Ziel herumtanzen.
+    if goal and (mode == "FLUCHT" or mode == "STREIFEN") then
+        local lvl = math.clamp(CFG.ayip or 0, 0, 3)
+        if lvl > 0 then
+            -- Der Parameter "threat" ist nur im Fluchtzweig gesetzt; beim
+            -- Streifen bleibt er leer, wodurch nie ein Manoever ausgeloest
+            -- wurde. Darum den naechsten Verfolger direkt aus der Lage
+            -- nehmen.
+            local tp, td = nil, math.huge
+            for _, t in ipairs(state.threats or {}) do
+                local d = ((t.pos - pos) * Vector3.new(1, 0, 1)).Magnitude
+                if d < td then tp, td = t.pos, d end
+            end
+            if threat and threatD and threatD < td then tp, td = threat.pos, threatD end
+            local toThreat
+            if tp then
+                local v = (tp - pos) * Vector3.new(1, 0, 1)
+                if v.Magnitude > 0.1 then toThreat = v.Unit end
+            end
+            local jd = jukeStep(pos, goal, toThreat, td, lvl)
+            if jd then
+                goal = jd
+                AP.usingPath = false
+            end
+        end
     end
 
     pcall(failTick, pos, hum, goal ~= nil)
