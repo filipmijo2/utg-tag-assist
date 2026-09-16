@@ -496,6 +496,55 @@ local function buildNodes()
 end
 
 -- bester Fluchtpunkt: weit weg von allen Verfolgern, mittig, hoch, erreichbar
+-- Fluchtziel aus dem NAVIGATIONSGRAPHEN.
+-- Das alte Punktraster kannte nur Positionen. Der Graph kennt auch, wie
+-- viele Wege von einem Punkt wegfuehren — und genau das fehlte: ohne
+-- dieses Wissen landete der Bot regelmaessig in Ecken und lief davor hin
+-- und her. Bewertet wird deshalb nach Hoehe (oben ist man schwerer zu
+-- fangen), Abstand zu den Verfolgern und Anzahl der Auswege.
+local function pickEscapeGraph(pos, threats)
+    local NG = getgenv().__UTG_NAV_GRAPH
+    local G = NG and NG.graph
+    if not G or #G.nodes < 50 then return nil end
+    local best, bestScore
+    local n = #G.nodes
+    -- Stichprobe statt aller Knoten: bei 28000 waere das jede Sekunde zu teuer
+    local tries = math.min(260, n)
+    for _ = 1, tries do
+        local nd = G.nodes[math.random(1, n)]
+        if not nd.bad then
+            local flat = (nd.p - pos) * Vector3.new(1, 0, 1)
+            local dist = flat.Magnitude
+            if dist > 25 and dist < 320 then
+                -- Auswege zaehlen: ein Punkt mit zwei Kanten ist eine Ecke
+                local ways = #nd.e
+                if ways >= 4 then
+                    -- Abstand zum naechsten Verfolger, und niemand darf
+                    -- naeher am Ziel sein als wir
+                    local nearestThreat, blockedBy = math.huge, false
+                    for _, t in ipairs(threats or {}) do
+                        local dt = ((nd.p - t.pos) * Vector3.new(1, 0, 1)).Magnitude
+                        if dt < nearestThreat then nearestThreat = dt end
+                        if dt < dist * 0.75 then blockedBy = true end
+                    end
+                    if not blockedBy then
+                        local up = nd.p.Y - pos.Y
+                        local score =
+                              math.min(up, 60) * 2.2          -- Hoehe zaehlt stark
+                            + math.min(nearestThreat, 200) * 0.9
+                            + math.min(ways, 12) * 3.0        -- viele Auswege
+                            - dist * 0.25                     -- nicht ans Kartenende
+                        if not bestScore or score > bestScore then
+                            best, bestScore = nd.p, score
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
 local function pickEscapeNode(pos, threats, preys)
     local list = NODES.list
     if not list or #list < 8 then return nil end
@@ -3664,7 +3713,10 @@ local function autopilotStep(threat, threatD, prey, preyD)
             or held > 6.0
             or ((AP.escNode - pos) * Vector3.new(1, 0, 1)).Magnitude < 18
         if needNew and not closeDanger and not preyTarget then
-            local node = pickEscapeNode(pos, state.threats or {}, state.preys or {})
+            -- Zuerst den Graphen fragen: er kennt Hoehe und Auswege und
+            -- schickt den Bot nach oben statt in die naechste Ecke.
+            local node = pickEscapeGraph(pos, state.threats or {})
+                      or pickEscapeNode(pos, state.threats or {}, state.preys or {})
             if node then
                 -- einen laufenden Lauf nicht fuer einen minimal anderen
                 -- Punkt aufgeben: der neue muss spuerbar woanders liegen
