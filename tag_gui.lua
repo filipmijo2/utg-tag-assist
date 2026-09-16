@@ -3060,8 +3060,9 @@ local JUKE_MOVES = {
             -- 270 Grad reicht meist, 450 ist die anderthalbfache Runde
             m.total = (ctx.level >= 2 and math.random() < 0.4) and 450 or 270
             -- so lang, dass es eine gefahrene Kurve wird und kein Drehen
-            -- auf der Stelle: rund 210 Grad pro Sekunde
-            m.dur = m.total / 210
+            -- auf der Stelle. 210 Grad pro Sekunde war noch zu hastig,
+            -- jetzt 165 - ein 270er dauert damit 1.6 s, ein 450er 2.7 s.
+            m.dur = m.total / 165
         end,
         run = function(ctx, m, t)
             if t < m.dur then
@@ -3135,35 +3136,6 @@ local JUKE_MOVES = {
             return nil
         end },
 
-    -- Squeeze: durch eine Luecke, die nur von vorn passierbar ist
-    {   name = "squeeze", cd = 5, minLevel = 3, maxD = 32, mapMove = true,
-        ready = function(ctx)
-            for _, deg in ipairs({ -50, -25, 25, 50 }) do
-                local d = turn(ctx.facing, deg)
-                if rayClear(ctx.pos, d, 2.4, 12) > 0.85
-                   and rayClear(ctx.pos, turn(d, 22), 2.4, 7) < 0.5
-                   and rayClear(ctx.pos, turn(d, -22), 2.4, 7) < 0.5 then
-                    return true
-                end
-            end
-            return false
-        end,
-        init = function(ctx, m)
-            m.dir = ctx.facing
-            for _, deg in ipairs({ -50, -25, 25, 50 }) do
-                local d = turn(ctx.facing, deg)
-                if rayClear(ctx.pos, d, 2.4, 12) > 0.85
-                   and rayClear(ctx.pos, turn(d, 22), 2.4, 7) < 0.5
-                   and rayClear(ctx.pos, turn(d, -22), 2.4, 7) < 0.5 then
-                    m.dir = d
-                    return
-                end
-            end
-        end,
-        run = function(ctx, m, t)
-            if t < 1.5 then return m.dir end
-            return nil
-        end },
 }
 
 -- Abstand bis zum naechsten Manoever, je Stufe
@@ -3850,8 +3822,11 @@ local function autopilotStep(threat, threatD, prey, preyD)
         buildNodes()
         local list = NODES.list
         local nowR = tick()
+        -- Streifziel laenger halten: es alle 14 s zu wechseln hat den Bot
+        -- staendig neu ausrichten lassen, was sich als groesster Abstand
+        -- zum Sollweg niederschlug (6 Studs gegenueber 1.3 beim Jagen).
         local need = not AP.roamNode
-            or nowR - (AP.roamAt or 0) > 14
+            or nowR - (AP.roamAt or 0) > 26
             or ((AP.roamNode - pos) * Vector3.new(1, 0, 1)).Magnitude < 16
         if need and list and #list > 8 then
             -- unter den brauchbaren Punkten einen zufaelligen waehlen, damit er
@@ -4549,14 +4524,11 @@ local function autopilotStep(threat, threatD, prey, preyD)
                 pcall(function() Utils.GetEvent("SlideInput"):Fire() end)
             end
         end
-        -- Tempo-Slide: nur geradeaus, schnell und ohne Jaeger im Nacken
-        if mode == "FLUCHT" and (threatD or 99) > 18 and AP.lastDir
-           and (hrp.AssemblyLinearVelocity * Vector3.new(1, 0, 1)).Magnitude > 28
-           and tick() - (AP.rollAt or 0) > 3.5 then
-            AP.rollAt = tick()
-            AP.slideCount = (AP.slideCount or 0) + 1
-            pcall(function() Utils.GetEvent("SlideInput"):Fire() end)
-        end
+        -- Der Tempo-Slide ist raus. Er sollte auf gerader Strecke Tempo
+        -- bringen, hielt aber zu lange an - der Slide laeuft, solange die
+        -- Taste gilt, und bremst danach aus. Die Lande-Rolle oben bleibt,
+        -- die ist kurz und bringt Hoehe mit.
+        -- (frueher: ab 28 Studs/s alle 3.5 s ausgeloest)
     end
 
     -- MENSCHLICHE DREHUNG: nicht in die neue Richtung springen, sondern mit
