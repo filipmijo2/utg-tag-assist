@@ -1594,7 +1594,10 @@ local function saveSettings()
         writefile(SETTINGS_FILE, game:GetService("HttpService"):JSONEncode({
             autopilot = CFG.autopilot and true or false,
             ayip = CFG.ayip or 0,
-            thirdPerson = CFG.thirdPerson and true or false,
+            -- 3rd Person wird BEWUSST nicht gesichert: der Modus haengt die
+            -- Kamera hinter den Charakter, und wer ihn einmal versehentlich
+            -- anhatte, bekam ihn bei jeder Injektion zurueck, ohne die
+            -- Ursache zu sehen.
         }))
     end)
 end
@@ -1607,7 +1610,6 @@ do
             if type(d) ~= "table" then return end
             if d.autopilot ~= nil then CFG.autopilot = d.autopilot end
             if type(d.ayip) == "number" then CFG.ayip = math.clamp(d.ayip, 0, 3) end
-            if d.thirdPerson ~= nil then CFG.thirdPerson = d.thirdPerson end
         end)
     end
 end
@@ -2545,6 +2547,29 @@ local function pickDirection(pos, goalDir, curVel)
     -- fuehrt den Bot sichtbar vom Pfad weg — teilweise mitten in eine Wand.
     -- Das Wandgleiten oben bleibt aktiv, damit er nicht stur dagegenrennt.
     if AP.usingPath then
+        -- Kleine Hindernisse kennt der Graph nicht: sein Raster ist 4 bis 9
+        -- Studs weit, Moebel und Deko in Innenraeumen fallen komplett durch.
+        -- Die Richtung bleibt daher unveraendert, aber es wird gesprungen
+        -- beziehungsweise knapp ausgewichen, statt dagegenzulaufen.
+        local kneeH = workspace:Raycast(pos + Vector3.new(0, 0.6, 0), goalDir * 4, AP.rp)
+        local chestH = workspace:Raycast(pos + Vector3.new(0, 3.2, 0), goalDir * 4, AP.rp)
+        if kneeH and not chestH then
+            -- niedrig genug zum Drueberspringen
+            if tick() - (AP.pathVaultAt or 0) > 0.5 then
+                AP.pathVaultAt = tick()
+                tryJump(true)
+            end
+        elseif kneeH and chestH then
+            -- volles Hindernis: knapp seitlich vorbei, ohne den Kurs
+            -- aufzugeben
+            local n = kneeH.Normal * Vector3.new(1, 0, 1)
+            if n.Magnitude > 0.05 then
+                local sideN = Vector3.new(-n.Unit.Z, 0, n.Unit.X)
+                if sideN:Dot(goalDir) < 0 then sideN = -sideN end
+                local mixed = (goalDir + sideN * 0.9)
+                if mixed.Magnitude > 0.05 then goalDir = mixed.Unit end
+            end
+        end
         AP.lastDir, AP.dirAt = goalDir, tick()
         return goalDir
     end
@@ -4999,7 +5024,6 @@ end
 function ENV.toggleThird()
     CFG.thirdPerson = not CFG.thirdPerson
     if CFG.thirdPerson then thirdStart() else thirdStop() end
-    if ENV.saveSettings then ENV.saveSettings() end
     return CFG.thirdPerson
 end
 
