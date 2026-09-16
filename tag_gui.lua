@@ -2268,10 +2268,16 @@ local function followPath(pos)
             end
             if anchor then
                 local toAnchor = (anchor - pos) * Vector3.new(1, 0, 1)
-                if toAnchor.Magnitude > 3.0 then
-                    -- noch nicht an der richtigen Seite: erst dorthin
+                -- Enger ansteuern als bisher (3.0): aus drei Studs Abstand
+                -- zur richtigen Seite trifft der Blickstrahl des Spiels den
+                -- Truss oft noch nicht, und er rutscht seitlich daran vorbei.
+                if toAnchor.Magnitude > 1.5 then
                     return toAnchor.Unit
                 end
+                -- auf der richtigen Seite: jetzt exakt auf die Leitermitte
+                -- zuhalten, damit der Strahl sie sicher trifft
+                local straight = (best.Position - pos) * Vector3.new(1, 0, 1)
+                if straight.Magnitude > 0.1 then return straight.Unit end
             end
             local v = (best.Position - pos) * Vector3.new(1, 0, 1)
             if v.Magnitude > 0.1 then return v.Unit end
@@ -4726,6 +4732,23 @@ local function assistStep(dt)
         -- 2.2 war zu hastig und liess das Tempo sichtbar rampen. 1.5 reicht,
         -- um die vorgegebene Richtung zuegig einzunehmen.
         wantAccel = math.max(wantAccel, 1.5)
+        -- VOR KRITISCHEN PUNKTEN ABBREMSEN. Leiter, Sprung, Zipline,
+        -- Jumppad und Durchgaenge muessen genau getroffen werden - bei
+        -- 32 Studs/s legt er pro Frame einen halben Stud zurueck und
+        -- schiesst darueber hinaus. Genau diese Punkte tragen aber die
+        -- guten Routen: wer sie verfehlt, faellt auf den Fussweg zurueck.
+        local pw = PATH.wps and PATH.wps[PATH.idx]
+        if pw then
+            local k = pw.kind
+            if k == "climb" or k == "zip" or k == "pad" or k == "jump" or k == "via" then
+                local d = ((pw.Position - pos) * Vector3.new(1, 0, 1)).Magnitude
+                if d < 14 then
+                    -- weich herunterregeln statt abrupt bremsen
+                    local f = math.clamp(d / 14, 0.45, 1)
+                    wantSpeed = math.min(wantSpeed, f)
+                end
+            end
+        end
     end
 
     -- weich nachziehen, damit kein sichtbarer Speed-Sprung entsteht
