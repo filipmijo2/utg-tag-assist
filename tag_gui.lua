@@ -2502,8 +2502,13 @@ local function pickDirection(pos, goalDir, curVel)
     -- Begehbarkeit geprueft, und das harte Abdrehen unten hat die
     -- Wegrichtung um im Schnitt 108 Grad verbogen — der Weg wurde damit
     -- praktisch ignoriert.
+    -- Auf einem geplanten Weg gar kein Gleiten mehr: gemessen hat es die
+    -- Richtung des Folgers um 17.5 Grad verbogen, obwohl der Graph die
+    -- Begehbarkeit bereits geprueft hat. Bleibt er dort wirklich haengen,
+    -- faengt das die Wegneuplanung ab.
     local onPath = AP.usingPath
-    local blockHit = workspace:Raycast(pos + up, goalDir * (onPath and 3.5 or 6), AP.rp)
+    local blockHit = (not onPath)
+        and workspace:Raycast(pos + up, goalDir * 6, AP.rp) or nil
     if not blockHit and not onPath then
         blockHit = workspace:Raycast(pos + Vector3.new(0, 0.6, 0), goalDir * 5, AP.rp)
     end
@@ -4427,6 +4432,7 @@ local function autopilotStep(threat, threatD, prey, preyD)
         local pdir = followPath(pos)
         if pdir then
             goal = pdir
+            AP.pdirDbg = pdir          -- Diagnose: was der Folger wollte
             AP.usingPath = true
         else
             AP.usingPath = false
@@ -4677,9 +4683,18 @@ local function assistStep(dt)
         if sp > wantSpeed then wantSpeed, wantAccel = sp, lerp(1, p.escAccel, f) end
     end
 
+    -- Auf einem geplanten Weg zaehlt vor allem, die vorgegebene Richtung
+    -- SCHNELL einzunehmen. Gemessen lag die Steuerungskette bei 2.7 Grad
+    -- Abweichung, die tatsaechlich gefahrene Richtung aber 27.5 Grad
+    -- daneben — die Traegheit war also der ganze Fehler. Beschleunigung
+    -- wurde bisher nur bei nahem Verfolger angehoben.
+    if AP.usingPath then
+        wantAccel = math.max(wantAccel, 2.2)
+    end
+
     -- weich nachziehen, damit kein sichtbarer Speed-Sprung entsteht
     state.speedMul = lerp(state.speedMul, wantSpeed, dt * 6)
-    if math.abs(state.speedMul - 1) < 0.004 then
+    if math.abs(state.speedMul - 1) < 0.004 and wantAccel <= 1.01 then
         state.speedMul = 1
         S.boosts.__utg = nil
     else
