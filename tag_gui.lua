@@ -47,7 +47,8 @@ local CFG = {
     autopilot   = true,
     -- AYIP: 0 = aus, 1/2/3 = Juke-Stufen (entspricht frueher Ankles 6 / 8 / 10)
     ayip        = 0,   -- aus = altes Standardverhalten
-    feintDist   = 15,      -- Mindestabstand fuer Finten (Studs)
+    -- Mindestabstand fuer Finten: fest, der Regler dafuer ist entfallen
+    feintDist   = 19,
     thirdPerson = false,   -- Taste T
     preset      = 3,       -- fest auf Maximum (kein Umschalten mehr)
 }
@@ -1575,6 +1576,33 @@ AP.path = PATH
 ENV.ap = AP          -- fuer Diagnose von aussen
 ENV.cfg = CFG        -- dito: erlaubt Messlaeufe mit gesetzter AYIP-Stufe
 
+-- Einstellungen ueber Neuinjektionen hinweg behalten. Gespeichert wird
+-- nur, was der Nutzer selbst schaltet; alles andere ergibt sich daraus.
+local SETTINGS_FILE = "utg_tag_settings.json"
+local function saveSettings()
+    if type(writefile) ~= "function" then return end
+    pcall(function()
+        writefile(SETTINGS_FILE, game:GetService("HttpService"):JSONEncode({
+            autopilot = CFG.autopilot and true or false,
+            ayip = CFG.ayip or 0,
+            thirdPerson = CFG.thirdPerson and true or false,
+        }))
+    end)
+end
+ENV.saveSettings = saveSettings
+do
+    if type(readfile) == "function" and type(isfile) == "function" then
+        pcall(function()
+            if not isfile(SETTINGS_FILE) then return end
+            local d = game:GetService("HttpService"):JSONDecode(readfile(SETTINGS_FILE))
+            if type(d) ~= "table" then return end
+            if d.autopilot ~= nil then CFG.autopilot = d.autopilot end
+            if type(d.ayip) == "number" then CFG.ayip = math.clamp(d.ayip, 0, 3) end
+            if d.thirdPerson ~= nil then CFG.thirdPerson = d.thirdPerson end
+        end)
+    end
+end
+
 -- Ein Pfad direkt zum Gegner scheitert oft (er steht auf einem Dach, auf einer
 -- Leiter, in der Luft). Deshalb wird eine Kette von Zielen probiert: exakt,
 -- auf den Boden projiziert, dann nur noch "in die Naehe" — den Rest macht die
@@ -2520,7 +2548,12 @@ local function pickDirection(pos, goalDir, curVel)
                         -- zaehlte. Ergebnis waren 43 Landungen bei 25
                         -- Spruengen — er lief laufend ueber Kanten.
                         + (ground[i] or 0) * 2.6
-                        + open * 1.7            -- Ecken/Sackgassen abwerten
+                        -- Offenheit deutlich hoeher gewichten und zusaetzlich
+                        -- bestrafen, wenn der Sektor richtig zu ist: mit 1.7
+                        -- lief er sehenden Auges in Ecken, weil die
+                        -- Zielrichtung schwerer wog als der fehlende Ausweg.
+                        + open * 3.2
+                        + ((open < 0.35) and -3.5 or 0)
                         + mid                   -- am Rand zur Mitte ziehen
                         + keep
                 ranked[#ranked + 1] = { dir = dir, s = s, jump = jump[i] }
@@ -4827,6 +4860,7 @@ end
 function ENV.toggleThird()
     CFG.thirdPerson = not CFG.thirdPerson
     if CFG.thirdPerson then thirdStart() else thirdStop() end
+    if ENV.saveSettings then ENV.saveSettings() end
     return CFG.thirdPerson
 end
 
@@ -4983,6 +5017,7 @@ local rFree
 local _, rAuto = makeButton("Autopilot (alles)", function() return CFG.autopilot end,
     function()
         CFG.autopilot = not CFG.autopilot
+        if ENV.saveSettings then ENV.saveSettings() end
         if not CFG.autopilot then
             AP.mode, AP.vec, AP.move = nil, nil, nil
             local m = RENV.shared.multipliers
@@ -5016,16 +5051,12 @@ end
 ayipBtn.Activated:Connect(function()
     task.spawn(function()
         CFG.ayip = ((CFG.ayip or 0) + 1) % 4
+        if ENV.saveSettings then ENV.saveSettings() end
         refreshAyip()
         LOG("AYIP -> Stufe " .. tostring(CFG.ayip))
     end)
 end)
 refreshAyip()
-
-makeSlider("Finten-Abstand", 8, 28,
-    function() return CFG.feintDist end,
-    function(v) CFG.feintDist = v end,
-    "%s:  %d Studs")
 
 local _, rThird = makeButton("3rd Person  [T]", function() return CFG.thirdPerson end,
                       function() ENV.toggleThird() end)
