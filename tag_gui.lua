@@ -3018,11 +3018,14 @@ local JUKE_MOVES = {
             -- Kuerzer gehalten als commit180: das Double-Back lebt davon,
             -- schnell wieder zurueck zu sein, sonst ist es kein Antaeuschen
             -- mehr, sondern ein halber Umweg.
-            if t < 0.38 then
-                local p = t / 0.38
+            -- Noch kuerzer: bei 32 Studs/s waren 0.38 s schon zwoelf Studs
+            -- weg vom Kurs. Ein Antaeuschen soll knapp sein, sonst ist es
+            -- ein Umweg.
+            if t < 0.26 then
+                local p = t / 0.26
                 return turn(ctx.facing, m.s * (75 + 95 * p))
             end
-            if t < 0.85 then return m.back end
+            if t < 0.62 then return m.back end
             return nil
         end },
 
