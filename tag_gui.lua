@@ -3844,6 +3844,38 @@ local function autopilotStep(threat, threatD, prey, preyD)
         end
     end
 
+    -- ZWEI REICHWEITEN.
+    -- Der Graph ist fuer die grobe Route da: er kennt Leitern, Stufen und
+    -- Ziplines ueber die ganze Karte, sein Raster ist aber 4 bis 9 Studs
+    -- weit und damit blind fuer alles Kleinteilige. Im Nahbereich taugt er
+    -- deshalb nicht — dort ist die freie Steuerung besser, die jeden Frame
+    -- die Umgebung abtastet und sofort reagiert.
+    -- Also: weit weg planen, nah dran direkt steuern.
+    -- Mit einer einzigen Schwelle kippt der Modus am Uebergang staendig
+    -- hin und her und verwirft dabei jedes Mal den Weg. Darum getrennte
+    -- Grenzen: ab 70 Studs wird geplant, erst unter 45 wieder direkt
+    -- gesteuert.
+    if wantPath and pathTarget then
+        local toGoal = ((pathTarget - pos) * Vector3.new(1, 0, 1)).Magnitude
+        -- Hoehenunterschied bleibt Sache des Graphen, auch auf kurze
+        -- Distanz: eine Leiter direkt vor der Nase findet die freie
+        -- Steuerung nie.
+        local climbNeed = math.abs(pathTarget.Y - pos.Y) > 14
+        if climbNeed then
+            AP.longRange = true
+        elseif toGoal > 70 then
+            AP.longRange = true
+        elseif toGoal < 45 then
+            AP.longRange = false
+        end
+        if not AP.longRange then
+            wantPath = false
+            if PATH.wps then PATH.wps = nil end
+            AP.usingPath = false
+            AP.routeTo = "direkt"
+        end
+    end
+
     if wantPath and pathTarget then
         local age = tick() - (PATH.at or 0)
         local moved = PATH.target and (PATH.target - pathTarget).Magnitude or math.huge
