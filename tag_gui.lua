@@ -2155,8 +2155,25 @@ local function followPath(pos)
             -- streng: gemessen entfielen darauf 56 % der gesamten
             -- Haengerzeit (im Schnitt 2.45 s je Fall, Zustand "Running")
             -- — er traf den Punkt nicht und blieb davor stehen.
-            local tight = (wp.kind == "via") and 2.6 or 3.0
-            reached = flat.Magnitude < tight and heightOk
+            -- Durchgaenge (Tueren, Fenster) erst als erledigt werten, wenn er
+            -- wirklich HINDURCH ist. Beim reinen Naeherungsradius schwenkte
+            -- er schon zum naechsten Wegpunkt, waehrend er noch davorstand,
+            -- und sprang links oder rechts am Rahmen vorbei.
+            if wp.kind == "via" then
+                reached = false
+                if PATH.idx > 1 then
+                    local seg = (wp.Position - wps[PATH.idx - 1].Position) * Vector3.new(1, 0, 1)
+                    if seg.Magnitude > 0.1 and seg.Unit:Dot(-flat) > 0
+                       and flat.Magnitude < 6 then
+                        reached = true
+                    end
+                end
+                if not reached and flat.Magnitude < 1.4 and heightOk then
+                    reached = true
+                end
+            else
+                local tight = 3.0
+                reached = flat.Magnitude < tight and heightOk
             -- (Ein eigenes Ventil fuer Durchgaenge stand hier mit 0.6 s und
             --  war toter Code: der allgemeine Notausgang unten greift schon
             --  bei 0.5 s und deckt denselben Fall ab.)
@@ -2165,6 +2182,7 @@ local function followPath(pos)
                 local seg = (wp.Position - wps[PATH.idx - 1].Position) * Vector3.new(1, 0, 1)
                 if seg.Magnitude > 0.1 and seg.Unit:Dot(-flat) > 0 then reached = true end
             end
+            end
             -- Notausgang: haengt er eine halbe Sekunde am selben Punkt und
             -- ist horizontal laengst da, gilt der Punkt als erledigt.
             -- NICHT aber, wenn der Punkt ueber ihm liegt — dann steht er
@@ -2172,7 +2190,10 @@ local function followPath(pos)
             -- schlimmer, weil der Weg danach durch die Decke zeigt.
             -- Stattdessen den Weg verwerfen und von der tatsaechlichen
             -- Position neu planen.
-            if not reached and flat.Magnitude < 7.2
+            -- Durchgaenge sind hier ausgenommen: sie muessen wirklich
+            -- passiert werden, sonst springt er wieder am Rahmen vorbei.
+            -- Kommt er dort nicht durch, plant die Wegneuberechnung neu.
+            if not reached and wp.kind ~= "via" and flat.Magnitude < 7.2
                and now - (PATH.idxAt or now) > 0.5 then
                 if up >= 2.5 then
                     failNote("unter_dem_weg",
