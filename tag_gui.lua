@@ -5079,7 +5079,6 @@ local function thirdStop()
         local cam = workspace.CurrentCamera
         if cam then
             cam.CameraType = Enum.CameraType.Custom
-            cam.FieldOfView = 70
             local ch = LP.Character
             local h = ch and ch:FindFirstChildOfClass("Humanoid")
             if h then cam.CameraSubject = h end
@@ -5515,20 +5514,4 @@ end
 
 LOG("bereit — Preset " .. P().name)
 flushLog(true)
--- Letzter Aufraeumschritt, nachdem alles aufgebaut ist: die
--- Verfolgerkamera startet immer aus. Woher sie den Zustand sonst
--- bekommt, konnte ich nicht abschliessend klaeren - hier wird er in
--- jedem Fall geradegezogen, statt ihn weiter zu suchen.
-task.spawn(function()
-    task.wait(1)
-    CFG.thirdPerson = false
-    pcall(thirdStop)
-    local cam = workspace.CurrentCamera
-    if cam then
-        cam.CameraType = Enum.CameraType.Custom
-        cam.FieldOfView = 70
-    end
-    if rFree then pcall(rFree) end
-end)
-
 print("[UTG Tag Assist] aktiv. Log: " .. LOGFILE .. "  |  RightControl blendet die GUI aus.")
