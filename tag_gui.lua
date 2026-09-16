@@ -2244,7 +2244,10 @@ local function followPath(pos)
         if toWp.Magnitude < math.clamp(spdNow * 0.16, 2.5, 7)
            and now - lastTry > 0.45 then
             PATH.jumped[PATH.idx] = now
-            tryJump()
+            -- force: ein Wegpunkt-Sprung ist gezielt, kein Spam. Ohne das
+            -- greift die Bremse fuer anlasslose Spruenge (0.85 s) und der
+            -- Bot kommt Treppen mit mehreren hop-Kanten nicht mehr hoch.
+            tryJump(true)
         end
     end
     -- Der Weg darf jetzt ueber Leitern fuehren. Ein Wegpunkt deutlich ueber uns
@@ -2261,9 +2264,10 @@ local function followPath(pos)
             end
         end
     end
-    -- Wegpunkt deutlich hoeher -> springen (Treppe/Absatz)
+    -- Wegpunkt deutlich hoeher -> springen (Treppe/Absatz). Ebenfalls
+    -- wegbezogen, also an der Sprungbremse vorbei.
     if wp.Position.Y - pos.Y > 3 then
-        tryJump()
+        tryJump(true)
     end
     local dir = (wp.Position - pos) * Vector3.new(1, 0, 1)
     if dir.Magnitude < 0.1 then return nil end
@@ -2681,6 +2685,22 @@ local function hookControlModule()
             return v
         end
         if CFG.autopilot and AP.vec and tick() > AP.manualUntil then
+            -- Die Richtung wird als WELTrichtung gehalten und erst hier in
+            -- den Kameraraum gerechnet. Frueher lag sie schon kamerarelativ
+            -- in AP.vec: drehte man die Maus zwischen zwei
+            -- Autopilot-Schritten, wurde derselbe Vektor gegen die neue
+            -- Kameraausrichtung gelesen — die Blickrichtung hat die
+            -- Laufrichtung verbogen.
+            if AP.vecWorld then
+                local ch = LP.Character
+                local vs = ch and ch:FindFirstChild("values")
+                local cy = vs and vs:FindFirstChild("CameraY")
+                if cy then
+                    local r = cy.Value:VectorToObjectSpace(AP.vecWorld)
+                    r = Vector3.new(r.X, 0, r.Z)
+                    if r.Magnitude > 0.05 then return r.Unit end
+                end
+            end
             return AP.vec
         end
         return v
@@ -4460,8 +4480,11 @@ local function autopilotStep(threat, threatD, prey, preyD)
     -- in Kamera-Koordinaten umrechnen (so wie echter Tasten-Input aussieht)
     local rel = camY.Value:VectorToObjectSpace(dir)
     rel = Vector3.new(rel.X, 0, rel.Z)
-    if rel.Magnitude < 0.05 then AP.mode, AP.vec = nil, nil return end
+    if rel.Magnitude < 0.05 then AP.mode, AP.vec, AP.vecWorld = nil, nil, nil return end
     AP.vec = rel.Unit
+    -- zusaetzlich die Weltrichtung merken; der Move-Hook rechnet sie mit
+    -- der aktuellen Kamera um, damit Mausdrehungen den Kurs nicht verbiegen
+    AP.vecWorld = dir.Unit
     AP.mode = mode
 
     local m = RENV.shared.multipliers
