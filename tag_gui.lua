@@ -701,6 +701,8 @@ end
 ------------------------------------------------------------------
 
 ------------------------------------------------------------------
+
+------------------------------------------------------------------
 -- 3c-2) EIGENER NAVIGATIONSGRAPH
 --     PathfindingService kennt keine der Fortbewegungsarten dieses
 --     Spiels (Wallrun, Zipline, Jumppad, Rail, SwingBar) und findet
@@ -957,7 +959,14 @@ do
             -- 7 oder 8 Kanten heisst freistehender Pfosten, da hilft Schieben nicht
             if edges >= 1 and edges <= 6 and push.Magnitude > 0.1 then
                 local target = nd.p + push.Unit * 1.6
-                local under = cast(target + Vector3.new(0, 1.2, 0), Vector3.new(0, -4, 0))
+                -- Nicht DURCH eine Wand schieben: geprueft wurde bisher nur, ob
+                -- am Zielort Boden liegt. Hinter einer duennen Wand ist das der
+                -- Fall, und der Knoten landete auf der falschen Seite - der Weg
+                -- fuehrte dann mitten hindurch.
+                if cast(nd.p + Vector3.new(0, 1.5, 0), push.Unit * 2.2) then
+                    target = nil
+                end
+                local under = target and cast(target + Vector3.new(0, 1.2, 0), Vector3.new(0, -4, 0))
                 if under and math.abs(under.Position.Y - nd.p.Y) < 1.5 then
                     local foot = under.Position + Vector3.new(0, 0.5, 0)
                     if not cast(foot, Vector3.new(0, CFG.agentHeight * 0.6, 0)) then
@@ -1474,7 +1483,7 @@ do
     
         local lines = string.split(blob, "\n")
         local head = string.split(lines[1] or "", "|")
-        if head[1] ~= "UTGNAV4" then return nil end
+        if head[1] ~= "UTGNAV5" then return nil end
         local cell = tonumber(head[3])
         local bbv = string.split(head[4] or "", ",")
         if not cell or #bbv < 6 then return nil end
@@ -1534,7 +1543,7 @@ do
         -- stueckweise zusammensetzen: ein einzelner String mit Millionen
         -- Verkettungen sprengt den Speicher
         local parts = {
-            ("UTGNAV4|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
+            ("UTGNAV5|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
                 r1(G.bb.min.X), r1(G.bb.min.Y), r1(G.bb.min.Z),
                 r1(G.bb.max.X), r1(G.bb.max.Y), r1(G.bb.max.Z))
         }
@@ -2489,15 +2498,23 @@ local function pickDirection(pos, goalDir, curVel)
     -- zwei Hoehen pruefen (Huefte und knapp ueber dem Boden, sonst werden
     -- niedrige Kanten uebersehen) und, falls das Abgleiten selbst wieder
     -- in die Wand fuehrt, zusaetzlich zur Seite aufdrehen.
-    local blockHit = workspace:Raycast(pos + up, goalDir * 6, AP.rp)
-                  or workspace:Raycast(pos + Vector3.new(0, 0.6, 0), goalDir * 5, AP.rp)
+    -- Bei einem geplanten Weg nur sanft abgleiten: der Graph hat die
+    -- Begehbarkeit geprueft, und das harte Abdrehen unten hat die
+    -- Wegrichtung um im Schnitt 108 Grad verbogen — der Weg wurde damit
+    -- praktisch ignoriert.
+    local onPath = AP.usingPath
+    local blockHit = workspace:Raycast(pos + up, goalDir * (onPath and 3.5 or 6), AP.rp)
+    if not blockHit and not onPath then
+        blockHit = workspace:Raycast(pos + Vector3.new(0, 0.6, 0), goalDir * 5, AP.rp)
+    end
     if blockHit then
         local slide = goalDir - blockHit.Normal * goalDir:Dot(blockHit.Normal)
         slide = slide * Vector3.new(1, 0, 1)
         if slide.Magnitude > 0.08 then
             goalDir = slide.Unit
-            -- zweite Runde: liegt auch der Gleitweg zu, staerker abdrehen
-            if workspace:Raycast(pos + up, goalDir * 4, AP.rp) then
+            -- zweite Runde: liegt auch der Gleitweg zu, staerker abdrehen.
+            -- Auf einem geplanten Weg entfaellt das.
+            if not onPath and workspace:Raycast(pos + up, goalDir * 4, AP.rp) then
                 local n2 = blockHit.Normal * Vector3.new(1, 0, 1)
                 if n2.Magnitude > 0.05 then
                     local sideN = Vector3.new(-n2.Unit.Z, 0, n2.Unit.X)
@@ -2505,7 +2522,7 @@ local function pickDirection(pos, goalDir, curVel)
                     goalDir = (pick * 1.2 + n2.Unit * 0.5).Unit
                 end
             end
-        else
+        elseif not onPath then
             -- frontal auf die Wand: entlang ihrer Flaeche ausweichen
             local n2 = blockHit.Normal * Vector3.new(1, 0, 1)
             if n2.Magnitude > 0.05 then
@@ -2599,40 +2616,6 @@ local function pickDirection(pos, goalDir, curVel)
                         end
                     end
                 end
-                -- Wissen aus dem Map-Scan einbeziehen: der Graph kennt zu
-                -- jeder Stelle die Zahl der Wege und ob dort Leitern oder
-                -- Stufen ansetzen. Die freie Nahbereichssteuerung hatte das
-                -- bisher nicht - sie sah nur Strahlen.
-                local gBonus = 0
-                do
-                    local NG = getgenv().__UTG_NAV_GRAPH
-                    local G = NG and NG.graph
-                    if G then
-                        local probe = pos + dir * 10
-                        local ix = math.floor((probe.X - G.bb.min.X) / G.cell + 0.5)
-                        local iz = math.floor((probe.Z - G.bb.min.Z) / G.cell + 0.5)
-                        local bucket = G.grid[ix .. "," .. iz]
-                        if bucket then
-                            local best
-                            for _, nd in ipairs(bucket) do
-                                if math.abs(nd.p.Y - pos.Y) < 9
-                                   and (not best or #nd.e > #best.e) then best = nd end
-                            end
-                            if best then
-                                -- wenige Wege = Ecke oder Innenraum, teuer
-                                gBonus = gBonus + (math.min(#best.e, 10) - 5) * 0.45
-                                if best.bad then gBonus = gBonus - 4 end
-                                -- Leitern und Stufen ausdruecklich belohnen
-                                for _, e in ipairs(best.e) do
-                                    if e.k == "climb" then gBonus = gBonus + 2.5 break
-                                    elseif e.k == "hop" then gBonus = gBonus + 0.8 break end
-                                end
-                            else
-                                gBonus = gBonus - 1.5   -- dort kennt der Scan gar nichts
-                            end
-                        end
-                    end
-                end
                 local s = align * (AP.mode == "JAGD" and 3.2 or 1.5)
                         - threatPen
                         + (clear[i] or 0) * 1.8
@@ -2642,13 +2625,10 @@ local function pickDirection(pos, goalDir, curVel)
                         -- zaehlte. Ergebnis waren 43 Landungen bei 25
                         -- Spruengen — er lief laufend ueber Kanten.
                         + (ground[i] or 0) * 2.6
-                        -- Offenheit deutlich hoeher gewichten und zusaetzlich
-                        -- bestrafen, wenn der Sektor richtig zu ist: mit 1.7
-                        -- lief er sehenden Auges in Ecken, weil die
-                        -- Zielrichtung schwerer wog als der fehlende Ausweg.
-                        + open * 3.2
-                        + ((open < 0.35) and -3.5 or 0)
-                        + gBonus
+                        -- Offenheit: 3.2 plus Strafmalus hatte keinen belegten
+                        -- Nutzen und stand im Verdacht, die Wegtreue zu
+                        -- verschlechtern. Zurueck auf den gemessenen Stand.
+                        + open * 1.7
                         + mid                   -- am Rand zur Mitte ziehen
                         + keep
                 ranked[#ranked + 1] = { dir = dir, s = s, jump = jump[i] }
@@ -2852,6 +2832,17 @@ local function climbStep(pos, dirHint)
     if not workspace:Raycast(pos + Vector3.new(0, 8, 0), -wall.Normal * 7, AP.rp) then
         AP.climbAssist = false
         return nil
+    end
+    -- Kein Wallride unter einem Ueberhang: ragt oberhalb etwas ueber die
+    -- Wand hinaus, stoesst man sich dort den Kopf und rutscht wieder ab.
+    -- Der Graph prueft das fuer seine Sprungkanten laengst, die
+    -- Nahbereichssteuerung bisher nicht.
+    do
+        local lip = pos + Vector3.new(0, 7.5, 0) - wall.Normal * 1.5
+        if workspace:Raycast(lip, Vector3.new(0, 6, 0), AP.rp) then
+            AP.climbAssist = false
+            return nil
+        end
     end
 
     local tan = wall.Normal:Cross(Vector3.new(0, 1, 0)) * Vector3.new(1, 0, 1)

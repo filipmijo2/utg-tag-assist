@@ -264,7 +264,14 @@ local function nudgeFromEdges(nodes)
         -- 7 oder 8 Kanten heisst freistehender Pfosten, da hilft Schieben nicht
         if edges >= 1 and edges <= 6 and push.Magnitude > 0.1 then
             local target = nd.p + push.Unit * 1.6
-            local under = cast(target + Vector3.new(0, 1.2, 0), Vector3.new(0, -4, 0))
+            -- Nicht DURCH eine Wand schieben: geprueft wurde bisher nur, ob
+            -- am Zielort Boden liegt. Hinter einer duennen Wand ist das der
+            -- Fall, und der Knoten landete auf der falschen Seite - der Weg
+            -- fuehrte dann mitten hindurch.
+            if cast(nd.p + Vector3.new(0, 1.5, 0), push.Unit * 2.2) then
+                target = nil
+            end
+            local under = target and cast(target + Vector3.new(0, 1.2, 0), Vector3.new(0, -4, 0))
             if under and math.abs(under.Position.Y - nd.p.Y) < 1.5 then
                 local foot = under.Position + Vector3.new(0, 0.5, 0)
                 if not cast(foot, Vector3.new(0, CFG.agentHeight * 0.6, 0)) then
@@ -781,7 +788,7 @@ function NAV.load(mapName)
 
     local lines = string.split(blob, "\n")
     local head = string.split(lines[1] or "", "|")
-    if head[1] ~= "UTGNAV4" then return nil end
+    if head[1] ~= "UTGNAV5" then return nil end
     local cell = tonumber(head[3])
     local bbv = string.split(head[4] or "", ",")
     if not cell or #bbv < 6 then return nil end
@@ -841,7 +848,7 @@ function NAV.save()
     -- stueckweise zusammensetzen: ein einzelner String mit Millionen
     -- Verkettungen sprengt den Speicher
     local parts = {
-        ("UTGNAV4|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
+        ("UTGNAV5|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
             r1(G.bb.min.X), r1(G.bb.min.Y), r1(G.bb.min.Z),
             r1(G.bb.max.X), r1(G.bb.max.Y), r1(G.bb.max.Z))
     }
