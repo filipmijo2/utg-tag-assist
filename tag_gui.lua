@@ -3075,11 +3075,14 @@ local JUKE_MOVES = {
             -- Noch kuerzer: bei 32 Studs/s waren 0.38 s schon zwoelf Studs
             -- weg vom Kurs. Ein Antaeuschen soll knapp sein, sonst ist es
             -- ein Umweg.
-            if t < 0.26 then
-                local p = t / 0.26
+            -- Sehr knapp halten: 0.26 s waren bei 32 Studs/s noch acht Studs
+            -- abseits. Jetzt reicht es gerade fuer die Koerpertaeuschung,
+            -- ohne nennenswert Strecke zu verlieren.
+            if t < 0.17 then
+                local p = t / 0.17
                 return turn(ctx.facing, m.s * (75 + 95 * p))
             end
-            if t < 0.62 then return m.back end
+            if t < 0.44 then return m.back end
             return nil
         end },
 
