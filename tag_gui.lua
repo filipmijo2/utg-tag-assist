@@ -703,6 +703,8 @@ end
 ------------------------------------------------------------------
 
 ------------------------------------------------------------------
+
+------------------------------------------------------------------
 -- 3c-2) EIGENER NAVIGATIONSGRAPH
 --     PathfindingService kennt keine der Fortbewegungsarten dieses
 --     Spiels (Wallrun, Zipline, Jumppad, Rail, SwingBar) und findet
@@ -1041,9 +1043,15 @@ do
     local CORRIDOR = 1.15
     local function corridorFree(a, c, side, off)
         local o = side * off
-        for _, w in ipairs({ 0, CORRIDOR, -CORRIDOR }) do
-            local shift = o + side * w
-            if cast(a + shift, (c + shift) - (a + shift)) then return false end
+        -- Auf DREI Hoehen pruefen, nicht nur auf Huefthoehe. In Hoehlen und an
+        -- unregelmaessigen Waenden sitzen die Hindernisse ueber oder unter der
+        -- Huefte - der Weg galt dann als frei und fuehrte mitten hindurch.
+        for _, h in ipairs({ 0, -1.5, 1.6 }) do
+            local lift = Vector3.new(0, h, 0)
+            for _, w in ipairs({ 0, CORRIDOR, -CORRIDOR }) do
+                local shift = o + side * w + lift
+                if cast(a + shift, (c + shift) - (a + shift)) then return false end
+            end
         end
         return true
     end
@@ -1483,7 +1491,7 @@ do
     
         local lines = string.split(blob, "\n")
         local head = string.split(lines[1] or "", "|")
-        if head[1] ~= "UTGNAV5" then return nil end
+        if head[1] ~= "UTGNAV6" then return nil end
         local cell = tonumber(head[3])
         local bbv = string.split(head[4] or "", ",")
         if not cell or #bbv < 6 then return nil end
@@ -1543,7 +1551,7 @@ do
         -- stueckweise zusammensetzen: ein einzelner String mit Millionen
         -- Verkettungen sprengt den Speicher
         local parts = {
-            ("UTGNAV5|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
+            ("UTGNAV6|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
                 r1(G.bb.min.X), r1(G.bb.min.Y), r1(G.bb.min.Z),
                 r1(G.bb.max.X), r1(G.bb.max.Y), r1(G.bb.max.Z))
         }
@@ -4689,7 +4697,9 @@ local function assistStep(dt)
     -- daneben — die Traegheit war also der ganze Fehler. Beschleunigung
     -- wurde bisher nur bei nahem Verfolger angehoben.
     if AP.usingPath then
-        wantAccel = math.max(wantAccel, 2.2)
+        -- 2.2 war zu hastig und liess das Tempo sichtbar rampen. 1.5 reicht,
+        -- um die vorgegebene Richtung zuegig einzunehmen.
+        wantAccel = math.max(wantAccel, 1.5)
     end
 
     -- weich nachziehen, damit kein sichtbarer Speed-Sprung entsteht
