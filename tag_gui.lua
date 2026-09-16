@@ -2732,9 +2732,15 @@ local function climbStep(pos, dirHint)
     -- Boden hat er damit dauerhaft die Blickrichtung an die Kamera
     -- gekoppelt statt an die Laufrichtung — beim Weglaufen entlang von
     -- Waenden war das praktisch durchgehend der Fall.
+    -- In der Luft allein reicht als Bedingung nicht: der Bot ist rund 40 %
+    -- der Zeit in der Luft, und dort hing die Blickrichtung dann dauerhaft
+    -- an der Kamera. Ein echter Wallrun STEIGT dabei — ein normaler Sturz
+    -- nicht. Also zusaetzlich auf aufwaerts gerichtete Geschwindigkeit
+    -- pruefen.
     local humW = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
     local airborne = humW and humW.FloorMaterial == Enum.Material.Air
-    if airborne then
+    local rising = hrp.AssemblyLinearVelocity.Y > 2
+    if airborne and rising then
         local m = RENV.shared.multipliers
         if m then
             m.RotateInMoveDirection = false
@@ -2859,39 +2865,59 @@ end
 
 local JUKE_MOVES = {
     -- 180 Grad antaeuschen und sofort wieder zurueck
-    {   name = "double180", cd = 3, minLevel = 1, maxD = 26,
-        init = function(ctx, m) m.back = ctx.facing end,
+    {   name = "double180", cd = 3, minLevel = 1, maxD = 22,
+        init = function(ctx, m)
+            m.back = ctx.facing
+            -- nicht stumpf kehrt, sondern schraeg zurueck: haelt Tempo
+            local side = Vector3.new(-ctx.facing.Z, 0, ctx.facing.X)
+            local s = (math.random() < 0.5) and 1 or -1
+            m.fake = (-ctx.facing * 1.0 + side * s * 0.55).Unit
+        end,
         run = function(ctx, m, t)
-            if t < 0.32 then return turn(ctx.facing, 180) end
-            if t < 0.75 then return m.back end
+            -- Laenger durchziehen: bei 32 Studs/s sind 0.32 s nur 10 Studs,
+            -- das kauft einem kein Verfolger ab. Erst weglaufen lassen,
+            -- dann kehren.
+            if t < 0.55 then return m.fake end
+            if t < 1.25 then return m.back end
             return nil
         end },
 
     -- 180 Grad wirklich durchziehen und am Verfolger vorbeilaufen
-    {   name = "commit180", cd = 3, minLevel = 2, maxD = 22,
+    {   name = "commit180", cd = 3, minLevel = 2, maxD = 20,
         init = function(ctx, m)
-            -- leicht versetzt, sonst laeuft er frontal hinein
-            local side = (math.random() < 0.5) and 28 or -28
-            m.dir = turn(ctx.facing, 180 + side)
+            -- schraeg an ihm vorbei statt frontal auf ihn zu, und mit
+            -- Vorwaertsanteil, damit das Tempo erhalten bleibt
+            local s = (math.random() < 0.5) and 1 or -1
+            local side = Vector3.new(-ctx.facing.Z, 0, ctx.facing.X) * s
+            m.dir = (-ctx.facing * 1.0 + side * 0.75).Unit
         end,
         run = function(ctx, m, t)
-            if t < 0.95 then return m.dir end
+            -- richtig committen: einmal 180 und dann auch dabei bleiben
+            if t < 1.7 then return m.dir end
             return nil
         end },
 
     -- Knoechelbrecher: 12 Uhr -> 9 Uhr -> 3 Uhr, ab Stufe 2 auch
     -- zurueck auf 9 Uhr und dort bleiben
-    {   name = "ankleBreaker", cd = 3, minLevel = 1, maxD = 30,
+    {   name = "ankleBreaker", cd = 3, minLevel = 1, maxD = 24,
         init = function(ctx, m)
+            -- Seitwaerts MIT Vorwaertsanteil, so wie es die alte Mechanik
+            -- gemacht hat: ein harter 85-Grad-Knick bremst den Bot aus und
+            -- sieht abgehackt aus, waehrend eine Mischung das Momentum
+            -- mitnimmt und trotzdem den Haken setzt.
             local s = (math.random() < 0.5) and 1 or -1
-            m.a = turn(ctx.facing, -85 * s)
-            m.b = turn(ctx.facing, 85 * s)
+            local fwd = ctx.facing
+            local side = Vector3.new(-fwd.Z, 0, fwd.X) * s
+            m.a = (side * 1.15 + fwd * 0.35).Unit
+            m.b = (-side * 1.25 + fwd * 0.3).Unit
             m.third = (ctx.level >= 2) and (math.random() < 0.5)
         end,
         run = function(ctx, m, t)
-            if t < 0.26 then return m.a end
-            if t < 0.54 then return m.b end
-            if m.third and t < 0.95 then return m.a end
+            -- Jede Richtung lange genug halten, sonst wirkt es wie Zittern
+            -- statt wie ein Haken: 0.26 s waren gerade acht Studs.
+            if t < 0.5 then return m.a end
+            if t < 1.05 then return m.b end
+            if m.third and t < 1.75 then return m.a end
             return nil
         end },
 
@@ -2931,17 +2957,19 @@ local JUKE_MOVES = {
             end
         end,
         run = function(ctx, m, t)
-            if t < 0.55 then return m.up end
-            if t < 0.64 then
+            -- Den Aufstieg lange genug antaeuschen, damit der Verfolger ihn
+            -- kauft und mit hochkommt - sonst steht er unten und wartet.
+            if t < 0.95 then return m.up end
+            if t < 1.05 then
                 tryJump(true)
                 return m.up
             end
-            if t < 1.25 then return m.away end
+            if t < 2.0 then return m.away end
             return nil
         end },
 
     -- Rollfinte: waehrend der Rolle die Richtung wechseln
-    {   name = "rollFeint", cd = 3, minLevel = 1, maxD = 26,
+    {   name = "rollFeint", cd = 3, minLevel = 1, maxD = 22,
         init = function(ctx, m)
             m.dir = turn(ctx.facing, (math.random() < 0.5) and 70 or -70)
             m.fired = false
@@ -2955,7 +2983,7 @@ local JUKE_MOVES = {
                     pcall(keyrelease, 0x43)
                 end)
             end
-            if t < 0.7 then return m.dir end
+            if t < 1.1 then return m.dir end
             return nil
         end },
 
@@ -2985,7 +3013,7 @@ local JUKE_MOVES = {
             end
         end,
         run = function(ctx, m, t)
-            if t < 1.0 then return m.dir end
+            if t < 1.5 then return m.dir end
             return nil
         end },
 }
@@ -3016,7 +3044,15 @@ local function jukeStep(pos, facing, toThreat, threatD, level)
 
     if level < 1 or not toThreat then return nil end
     if now - JUKE.lastAny < jukeGap(level) then return nil end
-    if threatD > 34 then return nil end
+    -- Nur in spuerbarer Naehe finten. Weiter weg sieht es niemand, kostet
+    -- aber Strecke - und der Verfolger hat Zeit, die Abkuerzung zu nehmen.
+    if threatD > 24 then return nil end
+    -- Und nur vom BODEN aus starten: in der Luft laesst sich die Richtung
+    -- kaum aendern, das Manoever verpufft dann wirkungslos. Die Spruenge
+    -- innerhalb von bamboozle und stairJuke sind davon unberuehrt, weil
+    -- nur der START geprueft wird.
+    local humJ = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+    if not humJ or humJ.FloorMaterial == Enum.Material.Air then return nil end
 
     local pool = {}
     for _, def in ipairs(JUKE_MOVES) do
