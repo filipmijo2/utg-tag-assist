@@ -3230,7 +3230,10 @@ local function autopilotStep(threat, threatD, prey, preyD)
             local rel = camY.Value:VectorToObjectSpace(cdir)
             rel = Vector3.new(rel.X, 0, rel.Z)
             if rel.Magnitude > 0.05 then
-                AP.vec, AP.mode = rel.Unit, "KLETTERN"
+                -- auch hier die Weltrichtung mitfuehren, sonst rechnet der
+                -- Move-Hook mit einer veralteten und die Kamera verbiegt
+                -- den Kurs
+                AP.vec, AP.vecWorld, AP.mode = rel.Unit, cdir.Unit, "KLETTERN"
                 return
             end
         end
