@@ -1624,7 +1624,10 @@ end
 --     Macht sichtbar, was der Graph plant: je Wegpunkt ein Wuerfel,
 --     eingefaerbt nach Kantenart. Rein lokal, nichts davon repliziert.
 ------------------------------------------------------------------
-local PATHVIS = { folder = nil, on = true }
+-- Die Anzeige baut bei jedem neuen Weg bis zu 50 Parts neu auf. Das ist
+-- zum Nachvollziehen nuetzlich, kostet aber Bildrate — daher aus, bis
+-- sie ueber die GUI eingeschaltet wird.
+local PATHVIS = { folder = nil, on = false }
 local KIND_COLOR = {
     walk    = Color3.fromRGB(235, 235, 235),
     hop     = Color3.fromRGB(255, 210,  60),
@@ -1962,10 +1965,15 @@ end
 
 local function requestPath(fromPos, candidates)
     if PATH.busy then return end
+    -- Harte Mindestpause zwischen zwei Berechnungen. Gemessen wurden 50
+    -- Anfragen in 30 s (1.7 pro Sekunde) bei 15-30 ms A* je Anfrage — das
+    -- allein erzeugte laufend Ruckler und drueckte die Bildrate auf 43.
+    if PATH.lastCalc and tick() - PATH.lastCalc < 0.7 then return end
     -- harte Sperre nach Fehlschlaegen: sonst wird jede Sekunde mehrfach
     -- gerechnet und jedes Mal derselbe Umweg verworfen
     if PATH.nextAllowed and tick() < PATH.nextAllowed then return end
     PATH.busy = true
+    PATH.lastCalc = tick()
     task.spawn(function()
         local wps, used
         -- Eine Graph-Anfrage kostet gemessen 12 ms statt 100-160 ms bei
