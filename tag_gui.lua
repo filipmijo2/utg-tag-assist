@@ -627,6 +627,14 @@ end
 ------------------------------------------------------------------
 
 ------------------------------------------------------------------
+
+------------------------------------------------------------------
+
+------------------------------------------------------------------
+
+------------------------------------------------------------------
+
+------------------------------------------------------------------
 -- 3c-2) EIGENER NAVIGATIONSGRAPH
 --     PathfindingService kennt keine der Fortbewegungsarten dieses
 --     Spiels (Wallrun, Zipline, Jumppad, Rail, SwingBar) und findet
@@ -682,7 +690,11 @@ do
         stepUp = 3.0,        -- Hoehe, die Gehen noch schafft
         wallChainMax = 25,   -- wie hoch eine Wallride-Kette traegt
         nodeCap = 120000,   -- TeapotTemple riss 45000 -> Bake brach mittendrin ab
-        rayBudget = 2500,    -- darf beim Backen ruckeln, laeuft ja nur einmal
+        -- Raycasts pro Frame waehrend des Backens. 2500 waren zwar schnell
+        -- fertig, haben das Spiel aber fuer die ganze Bakedauer unspielbar
+        -- gemacht. Der Bake laeuft nur einmal pro Map und darf deshalb ruhig
+        -- laenger brauchen — spuerbar ruckeln soll er nicht.
+        rayBudget = 450,
     }
     
     ------------------------------------------------------------------
@@ -809,13 +821,58 @@ do
         return nodes, grid, cell
     end
     
+    -- Wasser und Saeure sind hier KEIN Terrain, sondern Teile mit
+    -- CanCollide = false (gemessen auf RavenRock: "Water", "WaterMainPart",
+    -- Material Plastic). Ein Raycast mit RespectCanCollide geht schlicht
+    -- hindurch und trifft den Grund darunter — die Erkennung ueber das
+    -- Material fand deshalb 6 von 27869 Knoten. Stattdessen werden die
+    -- Volumen dieser Teile direkt geprueft.
+    local function markHazards(nodes, mapRoot)
+        local vols = {}
+        for _, d in ipairs(mapRoot:GetDescendants()) do
+            if d:IsA("BasePart") then
+                local n = d.Name:lower()
+                if n:find("water") or n:find("acid") or n:find("lava")
+                   or n:find("liquid") or n:find("slime") or n:find("poison")
+                   or d.Material == Enum.Material.Water
+                   or d:GetAttribute("Lava") or d:GetAttribute("ContactDamage")
+                   or d:GetAttribute("Acid") then
+                    -- Wolken und Deko ueber dem Wasser interessieren nicht
+                    if not n:find("cloud") and not n:find("splash") then
+                        vols[#vols+1] = d
+                    end
+                end
+            end
+        end
+        if #vols == 0 then return 0, 0 end
+        local marked = 0
+        for i, nd in ipairs(nodes) do
+            for _, v in ipairs(vols) do
+                local lp = v.CFrame:PointToObjectSpace(nd.p)
+                local h = v.Size * 0.5
+                -- Nur was WIRKLICH unter der Oberflaeche liegt. Ein erster
+                -- Versuch mit Puffer nach oben markierte 10794 von 27867 Knoten
+                -- (39 % der Map) — diese Wasserteile sind grossflaechig, und
+                -- alles knapp darueber ist trockenes Ufer.
+                if math.abs(lp.X) <= h.X and math.abs(lp.Z) <= h.Z
+                   and lp.Y <= h.Y - 0.5 and lp.Y >= -h.Y - 2 then
+                    nd.bad = true
+                    marked = marked + 1
+                    break
+                end
+            end
+            if i % 1500 == 0 then breathe() end
+        end
+        return marked, #vols
+    end
+    
     ------------------------------------------------------------------
     -- 4) Kanten. Kosten sind SEKUNDEN.
     ------------------------------------------------------------------
     -- Wasser und Schadensflaechen: Strafaufschlag auf jede Kante, die DORTHIN
     -- fuehrt. In Sekunden gerechnet entspricht das einem langen Umweg, also
     -- meidet A* sie zuverlaessig, ohne dass sie ganz unpassierbar werden.
-    local DANGER_COST = 6.0
+    local DANGER_COST = 25.0   -- Wasser wird damit praktisch immer umgangen
     local function addEdge(a, b, kind, cost, via)
         if b.bad then cost = cost + DANGER_COST end
         -- Fuehrt die Kante in eine enge Stelle, muss dort gerollt werden
@@ -1266,6 +1323,8 @@ do
         if #nodes < 50 then return nil, "zu wenige Knoten: " .. #nodes end
     
         local stats = {}
+        -- MUSS vor dem Kantenbau laufen: addEdge liest nd.bad
+        stats.hazard, stats.hazardParts = markHazards(nodes, mapRoot)
         stats.walk, stats.hop, stats.step = buildWalk(nodes, grid, prof)
         stats.climb = buildClimb(nodes, grid, bb, cell, mapRoot, prof)
         local j, d, rim = buildJumpDrop(nodes, grid, cell, prof)
@@ -1308,7 +1367,7 @@ do
     
         local lines = string.split(blob, "\n")
         local head = string.split(lines[1] or "", "|")
-        if head[1] ~= "UTGNAV3" then return nil end
+        if head[1] ~= "UTGNAV4" then return nil end
         local cell = tonumber(head[3])
         local bbv = string.split(head[4] or "", ",")
         if not cell or #bbv < 6 then return nil end
@@ -1368,7 +1427,7 @@ do
         -- stueckweise zusammensetzen: ein einzelner String mit Millionen
         -- Verkettungen sprengt den Speicher
         local parts = {
-            ("UTGNAV3|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
+            ("UTGNAV4|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
                 r1(G.bb.min.X), r1(G.bb.min.Y), r1(G.bb.min.Z),
                 r1(G.bb.max.X), r1(G.bb.max.Y), r1(G.bb.max.Z))
         }
@@ -1959,29 +2018,38 @@ local function followPath(pos)
             -- Also erst die freie Seite bestimmen, sie anlaufen, und von
             -- dort auf die Leiter zuhalten — nur so trifft der Blickstrahl
             -- des Spiels den TrussPart.
+            -- Von WELCHER Seite geklettert wird, steht schon im Weg: der
+            -- Wegpunkt davor ist der geplante Anlaufpunkt am Leiterfuss.
+            -- Vorher wurde stattdessen die dem Bot naechste freie Seite
+            -- gesucht — damit lief er um die Leiter herum und stieg von
+            -- hinten ein, obwohl der Weg vor ihre Front zeigte.
+            local approach = (PATH.idx > 1) and wps[PATH.idx - 1].Position or nil
             local cf = best.CFrame
             local half = math.max(best.Size.X, best.Size.Z) * 0.5
-            local anchor, aDist
+            local anchor, aScore
             for _, dir in ipairs({ cf.LookVector, -cf.LookVector,
                                    cf.RightVector, -cf.RightVector }) do
                 local flatDir = (dir * Vector3.new(1, 0, 1))
                 if flatDir.Magnitude > 0.1 then
                     flatDir = flatDir.Unit
                     local probe = best.Position + flatDir * (half + 3.5)
-                    -- Seite frei? (nichts zwischen Leiter und Standplatz)
-                        local blocked = workspace:Raycast(
-                            best.Position + Vector3.new(0, 1, 0),
-                            flatDir * (half + 3.5), AP.rp)
-                        if not blocked then
-                            local d = ((probe - pos) * Vector3.new(1, 0, 1)).Magnitude
-                            if not aDist or d < aDist then anchor, aDist = probe, d end
-                        end
+                    local blocked = workspace:Raycast(
+                        best.Position + Vector3.new(0, 1, 0),
+                        flatDir * (half + 3.5), AP.rp)
+                    if not blocked then
+                        -- an der geplanten Seite messen, nicht an der eigenen
+                        local ref = approach or pos
+                        local d = ((probe - ref) * Vector3.new(1, 0, 1)).Magnitude
+                        if not aScore or d < aScore then anchor, aScore = probe, d end
+                    end
                 end
             end
-            if anchor and aDist and aDist > 3.5 then
-                -- noch nicht auf der richtigen Seite: erst dorthin
-                local v = (anchor - pos) * Vector3.new(1, 0, 1)
-                if v.Magnitude > 0.1 then return v.Unit end
+            if anchor then
+                local toAnchor = (anchor - pos) * Vector3.new(1, 0, 1)
+                if toAnchor.Magnitude > 3.0 then
+                    -- noch nicht an der richtigen Seite: erst dorthin
+                    return toAnchor.Unit
+                end
             end
             local v = (best.Position - pos) * Vector3.new(1, 0, 1)
             if v.Magnitude > 0.1 then return v.Unit end
