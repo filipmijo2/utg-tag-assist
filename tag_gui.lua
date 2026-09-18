@@ -825,8 +825,12 @@ do
                  max = Vector3.new(pc(xs,0.98), maxY, pc(zs,0.98)) }
     end
     
+    local SIDE4 = { Vector3.new(1,0,0), Vector3.new(-1,0,0),
+                    Vector3.new(0,0,1), Vector3.new(0,0,-1) }
+
     local function sampleNodes(bb, onProgress)
         local nodes, grid = {}, {}
+        local narrow = 0        -- wegen zu wenig Platz verworfen
         -- Rasterweite an die Mapgroesse koppeln. Feiner ist nicht besser:
         -- mit festem Raster 4 kam TeapotTemple auf 51244 Knoten, und A* fand
         -- danach nur noch 4 von 15 Wegen bei 111 ms — gegenueber 20/20 bei
@@ -861,7 +865,28 @@ do
                             local h = ceil.Position.Y - foot.Y
                             low = h >= 2.2
                         end
+                        -- PASST DER CHARAKTER DORT UEBERHAUPT HIN?
+                        -- Ein Strahl von oben trifft jede nach oben zeigende
+                        -- Flaeche — auch die Oberkante einer Mauer, den Boden
+                        -- einer Nische hinter Deko oder eine Luecke zwischen
+                        -- zwei Teilen. Bisher wurde nur die Kopffreiheit
+                        -- geprueft, nicht die Breite: genau daher stammen die
+                        -- Wegpunkte, die im Spiel in einer Wand stecken.
+                        -- Geprueft wird auf Huefthoehe nach vier Seiten; sind
+                        -- drei davon naeher als 1.3 Studs zu, steht dort kein
+                        -- Charakter (er ist rund zwei Studs breit). Eine Wand
+                        -- an einer oder zwei Seiten ist normal und bleibt.
+                        local fits = true
                         if (not ceil) or low then
+                            local body = foot + Vector3.new(0, 2.2, 0)
+                            local blocked = 0
+                            for _, sd in ipairs(SIDE4) do
+                                if cast(body, sd * 1.3) then blocked = blocked + 1 end
+                            end
+                            fits = blocked < 3
+                            if not fits then narrow = narrow + 1 end
+                        end
+                        if ((not ceil) or low) and fits then
                             -- Gefahrflaechen merken statt wegwerfen: der Weg
                             -- darueber bleibt moeglich, kostet aber so viel, dass
                             -- A* ihn nur nimmt, wenn es gar nicht anders geht.
@@ -888,9 +913,9 @@ do
                 onProgress(ix / math.max(nx,1), #nodes)
             end
         end
-        return nodes, grid, cell
+        return nodes, grid, cell, narrow
     end
-    
+
     -- Wasser und Saeure sind hier KEIN Terrain, sondern Teile mit
     -- CanCollide = false (gemessen auf RavenRock: "Water", "WaterMainPart",
     -- Material Plastic). Ein Raycast mit RespectCanCollide geht schlicht
@@ -944,7 +969,7 @@ do
     -- Treppe. Also wird jeder Knoten von seinen Abbruchkanten weggeschoben,
     -- solange darunter noch dieselbe Flaeche liegt.
     local function nudgeFromEdges(nodes)
-        local moved = 0
+        local moved, offWall = 0, 0
         for i, nd in ipairs(nodes) do
             local push, edges = Vector3.zero, 0
             for k = 0, 7 do
@@ -958,6 +983,13 @@ do
                     edges = edges + 1
                 end
             end
+            -- Faellt der Boden nach SECHS oder mehr Seiten weg, ist das keine
+            -- Standflaeche mehr, sondern eine Mauerkrone oder ein Pfosten. Der
+            -- Knoten bleibt (manchmal fuehrt oben herum wirklich der einzige
+            -- Weg), wird aber so teuer, dass A* ihn nur im Notfall nimmt —
+            -- sonst laufen Wege ueber Mauerkronen, und im Spiel sieht das aus
+            -- wie ein Punkt in der Wand.
+            if edges >= 6 then nd.bad = true end
             -- 7 oder 8 Kanten heisst freistehender Pfosten, da hilft Schieben nicht
             if edges >= 1 and edges <= 6 and push.Magnitude > 0.1 then
                 local target = nd.p + push.Unit * 1.6
@@ -977,9 +1009,35 @@ do
                     end
                 end
             end
-            if i % 700 == 0 then breathe() end
+            -- VON WAENDEN WEGSCHIEBEN. Das Abtastraster ist map-global und
+            -- nicht an Waenden ausgerichtet: ein Knoten kann einen halben Stud
+            -- vor einer Wand liegen. Der Charakter ist rund zwei Studs breit,
+            -- sein Mittelpunkt kommt dort nie hin — im Spiel sieht so ein
+            -- Wegpunkt aus, als steckte er in der Wand, und getroffen wird er
+            -- nie. Also auf Koerperhoehe messen und so weit wegschieben, dass
+            -- mindestens 1.4 Studs Luft bleiben, solange darunter dieselbe
+            -- Flaeche liegt.
+            local body = nd.p + Vector3.new(0, 2.2, 0)
+            local away, walls = Vector3.zero, 0
+            for _, sd in ipairs(SIDE4) do
+                local h = cast(body, sd * 1.4)
+                if h then
+                    away = away - sd * (1.4 - (h.Position - body).Magnitude)
+                    walls = walls + 1
+                end
+            end
+            -- drei oder vier Seiten zu heisst Nische: da hilft Schieben nicht
+            if walls >= 1 and walls <= 2 and away.Magnitude > 0.15 then
+                local tgt = nd.p + away
+                local under = cast(tgt + Vector3.new(0, 1.2, 0), Vector3.new(0, -4, 0))
+                if under and math.abs(under.Position.Y - nd.p.Y) < 1.5 then
+                    nd.p = under.Position + Vector3.new(0, 0.5, 0)
+                    offWall = offWall + 1
+                end
+            end
+            if i % 500 == 0 then breathe() end
         end
-        return moved
+        return moved, offWall
     end
     
     ------------------------------------------------------------------
@@ -1441,13 +1499,13 @@ do
         if not bb then return nil, "Map zu klein" end
     
         local t0 = os.clock()
-        local nodes, grid, cell = sampleNodes(bb, onProgress)
+        local nodes, grid, cell, narrow = sampleNodes(bb, onProgress)
         if #nodes < 50 then return nil, "zu wenige Knoten: " .. #nodes end
-    
-        local stats = {}
+
+        local stats = { narrow = narrow or 0 }
         -- Beide MUESSEN vor dem Kantenbau laufen: das Wegschieben aendert
         -- Knotenpositionen, addEdge liest nd.bad
-        stats.nudged = nudgeFromEdges(nodes)
+        stats.nudged, stats.offWall = nudgeFromEdges(nodes)
         stats.hazard, stats.hazardParts = markHazards(nodes, mapRoot)
         stats.walk, stats.hop, stats.step = buildWalk(nodes, grid, prof)
         stats.climb = buildClimb(nodes, grid, bb, cell, mapRoot, prof)
@@ -1491,7 +1549,7 @@ do
     
         local lines = string.split(blob, "\n")
         local head = string.split(lines[1] or "", "|")
-        if head[1] ~= "UTGNAV6" then return nil end
+        if head[1] ~= "UTGNAV7" then return nil end
         local cell = tonumber(head[3])
         local bbv = string.split(head[4] or "", ",")
         if not cell or #bbv < 6 then return nil end
@@ -1551,7 +1609,7 @@ do
         -- stueckweise zusammensetzen: ein einzelner String mit Millionen
         -- Verkettungen sprengt den Speicher
         local parts = {
-            ("UTGNAV6|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
+            ("UTGNAV7|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
                 r1(G.bb.min.X), r1(G.bb.min.Y), r1(G.bb.min.Z),
                 r1(G.bb.max.X), r1(G.bb.max.Y), r1(G.bb.max.Z))
         }
@@ -1654,9 +1712,11 @@ local function ensureGraph()
             local s = g.stats
             LOG(("Navigationsgraph fuer %s gebaut: %d Knoten in %.1f s — %d gehen, "
                  .. "%d Stufe hoch, %d Stufe runter, %d springen, %d fallen, "
-                 .. "%d klettern, %d zip, %d pad")
+                 .. "%d klettern, %d zip, %d pad; %d Punkte wegen zu wenig "
+                 .. "Platz verworfen, %d von Waenden weggeschoben")
                 :format(g.map, s.nodes, s.secs, s.walk, s.hop or 0, s.step or 0,
-                        s.jump, s.drop, s.climb, s.zip, s.pad))
+                        s.jump, s.drop, s.climb, s.zip, s.pad, s.narrow or 0,
+                        s.offWall or 0))
             -- pcall allein genuegt hier nicht: NAV.save kann sauber
             -- zurueckkehren und trotzdem false melden
             local okCall, saved, info = pcall(NAV.save)
