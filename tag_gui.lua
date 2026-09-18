@@ -48,7 +48,7 @@ local CFG = {
     -- AYIP: 0 = aus, 1/2/3 = Juke-Stufen (entspricht frueher Ankles 6 / 8 / 10)
     ayip        = 0,   -- aus = altes Standardverhalten
     -- Mindestabstand fuer Finten: fest, der Regler dafuer ist entfallen
-    feintDist   = 25,
+    feintDist   = 29,
     thirdPerson = false,   -- Taste T
     preset      = 3,       -- fest auf Maximum (kein Umschalten mehr)
 }
@@ -3499,8 +3499,35 @@ end
 --     Richtungen sind relativ zur Laufrichtung gedacht: 12 Uhr ist
 --     voraus, 9 und 3 Uhr sind die Seiten.
 ------------------------------------------------------------------
-local JUKE = { active = nil, cd = {}, lastAny = 0, count = 0, log = {} }
+local JUKE = { active = nil, cd = {}, lastAny = 0, count = 0, log = {},
+               -- Wirkungsmessung je Manoever: wie viel Abstand hat es
+               -- gebracht? Ohne das ist jede Aenderung am Repertoire
+               -- Geschmackssache.
+               stat = {}, base = { n = 0, sum = 0 } }
 AP.juke = JUKE
+
+-- Bericht ueber die Wirkung der Manoever. Verglichen wird der
+-- Abstandsgewinn zum Verfolger ueber 1.2 s nach dem Manoever gegen
+-- denselben Zeitraum OHNE Manoever — nur die Differenz ist aussagekraeftig,
+-- weil der Abstand beim Weglaufen ohnehin schwankt.
+function ENV.jukeReport()
+    local base = (JUKE.base.n > 0) and (JUKE.base.sum / JUKE.base.n) or 0
+    local out = { ("ohne Finte: %+.2f Studs je 1.2 s (aus %d Messungen)")
+                  :format(base, JUKE.base.n) }
+    local rows = {}
+    for name, s in pairs(JUKE.stat) do
+        rows[#rows+1] = { name = name, avg = s.sum / math.max(s.n, 1), n = s.n,
+                          best = s.best, worst = s.worst }
+    end
+    table.sort(rows, function(a, b) return a.avg > b.avg end)
+    for _, r in ipairs(rows) do
+        out[#out+1] = ("%-12s %+.2f (gegen ohne: %+.2f)  n=%d  best %+.1f  schlecht %+.1f")
+            :format(r.name, r.avg, r.avg - base, r.n, r.best, r.worst)
+    end
+    out[#out+1] = ("gestartet %d, abgebrochen (Tempo) %d, abgebrochen (Wand) %d")
+        :format(JUKE.count, JUKE.aborted or 0, JUKE.wallAborts or 0)
+    return table.concat(out, "\n")
+end
 
 local function turn(dir, deg)
     local a = math.rad(deg)
@@ -3534,9 +3561,45 @@ local function findRise(pos, facing)
     return nil
 end
 
+-- Sucht eine Ecke oder Saeule in Laufrichtung, um die man eng herumziehen
+-- kann: eine Richtung, in der etwas steht, unmittelbar daneben aber frei ist
+-- und Boden liegt. Rueckgabe: Richtung zum Hindernis und die freie Seite.
+local function findCorner(pos, facing)
+    for _, deg in ipairs({ 0, -25, 25, -50, 50 }) do
+        local dir = turn(facing, deg)
+        local f = rayClear(pos, dir, 2.4, 12)
+        -- Hindernis 4 bis 10 Studs voraus: nah genug zum Umrunden, weit
+        -- genug, um ueberhaupt hinzukommen
+        if f > 0.33 and f < 0.85 then
+            for _, sdeg in ipairs({ 45, -45 }) do
+                local sdir = turn(dir, sdeg)
+                if rayClear(pos, sdir, 2.4, 12) > 0.95
+                   and groundAt(pos, sdir, 8, 10) then
+                    return dir, (sdeg > 0) and 1 or -1
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- GEMESSENE WIRKUNG (2026-09-18, drei Laeufe auf CrossPaths/GlassHouses,
+-- Abstandsgewinn zum Verfolger 1.2 s nach dem Manoever, Vergleichswert ohne
+-- Finte lag bei -2.9 bis +1.1 Studs):
+--     rollFeint   +17.5 Studs (n=9)
+--     double180   +14.0        (n=5)
+--     stairJuke   +11.5        (n=5)
+--     cornerLoop   -0.7        (n=4)
+--     bamboozle    -9.0        (n=2)
+--     circle      -10.4        (n=1)
+-- Die Kehren und die Rollfinte tragen das Repertoire; die langen Bogen- und
+-- Sprungmanoever kosten eher Strecke. Deshalb dreht der Kreis jetzt kuerzer,
+-- und die Auswahl gewichtet sich zur Laufzeit selbst nach Wirkung (siehe
+-- jukeStep) — statt die schwachen Manoever zu loeschen, was bei n=1 bis 4
+-- verfrueht waere.
 local JUKE_MOVES = {
     -- 180 Grad antaeuschen und sofort wieder zurueck
-    {   name = "double180", cd = 5, minLevel = 1, maxD = 25,
+    {   name = "double180", cd = 5, minLevel = 1, maxD = 29, minD = 6, turnBack = true,
         init = function(ctx, m)
             m.back = ctx.facing
             m.s = (math.random() < 0.5) and 1 or -1
@@ -3567,7 +3630,7 @@ local JUKE_MOVES = {
         end },
 
     -- 180 Grad wirklich durchziehen und am Verfolger vorbeilaufen
-    {   name = "commit180", cd = 5, minLevel = 2, maxD = 23,
+    {   name = "commit180", cd = 5, minLevel = 2, maxD = 27, minD = 9, turnBack = true,
         init = function(ctx, m)
             m.s = (math.random() < 0.5) and 1 or -1
         end,
@@ -3591,15 +3654,15 @@ local JUKE_MOVES = {
     -- kostet (das Spiel setzt es auf 0, sobald die Seitgeschwindigkeit
     -- unter 6.8 faellt) und der Verfolger einen harten Knick ohnehin
     -- mitgeht. Ein Bogen laesst ihn dagegen aussen vorbeilaufen.
-    {   name = "circle", cd = 5, minLevel = 1, maxD = 25, skipWall = true,
+    {   name = "circle", cd = 5, minLevel = 1, maxD = 29, minD = 7, arc = true, skipWall = true,
         init = function(ctx, m)
             m.s = (math.random() < 0.5) and 1 or -1
-            -- 270 Grad reicht meist, 450 ist die anderthalbfache Runde
-            m.total = (ctx.level >= 2 and math.random() < 0.4) and 450 or 270
-            -- so lang, dass es eine gefahrene Kurve wird und kein Drehen
-            -- auf der Stelle. 210 Grad pro Sekunde war noch zu hastig,
-            -- jetzt 165 - ein 270er dauert damit 1.6 s, ein 450er 2.7 s.
-            m.dur = m.total / 165
+            -- Die anderthalbfache Runde (450 Grad) ist raus: gemessen hat
+            -- der Kreis als einziges Manoever Abstand GEKOSTET, und je
+            -- laenger er dauert, desto mehr. 270 Grad bleiben, dafuer
+            -- zuegiger gedreht (165 -> 200 Grad/s, 1.6 -> 1.35 s).
+            m.total = 270
+            m.dur = m.total / 200
         end,
         run = function(ctx, m, t)
             if t < m.dur then
@@ -3609,7 +3672,7 @@ local JUKE_MOVES = {
             return nil
         end },
     -- wieder auf dem Ausgangspunkt landen
-    {   name = "bamboozle", cd = 8, minLevel = 2, maxD = 25, mapMove = true,
+    {   name = "bamboozle", cd = 8, minLevel = 2, maxD = 29, minD = 7, turnBack = true, mapMove = true,
         ready = function(ctx)
             local near = groundAt(ctx.pos, ctx.facing, 4, 10)
             local far = groundAt(ctx.pos, ctx.facing, 11, 14)
@@ -3630,7 +3693,7 @@ local JUKE_MOVES = {
 
     -- Treppen-/Leiterfinte: Aufstieg antaeuschen, dann abspringen.
     -- Entweder zurueck zum Ausgangspunkt oder seitlich weiter.
-    {   name = "stairJuke", cd = 8, minLevel = 2, maxD = 34, mapMove = true,
+    {   name = "stairJuke", cd = 8, minLevel = 2, maxD = 38, minD = 8, mapMove = true,
         ready = function(ctx) return findRise(ctx.pos, ctx.facing) ~= nil end,
         init = function(ctx, m)
             local dir, kind = findRise(ctx.pos, ctx.facing)
@@ -3654,8 +3717,30 @@ local JUKE_MOVES = {
             return nil
         end },
 
+    -- Eng um eine Ecke oder Saeule ziehen. Der Verfolger kommt mit Tempo an
+    -- und kann den Knick nicht so eng fahren — er laeuft aussen vorbei und
+    -- verliert dabei die Sichtlinie. Anders als die Kehren kostet das kaum
+    -- Strecke, weil der Bot hinter dem Hindernis weiterlaeuft.
+    {   name = "cornerLoop", cd = 6, minLevel = 1, maxD = 26, minD = 6,
+        arc = true, skipWall = true, noMirror = true,
+        ready = function(ctx) return findCorner(ctx.pos, ctx.facing) ~= nil end,
+        init = function(ctx, m)
+            local dir, side = findCorner(ctx.pos, ctx.facing)
+            m.to, m.s = dir or ctx.facing, side or 1
+        end,
+        run = function(ctx, m, t)
+            -- erst knapp an der Kante vorbei (auf der freien Seite) ...
+            if t < 0.40 then return turn(m.to, m.s * 35) end
+            -- ... dann eng herumziehen, solange das Tempo haelt
+            if t < 1.20 then
+                local p = (t - 0.40) / 0.80
+                return turn(m.to, m.s * (35 + 125 * p))
+            end
+            return nil
+        end },
+
     -- Rollfinte: waehrend der Rolle die Richtung wechseln
-    {   name = "rollFeint", cd = 5, minLevel = 1, maxD = 25,
+    {   name = "rollFeint", cd = 5, minLevel = 1, maxD = 29, minD = 6, arc = true,
         init = function(ctx, m)
             m.dir = turn(ctx.facing, (math.random() < 0.5) and 70 or -70)
             m.fired = false
@@ -3683,10 +3768,73 @@ local function jukeGap(level)
 end
 
 -- Waehlt ein Manoever und fuehrt es aus. Rueckgabe: Richtung oder nil.
+-- Ein Manoever beenden und zur Wirkungsmessung anmelden.
+local function endJuke(a, now, why)
+    -- Ein Manoever, das an einer Wand abgebrochen ist, hat gar nicht
+    -- stattgefunden — es mit dem vollen Cooldown von 5 bis 8 Sekunden zu
+    -- sperren, verschenkt das halbe Repertoire. Gemessen kamen auf 15
+    -- gestartete Finten 19 solcher Abbrueche. Kurze Sperre statt langer.
+    if why == "wallAborts" or why == "edgeAborts" then
+        JUKE.cd[a.def.name] = now - math.max((a.def.cd or 5) - 1.5, 0)
+    else
+        JUKE.cd[a.def.name] = now
+    end
+    JUKE.lastAny = now
+    if why then JUKE[why] = (JUKE[why] or 0) + 1 end
+    -- Erst 1.2 s NACH dem Ende messen: der Verfolger braucht einen Moment,
+    -- um auf den Haken zu reagieren, und genau das soll gemessen werden.
+    if a.d0 then
+        JUKE.pending = { name = a.def.name, d0 = a.d0, at = now + 1.2,
+                         cut = (why ~= nil) }
+    end
+    JUKE.active, AP.jukeName = nil, nil
+end
+
 local function jukeStep(pos, facing, toThreat, threatD, level)
     local now = tick()
     local ctx = { pos = pos, facing = facing, toThreat = toThreat,
                   threatD = threatD, level = level }
+    local dOK = threatD and threatD < 400
+
+    -- WIRKUNGSMESSUNG. Ein Manoever ist nur dann gut, wenn danach mehr
+    -- Abstand da ist als ohne — deshalb wird beides gemessen: der Gewinn
+    -- nach jeder Finte und, als Vergleich, derselbe Zeitraum im normalen
+    -- Weglaufen.
+    local pend = JUKE.pending
+    if pend then
+        if dOK and now >= pend.at then
+            local gain = threatD - pend.d0
+            local s = JUKE.stat[pend.name]
+                      or { n = 0, sum = 0, best = -99, worst = 99 }
+            s.n, s.sum = s.n + 1, s.sum + gain
+            if gain > s.best then s.best = gain end
+            if gain < s.worst then s.worst = gain end
+            JUKE.stat[pend.name] = s
+            LOG(("Finte %s%s: Abstand %.1f -> %.1f (%+.1f), Schnitt %+.1f aus %d")
+                :format(pend.name, pend.cut and " (abgebrochen)" or "",
+                        pend.d0, threatD, gain, s.sum / s.n, s.n))
+            JUKE.pending = nil
+            -- Alle zehn Messungen die Rangliste ins Log: so sammelt sich
+            -- ueber echte Spielzeit eine belastbare Aussage darueber, welches
+            -- Manoever wirklich Abstand bringt.
+            JUKE.since = (JUKE.since or 0) + 1
+            if JUKE.since >= 10 then
+                JUKE.since = 0
+                LOG("--- Wirkung der Finten ---\n" .. ENV.jukeReport())
+            end
+        elseif now > pend.at + 2.5 then
+            JUKE.pending = nil          -- Verfolger weg, nicht auswertbar
+        end
+    elseif dOK and not JUKE.active then
+        -- Vergleichswert: Abstandsaenderung ueber dieselben 1.2 s ohne Finte
+        local b = JUKE.baseRef
+        if b and now - b.t >= 1.2 then
+            JUKE.base.n = JUKE.base.n + 1
+            JUKE.base.sum = JUKE.base.sum + (threatD - b.d)
+            b = nil
+        end
+        if not b then JUKE.baseRef = { t = now, d = threatD } end
+    end
 
     local a = JUKE.active
     if a then
@@ -3698,10 +3846,7 @@ local function jukeStep(pos, facing, toThreat, threatD, level)
         local sp = hrpJ and (hrpJ.AssemblyLinearVelocity * Vector3.new(1, 0, 1)).Magnitude or 99
         a.slow = (sp < 9) and ((a.slow or 0) + 1) or 0
         if a.slow > 12 then          -- rund 0.2 s dauerhaft zu langsam
-            JUKE.cd[a.def.name] = now
-            JUKE.lastAny = now
-            JUKE.aborted = (JUKE.aborted or 0) + 1
-            JUKE.active, AP.jukeName = nil, nil
+            endJuke(a, now, "aborted")
             return nil
         end
         local dir = a.def.run(ctx, a, now - a.t0)
@@ -3714,18 +3859,26 @@ local function jukeStep(pos, facing, toThreat, threatD, level)
             -- hineinzulaufen. Dort zaehlt allein die Zielrichtung, die
             -- beim Start geprueft wird.
             if not a.def.skipWall and rayClear(pos, dir, 2.4, 9) < 0.7 then
-                JUKE.cd[a.def.name] = now
-                JUKE.lastAny = now
-                JUKE.wallAborts = (JUKE.wallAborts or 0) + 1
-                JUKE.active, AP.jukeName = nil, nil
+                endJuke(a, now, "wallAborts")
                 return nil
+            end
+            -- ABBRUCH AN DER KANTE. Ein Manoever, das ueber eine Kante
+            -- fuehrt, endet im Sturz — und ein Sturz kostet mehr, als jede
+            -- Finte je bringt. Geprueft wird der Boden dort, wo er in einer
+            -- Viertelsekunde waere.
+            if not a.def.mapMove then
+                local ahead = pos + dir * 9
+                local g = workspace:Raycast(ahead + Vector3.new(0, 2, 0),
+                                            Vector3.new(0, -14, 0), AP.rp)
+                if not g then
+                    endJuke(a, now, "edgeAborts")
+                    return nil
+                end
             end
             AP.jukeName = a.def.name
             return dir
         end
-        JUKE.cd[a.def.name] = now
-        JUKE.lastAny = now
-        JUKE.active, AP.jukeName = nil, nil
+        endJuke(a, now, nil)
         return nil
     end
 
@@ -3733,7 +3886,7 @@ local function jukeStep(pos, facing, toThreat, threatD, level)
     if now - JUKE.lastAny < jukeGap(level) then return nil end
     -- Nur in spuerbarer Naehe finten. Weiter weg sieht es niemand, kostet
     -- aber Strecke - und der Verfolger hat Zeit, die Abkuerzung zu nehmen.
-    if threatD > 25 then return nil end
+    if threatD > 30 then return nil end
     -- Und nur vom BODEN aus starten: in der Luft laesst sich die Richtung
     -- kaum aendern, das Manoever verpufft dann wirkungslos. Die Spruenge
     -- innerhalb von bamboozle und stairJuke sind davon unberuehrt, weil
@@ -3741,9 +3894,28 @@ local function jukeStep(pos, facing, toThreat, threatD, level)
     local humJ = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
     if not humJ or humJ.FloorMaterial == Enum.Material.Air then return nil end
 
+    -- ZEIT BIS ZUM KONTAKT statt blosser Entfernung. Ein Verfolger 25 Studs
+    -- hinter einem, der keinen Meter gutmacht, ist keine Lage fuer eine
+    -- Finte — sie kostet dann nur Strecke. Einer, der mit sechs Studs pro
+    -- Sekunde aufholt, ist in vier Sekunden da. Gefintet wird, wenn er
+    -- wirklich naeher kommt oder schon dicht dran ist.
+    local closing = 0
+    if JUKE.lastD and JUKE.lastDt and now - JUKE.lastDt > 0.08 then
+        closing = (JUKE.lastD - threatD) / (now - JUKE.lastDt)
+    end
+    if not JUKE.lastDt or now - JUKE.lastDt > 0.08 then
+        JUKE.lastD, JUKE.lastDt = threatD, now
+    end
+    -- Unter 18 Studs wird immer gefintet, darueber nur gegen jemanden, der
+    -- wirklich aufholt. 14 war zu streng: ein Verfolger, der das Tempo nur
+    -- haelt, ist trotzdem eine Bedrohung, sobald man an ein Hindernis kommt.
+    local ttc = (closing > 0.5) and (threatD / closing) or math.huge
+    if ttc > 4.5 and threatD > 18 then return nil end
+
     local pool = {}
     for _, def in ipairs(JUKE_MOVES) do
         if level >= def.minLevel and threatD <= def.maxD
+           and threatD >= (def.minD or 0)
            and now - (JUKE.cd[def.name] or -99) >= def.cd
            and ((not def.ready) or def.ready(ctx)) then
             pool[#pool + 1] = def
@@ -3751,42 +3923,110 @@ local function jukeStep(pos, facing, toThreat, threatD, level)
     end
     if #pool == 0 then return nil end
 
-    -- Gewichtete Auswahl statt reinem Zufall. Die mapbezogenen Manoever
-    -- brauchen eine passende Stelle, und die ist selten: gemessen lag
-    -- eine Kante voraus in 1.2 % der Frames, eine enge Luecke in 0.9 %.
-    -- Bei Gleichverteilung faellt so eine Gelegenheit fast immer durch,
-    -- also bekommen sie deutlich mehr Gewicht, wenn sie ueberhaupt
-    -- moeglich sind.
+    -- Gewichtete Auswahl statt reinem Zufall, aus drei Teilen:
+    --  1. Gelegenheit: die mapbezogenen Manoever brauchen eine passende
+    --     Stelle, und die ist selten (gemessen: Kante voraus in 1.2 % der
+    --     Frames). Bei Gleichverteilung faellt so eine Gelegenheit fast
+    --     immer durch, also zaehlen sie mehr, wenn sie moeglich sind.
+    --  2. Lage: steht der Verfolger direkt im Ruecken, wirken Kehren; kommt
+    --     er von der Seite, wirkt der Bogen, weil er aussen vorbeilaeuft.
+    --  3. Erfahrung: was in dieser Runde Abstand gebracht hat, wird
+    --     haeufiger genommen — was Abstand gekostet hat, seltener. Ein
+    --     Mindestgewicht bleibt immer, sonst probiert er nie wieder etwas.
+    local behind = 0        -- 1 = genau im Ruecken, 0 = quer daneben
+    if toThreat and facing then
+        behind = math.clamp(-toThreat:Dot(facing), 0, 1)
+    end
     local total = 0
     for _, def in ipairs(pool) do
-        def.__w = def.mapMove and 6 or 1
+        local w = def.mapMove and 3 or 1
+        if def.turnBack then
+            -- Kehre: gut gegen jemanden im Ruecken, schlecht gegen jemanden,
+            -- der seitlich schneidet — dem laeuft man direkt in die Arme.
+            w = w * (0.45 + 1.1 * behind)
+        elseif def.arc then
+            -- Bogen: genau andersherum
+            w = w * (0.6 + 0.9 * (1 - behind))
+        end
+        local s = JUKE.stat[def.name]
+        if s and s.n >= 1 then
+            -- Schrumpfung: ein einzelnes Ergebnis zaehlt nur zu einem
+            -- Drittel, erst mit mehreren Messungen zaehlt der volle Wert.
+            -- Sonst wirft ein Zufallstreffer das ganze Repertoire um.
+            local avg = (s.sum / s.n) * (s.n / (s.n + 2))
+            w = w * math.clamp(1 + avg / 6, 0.25, 2.2)
+        end
+        def.__w = math.max(w, 0.12)
         total = total + def.__w
     end
-    local roll, def = math.random() * total, pool[#pool]
-    for _, d in ipairs(pool) do
-        roll = roll - d.__w
-        if roll <= 0 then def = d break end
+    -- Startrichtung pruefen — und bei einer Wand NICHT gleich aufgeben.
+    -- Fast jedes Manoever hat eine zufaellige Seite; ist die eine zu, ist die
+    -- andere meist frei. Erst wenn beide Seiten scheitern, wird das naechste
+    -- Manoever aus dem Topf probiert. Gemessen war das der groesste Verlust
+    -- im ganzen Repertoire.
+    local function startDir(def, m)
+        -- Beim Kreis zaehlt die Richtung, in der er ENDET, nicht die, mit
+        -- der er beginnt
+        local first = def.run(ctx, m, 0)
+        if def.skipWall and m.total and m.s then
+            first = turn(ctx.facing, m.s * m.total)
+        end
+        return first
     end
-    local m = { def = def, t0 = now }
-    if def.init then def.init(ctx, m) end
-    -- Startrichtung vorab pruefen, damit das Manoever gar nicht erst in
-    -- eine Wand beginnt
-    -- Beim Kreis zaehlt die Richtung, in der er ENDET, nicht die, mit der
-    -- er beginnt
-    local first = def.run(ctx, m, 0)
-    if def.skipWall and m.total and m.s then
-        first = turn(ctx.facing, m.s * m.total)
+    local function usable(def, first)
+        if not first then return true end
+        if rayClear(pos, first, 2.4, 9) < 0.7 then return false, "wallAborts" end
+        -- nicht ueber eine Kante starten: ohne Boden endet die Finte im
+        -- Sturz. Die mapbezogenen Manoever sind ausgenommen, die SUCHEN Kanten.
+        if not def.mapMove then
+            local ahead = pos + first * 10
+            if not workspace:Raycast(ahead + Vector3.new(0, 2, 0),
+                                     Vector3.new(0, -14, 0), AP.rp) then
+                return false, "edgeAborts"
+            end
+        end
+        return true
     end
-    if first and rayClear(pos, first, 2.4, 9) < 0.7 then
-        JUKE.cd[def.name] = now
-        JUKE.wallAborts = (JUKE.wallAborts or 0) + 1
-        return nil
+
+    local skip = {}
+    for attempt = 1, 3 do
+        local avail = 0
+        for _, d in ipairs(pool) do if not skip[d] then avail = avail + d.__w end end
+        if avail <= 0 then break end
+        local roll, def = math.random() * avail, nil
+        for _, d in ipairs(pool) do
+            if not skip[d] then
+                roll = roll - d.__w
+                if roll <= 0 then def = d break end
+            end
+        end
+        if not def then break end
+
+        local m = { def = def, t0 = now, d0 = threatD }
+        if def.init then def.init(ctx, m) end
+        local first = startDir(def, m)
+        local ok, why = usable(def, first)
+        if not ok and m.s and not def.noMirror then
+            -- andere Seite versuchen, bevor das Manoever verworfen wird.
+            -- Nicht bei cornerLoop: dessen Seite ist die FREIE Seite der
+            -- gefundenen Ecke, gespiegelt zeigt sie ins Hindernis.
+            m.s = -m.s
+            first = startDir(def, m)
+            ok, why = usable(def, first)
+        end
+        if ok then
+            JUKE.active = m
+            JUKE.count = JUKE.count + 1
+            JUKE.log[def.name] = (JUKE.log[def.name] or 0) + 1
+            AP.jukeName = def.name
+            return first or facing
+        end
+        skip[def] = true
+        JUKE[why] = (JUKE[why] or 0) + 1
+        -- kurze Sperre, nicht der volle Cooldown: gelaufen ist es ja nicht
+        JUKE.cd[def.name] = now - math.max((def.cd or 5) - 1.5, 0)
     end
-    JUKE.active = m
-    JUKE.count = JUKE.count + 1
-    JUKE.log[def.name] = (JUKE.log[def.name] or 0) + 1
-    AP.jukeName = def.name
-    return def.run(ctx, m, 0) or facing
+    return nil
 end
 local function autopilotStep(threat, threatD, prey, preyD)
     refreshRaycastFilter()      -- Filter aktuell halten, bevor irgendwer strahlt
@@ -5314,7 +5554,12 @@ local function assistStep(dt)
     -- normalen nicht ueberschreibt und mit dem Manoever endet.
     if S.boosts then
         if AP.jukeName then
-            S.boosts.__utgjuke = { Speed = 1.18, Accel = 1.5, Jump = 1 }
+            -- Waehrend eines Manoevers einen Tick mehr Tempo (1.18 -> 1.25,
+            -- Nutzer-Vorgabe): der Bogen kostet Strecke, und genau in diesen
+            -- knapp zwei Sekunden entscheidet sich, ob der Verfolger
+            -- aufschliesst. Mehr Beschleunigung dazu, damit die neue Richtung
+            -- schnell anliegt.
+            S.boosts.__utgjuke = { Speed = 1.25, Accel = 1.6, Jump = 1 }
         else
             S.boosts.__utgjuke = nil
         end
