@@ -3408,11 +3408,14 @@ local JUKE_MOVES = {
             -- Sehr knapp halten: 0.26 s waren bei 32 Studs/s noch acht Studs
             -- abseits. Jetzt reicht es gerade fuer die Koerpertaeuschung,
             -- ohne nennenswert Strecke zu verlieren.
-            if t < 0.17 then
-                local p = t / 0.17
+            -- Noch einen Tick knapper (0.17/0.44 -> 0.14/0.36): das Ausholen
+            -- kostet bei vollem Tempo 4.5 statt 5.4 Studs, und der ganze
+            -- Haken ist nach gut einer Drittelsekunde durch.
+            if t < 0.14 then
+                local p = t / 0.14
                 return turn(ctx.facing, m.s * (75 + 95 * p))
             end
-            if t < 0.44 then return m.back end
+            if t < 0.36 then return m.back end
             return nil
         end },
 
