@@ -2416,7 +2416,12 @@ local function followPath(pos, mode)
     -- fehlender Fortschritt zum Wegpunkt ist dann kein Haenger.
     if AP.jukeName or tick() < (AP.manualUntil or 0) then pr.at = now end
     local stuckFor = now - pr.at
-    AP.pathLoose = (stuckFor > 0.9)
+    -- BEIM WEGLAUFEN GRUNDSAETZLICH WEICH. Der Weg liefert dort nur die
+    -- Himmelsrichtung; gefahren wird sie von derselben Nahbereichssteuerung
+    -- wie ohne Weg (offenste Richtung, Wandgleiten, Verfolger als Term).
+    -- Stur abgefahrene Wegpunkte kosten auf der Flucht mehr als sie bringen
+    -- — gemessen 34 Fehler mit Route gegen 29 ohne.
+    AP.pathLoose = flee or (stuckFor > 0.9)
     if stuckFor > 2.2 then
         -- Ueberspringen ist nur bei einem NAHEN Wegpunkt sinnvoll: den trifft
         -- er dann eben nicht genau, der Weg dahinter stimmt aber noch. Ist er
@@ -2452,7 +2457,7 @@ local function followPath(pos, mode)
     -- den Zielknoten oben zuzulaufen reicht nicht, seitlich daneben klettert
     -- er nie. Gesprungen wird dabei nicht: ein Sprung an der Leiter heisst
     -- loslassen (das faengt tryJump bereits ab).
-    if wp.kind == "climb" then
+    if wp.kind == "climb" and tick() >= (AP.noClimbUntil or 0) then
         local best, bd
         for _, l in ipairs(ladders()) do
             if l.Parent then
@@ -2636,7 +2641,7 @@ local function followPath(pos, mode)
     end
     -- Der Weg darf jetzt ueber Leitern fuehren. Ein Wegpunkt deutlich ueber uns
     -- in Leiternaehe heisst: dranhalten und klettern, nicht danebenlaufen.
-    if wp.Position.Y - pos.Y > 3 then
+    if wp.Position.Y - pos.Y > 3 and tick() >= (AP.noClimbUntil or 0) then
         for _, l in ipairs(ladders()) do
             if l.Parent and (l.Position - wp.Position).Magnitude < 8 then
                 AP.ladder = l
@@ -3697,7 +3702,19 @@ local function autopilotStep(threat, threatD, prey, preyD)
     local roleName = tostring(state.role or "")
     local roleFrozen = roleName:find("Frozen") ~= nil or roleName:find("Caged") ~= nil
     local nowI = tick()
-    if AP.vec and AP.vec.Magnitude > 0.1 then
+    -- Diese Messung hat frueher nie angeschlagen (sie las ein "pos", das an
+    -- der Stelle noch gar nicht existierte). Seit das behoben ist, muss sie
+    -- eng gefasst werden, sonst gilt jedes normale Haengenbleiben als
+    -- Bewegungsunfaehigkeit und der Autopilot pausiert sich selbst aus einer
+    -- Lage heraus, aus der er sich gerade befreien sollte.
+    -- Ein echter Freeze/Kaefig verankert den Charakter: die Geschwindigkeit
+    -- ist praktisch null. Wer an einer Wand haengt oder an einer Leiter
+    -- klettert, hat dagegen Restbewegung — und Klettern ist ohnehin langsam.
+    local humI = char:FindFirstChildOfClass("Humanoid")
+    local hrpI = char:FindFirstChild("HumanoidRootPart")
+    local velI = hrpI and hrpI.AssemblyLinearVelocity.Magnitude or 99
+    local climbingI = humI and humI:GetState() == Enum.HumanoidStateType.Climbing
+    if AP.vec and AP.vec.Magnitude > 0.1 and not climbingI and velI < 1.0 then
         local moved = AP.immPos and (pos - AP.immPos).Magnitude or 99
         if not AP.immAt or nowI - AP.immAt > 0.5 then
             AP.immStuck = (moved < 1.5) and ((AP.immStuck or 0) + 1) or 0
@@ -3720,6 +3737,24 @@ local function autopilotStep(threat, threatD, prey, preyD)
     end
     AP.frozenLogged = false
     AP.immobile = false
+
+    -- FESTHAENGEN AN DER LEITER. Klettern ohne Hoehengewinn heisst, dass der
+    -- Charakter am Truss klebt, ohne hochzukommen (beobachtet: Zustand
+    -- Climbing, Position minutenlang unveraendert). Ein Sprung ist an der
+    -- Leiter das Loslassen — danach kurz keine Leiter mehr ansteuern, sonst
+    -- greift er im naechsten Frame wieder zu.
+    if humI and humI:GetState() == Enum.HumanoidStateType.Climbing then
+        if not AP.climbY or math.abs(pos.Y - AP.climbY) > 1.0 then
+            AP.climbY, AP.climbYAt = pos.Y, nowI
+        elseif nowI - (AP.climbYAt or nowI) > 1.5 then
+            AP.climbY, AP.climbYAt = pos.Y, nowI
+            tryJump(true)
+            AP.noClimbUntil = nowI + 1.5
+            failNote("leiter_haengt", "1.5 s an der Leiter ohne Hoehengewinn — losgelassen")
+        end
+    else
+        AP.climbY, AP.climbYAt = nil, nil
+    end
 
     local goal, mode
 
@@ -4996,7 +5031,11 @@ local function autopilotStep(threat, threatD, prey, preyD)
             -- Wegpunkte im Rasterabstand von 4 bis 6 stehen. Der Bot konnte
             -- die Kurven schlicht nicht fahren, schnitt sie ab und driftete
             -- gemessen 4 bis 8 Studs neben den Weg — bei hohem Tempo mehr.
-            if AP.usingPath and not juking3 then
+            -- Die Aufhebung gilt nur beim harten Abfahren eines Weges (Jagd).
+            -- Ist der Weg nur ein Vorschlag (Weglaufen), bleibt die normale,
+            -- menschlich aussehende Drehrate — es gibt dort keine engen
+            -- Wegpunkte, die eine Sofortdrehung noetig machen.
+            if AP.usingPath and not AP.pathLoose and not juking3 then
                 degPerSec = 100000
             end
             local maxRad = math.rad(degPerSec) * dtT
@@ -5124,7 +5163,10 @@ local function assistStep(dt)
         -- heisst das: der Autopilot bewegt den Charakter gar nicht mehr.
         local hrpS = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
         local posS = hrpS and hrpS.Position
-        local pw = PATH.wps and PATH.wps[PATH.idx]
+        -- Nicht bremsen, solange der Weg nur ein Vorschlag ist (Weglaufen,
+        -- oder Folger haengt): dort wird kein Punkt genau getroffen, das
+        -- Abbremsen waere reiner Tempoverlust vor dem Verfolger.
+        local pw = (not AP.pathLoose) and PATH.wps and PATH.wps[PATH.idx] or nil
         if pw and posS then
             local k = pw.kind
             -- "jump" ist hier bewusst NICHT mehr dabei. Die Sprungkante
