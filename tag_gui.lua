@@ -2194,7 +2194,7 @@ local function requestPath(fromPos, candidates)
             -- weit aussehen und trotzdem der schnellste sein — genau solche
             -- Wege hat die alte Regel zuverlaessig weggeworfen.
             PATH.jumped, PATH.idxAt, PATH.from = {}, tick(), fromPos
-            PATH.air, PATH.prog = nil, nil
+            PATH.air, PATH.prog, PATH.syncAt = nil, nil, nil
             AP.pathLoose = false
             visPath(wps)
             -- Normalerweise ist der erste Wegpunkt der eigene Standort und
@@ -2458,15 +2458,30 @@ local function followPath(pos, mode)
     -- Kreise, bis sich das Ziel aendert (beobachtet). Ein Wegpunkt, den er bei
     -- 32 Studs/s nicht genau trifft, wird umkreist statt erreicht.
     -- Deshalb wird der Fortschritt zum aktuellen Wegpunkt gemessen:
-    --   Stufe 1 (ab 0.9 s ohne Annaeherung): die freie Nahbereichssteuerung
-    --     wird zugeschaltet — dieselbe, die beim Weglaufen laeuft (Wandgleiten
-    --     und Wahl der offensten Richtung), mit der Wegrichtung als Ziel.
-    --   Stufe 2 (ab 2.2 s): Wegpunkt ueberspringen, wenn der naechste frei
-    --     erreichbar ist, sonst den Weg verwerfen und neu planen.
+    --   Stufe 1: sobald ein Wegpunkt NICHT in der erwarteten Zeit erreicht
+    --     ist, wird die freie Nahbereichssteuerung zugeschaltet — dieselbe,
+    --     die beim Weglaufen laeuft (Wandgleiten, Wahl der offensten
+    --     Richtung), mit der Wegrichtung als Ziel.
+    --   Stufe 2: deutlich ueber der Zeit und ohne Annaeherung — Wegpunkt
+    --     ueberspringen, wenn der naechste frei erreichbar ist, sonst den Weg
+    --     verwerfen und neu planen.
+    --
+    -- DIE ERWARTETE ZEIT statt einer festen Frist. Wegpunkte liegen 4 bis 9
+    -- Studs auseinander, bei 32 Studs/s werden also drei bis acht pro Sekunde
+    -- abgehakt. Eine feste Frist von 0.9 s ist in diesem Takt eine halbe
+    -- Ewigkeit — bis sie ablief, stand der Bot laengst vor seinem Hindernis.
+    -- Gerechnet wird darum mit Strecke durch Tempo: braucht er laenger als das
+    -- knapp Doppelte davon, stimmt etwas nicht, und zwar SOFORT.
     local flatNow = ((wp.Position - pos) * Vector3.new(1, 0, 1)).Magnitude
+    local hrpP = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+    local spdP = hrpP and (hrpP.AssemblyLinearVelocity * Vector3.new(1, 0, 1)).Magnitude or 0
     local pr = PATH.prog
     if not pr or pr.idx ~= PATH.idx then
-        pr = { idx = PATH.idx, best = flatNow, at = now }
+        -- Budget beim Eintritt in den Wegpunkt festlegen, nicht laufend neu:
+        -- sonst waechst es mit, waehrend er langsamer wird, und laeuft nie ab.
+        local ref = math.max(spdP, 12)
+        pr = { idx = PATH.idx, best = flatNow, at = now, t0 = now,
+               budget = flatNow / ref * 1.9 + 0.25 }
         PATH.prog = pr
     elseif flatNow < pr.best - 0.4 then
         pr.best, pr.at = flatNow, now
@@ -2474,15 +2489,53 @@ local function followPath(pos, mode)
     -- Die Uhr laeuft nur, wenn der Folger auch wirklich steuert. Waehrend
     -- einer Finte und bei eigenem Tasteneingriff fuehrt jemand anders, und
     -- fehlender Fortschritt zum Wegpunkt ist dann kein Haenger.
-    if AP.jukeName or tick() < (AP.manualUntil or 0) then pr.at = now end
+    if AP.jukeName or tick() < (AP.manualUntil or 0) then
+        pr.at, pr.t0 = now, now
+    end
     local stuckFor = now - pr.at
+    local overdue = now - pr.t0 - pr.budget       -- wie lange ueberfaellig
     -- BEIM WEGLAUFEN GRUNDSAETZLICH WEICH. Der Weg liefert dort nur die
     -- Himmelsrichtung; gefahren wird sie von derselben Nahbereichssteuerung
     -- wie ohne Weg (offenste Richtung, Wandgleiten, Verfolger als Term).
     -- Stur abgefahrene Wegpunkte kosten auf der Flucht mehr als sie bringen
     -- — gemessen 34 Fehler mit Route gegen 29 ohne.
-    AP.pathLoose = flee or (stuckFor > 0.9)
-    if stuckFor > 2.2 then
+    -- Sonst: ueberfaellig ODER ohne Annaeherung. Zurueck auf hart geht es von
+    -- selbst, sobald wieder ein Wegpunkt abgehakt ist — dann ist pr neu.
+    AP.pathLoose = flee or (overdue > 0) or (stuckFor > 0.9)
+
+    -- WIEDER IN DEN WEG EINSTEIGEN. Faehrt die Nahbereichssteuerung, landet
+    -- der Bot oft neben dem verpassten Punkt, aber laengst auf Hoehe eines
+    -- spaeteren. Dann dort einsteigen statt zurueckzulaufen. Alle 0.25 s, weil
+    -- jede Pruefung Strahlen kostet.
+    if AP.pathLoose and not wp.takeoff and now - (PATH.syncAt or 0) > 0.25 then
+        PATH.syncAt = now
+        local jumpTo
+        for k = PATH.idx + 1, math.min(PATH.idx + 6, #wps) do
+            local w2 = wps[k]
+            local d2 = ((w2.Position - pos) * Vector3.new(1, 0, 1)).Magnitude
+            if d2 < flatNow - 1 and d2 < 14
+               and math.abs(w2.Position.Y - pos.Y) < 8
+               and lineFree(pos, w2.Position) then
+                jumpTo = k                 -- den weitesten passenden nehmen
+            end
+            -- Nicht ueber einen Absprung hinweg einsteigen: dahinter liegt
+            -- eine Luecke, und der Landepunkt allein ist kein Weg.
+            if w2.takeoff then break end
+        end
+        if jumpTo then
+            PATH.idx, PATH.idxAt, PATH.prog = jumpTo, now, nil
+            wp = wps[jumpTo]
+            flatNow = ((wp.Position - pos) * Vector3.new(1, 0, 1)).Magnitude
+            AP.pathLoose = flee
+            stuckFor, overdue = 0, -1
+        end
+    end
+
+    -- Aufgeben, wenn er es sichtbar nicht schafft: weit ueber der Zeit UND
+    -- ohne Annaeherung. Bei kurzen Abschnitten greift das nach gut einer
+    -- Sekunde, bei langen entsprechend spaeter.
+    if (overdue > math.max(pr.budget * 2, 0.8) and stuckFor > 0.6)
+       or stuckFor > 2.2 then
         -- Ueberspringen ist nur bei einem NAHEN Wegpunkt sinnvoll: den trifft
         -- er dann eben nicht genau, der Weg dahinter stimmt aber noch. Ist er
         -- weit weg, laeuft er in Wahrheit ganz woanders — dann taugt der
@@ -2495,15 +2548,15 @@ local function followPath(pos, mode)
                           and lineFree(pos, nxtW.Position)
         if skippable then
             failNote("wegpunkt_uebersprungen",
-                ("Art %s, %.1f s ohne Annaeherung (%.0f Studs)")
-                    :format(tostring(wp.kind), stuckFor, flatNow))
+                ("Art %s, %.1f s ueberfaellig, %.1f s ohne Annaeherung (%.0f Studs)")
+                    :format(tostring(wp.kind), math.max(overdue, 0), stuckFor, flatNow))
             PATH.idx = PATH.idx + 1
             PATH.idxAt, PATH.prog = now, nil
             wp = wps[PATH.idx]
         else
             failNote("weg_haengt",
-                ("Art %s, %.1f s ohne Annaeherung (%.0f Studs) — neu geplant")
-                    :format(tostring(wp.kind), stuckFor, flatNow))
+                ("Art %s, %.1f s ueberfaellig, %.1f s ohne Annaeherung (%.0f Studs) — neu geplant")
+                    :format(tostring(wp.kind), math.max(overdue, 0), stuckFor, flatNow))
             PATH.wps, PATH.at, PATH.lastCalc, PATH.prog = nil, 0, nil, nil
             AP.pathLoose = false
             return nil
