@@ -2172,8 +2172,10 @@ local function jumpProfile()
     return g, vy
 end
 
--- liefert die Richtung zum naechsten Wegpunkt (oder nil, wenn kein Pfad taugt)
-local function followPath(pos)
+-- liefert die Richtung zum naechsten Wegpunkt (oder nil, wenn kein Pfad taugt).
+-- "mode" entscheidet ueber die Strenge: beim Weglaufen ist der Weg nur eine
+-- Richtung, beim Jagen ein Ziel.
+local function followPath(pos, mode)
     local wps = PATH.wps
     if not wps then
         -- kein Weg mehr, also auch kein laufender Sprung: der Flugzustand
@@ -2244,8 +2246,20 @@ local function followPath(pos)
     -- ausloesen — er erreicht den hoeher liegenden Punkt nicht und spamt.
     -- 12 ist ueber alle Steigraten stabil.
     local now = tick()
+    -- BEIM WEGLAUFEN IST DER WEG NUR EINE RICHTUNG, KEINE SCHIENE.
+    -- Das Ziel ist dort eine grobe Himmelsrichtung weg vom Faenger, kein
+    -- bestimmter Punkt — ein um zwei Studs verfehlter Wegpunkt ist also
+    -- voellig egal. Mit den strengen Toleranzen hat der Bot dafuer aber
+    -- kehrtgemacht und ihn nachgeholt, und ein Umdrehen vor dem Verfolger
+    -- kostet genau das, was die Flucht gewinnen soll. Beim Jagen zaehlt
+    -- dagegen der genaue Punkt, dort bleibt alles wie es war.
+    local flee = (mode == "FLUCHT")
+    local tightR   = flee and 6.0 or 3.0    -- Annahmeradius
+    local passR    = flee and 14 or 7.2     -- "schon vorbei" gilt bis hierhin
+    local upTol    = flee and 4.0 or 2.5    -- wie hoch der Punkt liegen darf
+    local advMax   = flee and 4 or 2        -- Wegpunkte pro Frame
     local advanced = 0
-    while PATH.idx <= #wps and advanced < 2 do
+    while PATH.idx <= #wps and advanced < advMax do
         local wp = wps[PATH.idx]
         local flat = (wp.Position - pos) * Vector3.new(1, 0, 1)
         local dy = math.abs(wp.Position.Y - pos.Y)
@@ -2256,7 +2270,15 @@ local function followPath(pos)
             -- den Ausloeseabstand (rund 3.1 Studs bei vollem Tempo): der
             -- Absprung waere abgehakt, bevor gesprungen wurde, und es bliebe
             -- der Landepunkt jenseits der Luecke uebrig.
-            if now - (PATH.idxAt or now) > 2 then
+            -- Beim Weglaufen wird ein verpasster Absprung nicht nachgeholt:
+            -- liegt er hinter dem Bot, waere das eine Kehrtwende vor dem
+            -- Verfolger. Dann lieber sofort einen neuen Weg.
+            local behind = false
+            if flee and PATH.idx > 1 then
+                local segT = (wp.Position - wps[PATH.idx - 1].Position) * Vector3.new(1, 0, 1)
+                behind = segT.Magnitude > 0.1 and segT.Unit:Dot(-flat) > 0
+            end
+            if behind or now - (PATH.idxAt or now) > 2 then
                 failNote("absprung_verpasst",
                     ("%.0f Studs vom Absprung, kein Sprung ausgeloest")
                         :format(flat.Magnitude))
@@ -2290,7 +2312,7 @@ local function followPath(pos)
             -- ins Leere. Nach UNTEN bleibt es grosszuegig, weil Fallen
             -- erlaubt ist und er sonst beim Absteigen klebt.
             local up = wp.Position.Y - pos.Y
-            local heightOk = up < 2.5 and up > -12
+            local heightOk = up < upTol and up > -12
             -- Tuerdurchgaenge brauchen Genauigkeit, aber 1.6 Studs waren zu
             -- streng: gemessen entfielen darauf 56 % der gesamten
             -- Haengerzeit (im Schnitt 2.45 s je Fall, Zustand "Running")
@@ -2299,7 +2321,7 @@ local function followPath(pos)
             -- wirklich HINDURCH ist. Beim reinen Naeherungsradius schwenkte
             -- er schon zum naechsten Wegpunkt, waehrend er noch davorstand,
             -- und sprang links oder rechts am Rahmen vorbei.
-            if wp.kind == "via" then
+            if wp.kind == "via" and not flee then
                 reached = false
                 if PATH.idx > 1 then
                     local seg = (wp.Position - wps[PATH.idx - 1].Position) * Vector3.new(1, 0, 1)
@@ -2321,13 +2343,20 @@ local function followPath(pos)
                     reached = true
                 end
             else
-                local tight = 3.0
-                reached = flat.Magnitude < tight and heightOk
+                reached = flat.Magnitude < tightR and heightOk
             -- (Ein eigenes Ventil fuer Durchgaenge stand hier mit 0.6 s und
             --  war toter Code: der allgemeine Notausgang unten greift schon
             --  bei 0.5 s und deckt denselben Fall ab.)
             -- oder schon daran vorbei: hinter der Ebene senkrecht zum Wegstueck
-            if not reached and PATH.idx > 1 and flat.Magnitude < 7.2 and heightOk then
+            if not reached and PATH.idx > 1 and flat.Magnitude < passR and heightOk then
+                local seg = (wp.Position - wps[PATH.idx - 1].Position) * Vector3.new(1, 0, 1)
+                if seg.Magnitude > 0.1 and seg.Unit:Dot(-flat) > 0 then reached = true end
+            end
+            -- NIE UMDREHEN, UM EINEN PUNKT NACHZUHOLEN. Beim Weglaufen gilt
+            -- ein Wegpunkt, der hinter dem Bot liegt, ohne Abstandsgrenze als
+            -- erledigt — auch wenn er ihn um zehn Studs verfehlt hat. Kehrt
+            -- machen heisst dem Verfolger entgegenlaufen.
+            if not reached and flee and PATH.idx > 1 then
                 local seg = (wp.Position - wps[PATH.idx - 1].Position) * Vector3.new(1, 0, 1)
                 if seg.Magnitude > 0.1 and seg.Unit:Dot(-flat) > 0 then reached = true end
             end
@@ -4806,7 +4835,7 @@ local function autopilotStep(threat, threatD, prey, preyD)
             cands[#cands + 1] = pos + v * 0.4      -- ... notfalls noch kuerzer
             requestPath(pos, cands)
         end
-        local pdir = followPath(pos)
+        local pdir = followPath(pos, mode)
         if pdir then
             goal = pdir
             AP.pdirDbg = pdir          -- Diagnose: was der Folger wollte
