@@ -1996,14 +1996,34 @@ local function computeGraph(fromPos, toPos)
 
     local raw = {}
     for i, step in ipairs(path) do
-        local kind = step.kind
         raw[i] = {
             Position = step.node.p,
-            Action = (kind == "jump" or kind == "pad" or kind == "hop")
-                     and Enum.PathWaypointAction.Jump
-                     or Enum.PathWaypointAction.Walk,
-            kind = kind,
+            Action = Enum.PathWaypointAction.Walk,
+            kind = step.kind,
         }
+    end
+
+    -- DIE SPRUNGMARKE GEHOERT AN DEN ABSPRUNG, NICHT AN DIE LANDUNG.
+    -- A* traegt in jeden Knoten die Art der Kante ein, die ZU IHM fuehrt
+    -- (NAV.findPath, came[at].k). Ein Wegpunkt der Art "jump" ist also der
+    -- LANDEpunkt. Ausgeloest wurde der Sprung aber wenige Studs vor genau
+    -- diesem Wegpunkt — bei einer Sprungweite von bis zu 22 Studs also
+    -- ungefaehr eine halbe Sekunde nachdem der Bot bereits ueber die Kante
+    -- gelaufen und gefallen war. Dass Treppen trotzdem funktionierten, lag
+    -- allein daran, dass "hop"-Kanten nur zwischen Nachbarzellen entstehen
+    -- (4 bis 5.6 Studs) und der Ausloeseradius dort zufaellig passte.
+    -- Der Absprung bekommt jetzt die Marke und das Sprungziel dazu; die
+    -- Kantenart bleibt am Landepunkt stehen, weil Fehlersuche und Anzeige
+    -- sie dort erwarten.
+    for i = 2, #raw do
+        local k = raw[i].kind
+        if k == "jump" or k == "hop" then
+            local t = raw[i - 1]
+            t.Action = Enum.PathWaypointAction.Jump
+            t.takeoff = true
+            t.jumpTo = raw[i].Position
+            t.jumpKind = k
+        end
     end
 
     -- Ein Glaettungsversuch (aufeinanderfolgende Gehpunkte bei freier Sicht
@@ -2053,7 +2073,31 @@ computeEngine = function(fromPos, toPos, radius)
         end
         return nil
     end)
-    if ok and res and #res > 1 then return res end
+    if ok and res and #res > 1 then
+        -- PathWaypoint ist ein Datentyp der Engine, kein Tabelle. Der
+        -- Wegpunkt-Folger fragt aber ueberall nach wp.kind — und ein
+        -- unbekanntes Feld an einem Engine-Datentyp ist kein nil, sondern
+        -- ein Fehler. Jede ueber die Engine gefundene Route hat den
+        -- Autopilotschritt deshalb sofort abgebrochen. Also hier in
+        -- einfache Tabellen umschreiben, in demselben Format wie der Graph.
+        local out = {}
+        for i, w in ipairs(res) do
+            out[i] = { Position = w.Position, Action = w.Action, kind = "walk" }
+        end
+        -- Bei der Engine sitzt die Sprungmarke bereits am richtigen Ende
+        -- (dort, wo gesprungen werden soll). Sie bekommt hier nur noch das
+        -- Sprungziel dazu, damit der Absprung dieselbe Behandlung erfaehrt
+        -- wie beim Graphen.
+        for i = 1, #out do
+            if out[i].Action == Enum.PathWaypointAction.Jump and out[i + 1] then
+                out[i].takeoff = true
+                out[i].jumpTo = out[i + 1].Position
+                out[i].jumpKind = "jump"
+                out[i + 1].kind = "jump"
+            end
+        end
+        return out
+    end
     return nil
 end
 
@@ -2090,8 +2134,16 @@ local function requestPath(fromPos, candidates)
             -- weit aussehen und trotzdem der schnellste sein — genau solche
             -- Wege hat die alte Regel zuverlaessig weggeworfen.
             PATH.jumped, PATH.idxAt, PATH.from = {}, tick(), fromPos
+            PATH.air, PATH.prog = nil, nil
+            AP.pathLoose = false
             visPath(wps)
-            PATH.wps, PATH.idx, PATH.at, PATH.target, PATH.fails = wps, 2, tick(), used, 0
+            -- Normalerweise ist der erste Wegpunkt der eigene Standort und
+            -- wird uebersprungen. Traegt er aber schon die Sprungmarke
+            -- (erste Kante des Weges ist ein Sprung), darf er nicht
+            -- entfallen, sonst faellt genau dieser Absprung aus.
+            local startIdx = (wps[1] and wps[1].takeoff) and 1 or 2
+            PATH.wps, PATH.idx, PATH.at, PATH.target, PATH.fails =
+                wps, startIdx, tick(), used, 0
             PATH.nextAllowed = nil
         else
             PATH.wps, PATH.fails = nil, PATH.fails + 1
@@ -2106,10 +2158,79 @@ local function requestPath(fromPos, candidates)
     end)
 end
 
+-- Sprungwerte des Charakters, jedes Mal frisch gelesen: die Gravitation
+-- unterscheidet sich je Map deutlich (auf FactionAction 71.25 statt 196),
+-- und JumpPower aendert sich mit Boosts.
+local function jumpProfile()
+    local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+    local g = math.max(workspace.Gravity, 1)
+    local vy = 28
+    if hum then
+        vy = hum.UseJumpPower and hum.JumpPower
+             or math.sqrt(2 * g * math.max(hum.JumpHeight, 1))
+    end
+    return g, vy
+end
+
 -- liefert die Richtung zum naechsten Wegpunkt (oder nil, wenn kein Pfad taugt)
 local function followPath(pos)
     local wps = PATH.wps
-    if not wps then return nil end
+    if not wps then
+        -- kein Weg mehr, also auch kein laufender Sprung: der Flugzustand
+        -- sperrt sonst dauerhaft Ausweichen und Finten
+        PATH.air, AP.inAir, AP.pathLoose, PATH.prog = nil, false, false, nil
+        return nil
+    end
+
+    -- WAEHREND EINES SPRUNGS WIRD NICHT NACHGERECHNET.
+    -- In der Luft ist jede Korrektur schaedlich: die Wegpunktpruefung haekt
+    -- Punkte ab oder verwirft den Weg ("unter dem Weg"), waehrend der Bot
+    -- noch fliegt, und das Ausweichen vor Hindernissen dreht ihn kurz vor
+    -- der Landung von der Zielkante weg. Zwischen Absprung und Aufsetzen
+    -- zaehlt deshalb nur eines: die Luftsteuerung auf den Landepunkt.
+    local air = PATH.air
+    if air then
+        local humA = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+        local flying = humA and humA.FloorMaterial == Enum.Material.Air
+        local tAir = tick() - air.at
+        local toLand = (air.to - pos) * Vector3.new(1, 0, 1)
+        if flying and tAir < 3 then
+            -- im Flug niemals die freie Richtungswahl: sie bewertet Boden und
+            -- Offenheit und wuerde den Bot von seiner Zielkante wegdrehen
+            AP.inAir, AP.pathLoose = true, false
+            if toLand.Magnitude > 0.1 then return toLand.Unit end
+            return nil
+        end
+        AP.inAir = false
+        -- Nicht abgehoben? Der Tap wird verschluckt, wenn der Charakter
+        -- gerade landet, rollt oder eine Leiter streift. Zwei Mal kurz
+        -- nachfassen ist billiger als eine Neuplanung.
+        local lifted = (pos.Y - air.from.Y) > 1.2
+        if not flying and not lifted and tAir < 0.5 then
+            if tick() - (air.lastTry or 0) > 0.15 and (air.tries or 1) < 3 then
+                air.tries, air.lastTry = (air.tries or 1) + 1, tick()
+                tryJump(true)
+            end
+            if toLand.Magnitude > 0.1 then return toLand.Unit end
+            return nil
+        end
+        PATH.air, PATH.prog = nil, nil   -- Fortschrittsuhr nach der Landung neu
+        local flat = toLand.Magnitude
+        local dy = pos.Y - air.to.Y
+        LOG(("Sprung %s: %.0f Studs Luecke, Absprung %.0f Studs/s (noetig %.0f), "
+             .. "Winkel %.0f Grad -> %s (%.0f flach, %.0f hoch daneben)")
+            :format(tostring(air.kind), air.gap, air.spd, air.need, air.ang,
+                    (flat <= 7 and dy > -6) and "gelandet" or "DANEBEN", flat, dy))
+        if flat > 7 or dy < -6 then
+            failNote("sprung_daneben",
+                ("Luecke %.0f, Absprung %.0f Studs/s bei %.0f Grad, %.0f Studs daneben")
+                    :format(air.gap, air.spd, air.ang, flat))
+            -- sofort neu planen, nicht erst nach der Mindestpause: er steht
+            -- jetzt irgendwo unter der Route
+            PATH.wps, PATH.at, PATH.lastCalc = nil, 0, nil
+            return nil
+        end
+    end
     -- Wegpunkte abhaken. Die alte Regel "XZ-Abstand < 4.5" war bei
     -- WaypointSpacing 3 groesser als der Abstand zwischen zwei Wegpunkten:
     -- es lag staendig schon der uebernaechste Punkt im Streichbereich und
@@ -2129,6 +2250,25 @@ local function followPath(pos)
         local flat = (wp.Position - pos) * Vector3.new(1, 0, 1)
         local dy = math.abs(wp.Position.Y - pos.Y)
         local reached
+        if wp.takeoff then
+            -- EIN ABSPRUNGPUNKT WIRD NUR DURCH DEN SPRUNG SELBST ERLEDIGT.
+            -- Sonst gewinnt das normale Abhaken (Radius 3.0) das Rennen gegen
+            -- den Ausloeseabstand (rund 3.1 Studs bei vollem Tempo): der
+            -- Absprung waere abgehakt, bevor gesprungen wurde, und es bliebe
+            -- der Landepunkt jenseits der Luecke uebrig.
+            if now - (PATH.idxAt or now) > 2 then
+                failNote("absprung_verpasst",
+                    ("%.0f Studs vom Absprung, kein Sprung ausgeloest")
+                        :format(flat.Magnitude))
+                PATH.wps, PATH.at, PATH.prog = nil, 0, nil
+                -- kurze Sperre, sonst kommt sofort derselbe Weg mit
+                -- demselben Absprung zurueck und er huepft dort fest
+                PATH.nextAllowed = now + 1.2
+                AP.pathLoose = false
+                return nil
+            end
+            break
+        end
         if wp.kind == "climb" then
             -- Der Kopf einer Leiter liegt bis zu 45 Studs ueber dem Fuss.
             -- Hier darf der Notausgang nicht greifen, sonst gilt der Punkt
@@ -2169,6 +2309,15 @@ local function followPath(pos)
                     end
                 end
                 if not reached and flat.Magnitude < 1.4 and heightOk then
+                    reached = true
+                end
+                -- Ventil: ein Durchgang, der nach ueber einer Sekunde immer
+                -- noch nicht passiert ist, wird nicht getroffen — bei 32
+                -- Studs/s und 1.4 Studs Annahmeradius umkreist der Bot ihn
+                -- nur. Dann gilt er als erledigt; kommt er dahinter wirklich
+                -- nicht weiter, greift der Fortschrittswaechter.
+                if not reached and flat.Magnitude < 5 and heightOk
+                   and now - (PATH.idxAt or now) > 1.2 then
                     reached = true
                 end
             else
@@ -2212,6 +2361,60 @@ local function followPath(pos)
     if not PATH.idxAt then PATH.idxAt = now end
     if PATH.idx > #wps then PATH.wps = nil return nil end
     local wp = wps[PATH.idx]
+
+    -- FORTSCHRITTSWAECHTER. Bisher gab es auf einem Weg keine Rettung fuer den
+    -- Nahbereich: der Folger zeigt stur auf seinen Wegpunkt, und weil auf
+    -- Wegen weder Wandgleiten noch die Richtungswahl laufen, dreht der Bot vor
+    -- einem Durchgang, den er zu Fuss einfach durchlaufen koennte, so lange
+    -- Kreise, bis sich das Ziel aendert (beobachtet). Ein Wegpunkt, den er bei
+    -- 32 Studs/s nicht genau trifft, wird umkreist statt erreicht.
+    -- Deshalb wird der Fortschritt zum aktuellen Wegpunkt gemessen:
+    --   Stufe 1 (ab 0.9 s ohne Annaeherung): die freie Nahbereichssteuerung
+    --     wird zugeschaltet — dieselbe, die beim Weglaufen laeuft (Wandgleiten
+    --     und Wahl der offensten Richtung), mit der Wegrichtung als Ziel.
+    --   Stufe 2 (ab 2.2 s): Wegpunkt ueberspringen, wenn der naechste frei
+    --     erreichbar ist, sonst den Weg verwerfen und neu planen.
+    local flatNow = ((wp.Position - pos) * Vector3.new(1, 0, 1)).Magnitude
+    local pr = PATH.prog
+    if not pr or pr.idx ~= PATH.idx then
+        pr = { idx = PATH.idx, best = flatNow, at = now }
+        PATH.prog = pr
+    elseif flatNow < pr.best - 0.4 then
+        pr.best, pr.at = flatNow, now
+    end
+    -- Die Uhr laeuft nur, wenn der Folger auch wirklich steuert. Waehrend
+    -- einer Finte und bei eigenem Tasteneingriff fuehrt jemand anders, und
+    -- fehlender Fortschritt zum Wegpunkt ist dann kein Haenger.
+    if AP.jukeName or tick() < (AP.manualUntil or 0) then pr.at = now end
+    local stuckFor = now - pr.at
+    AP.pathLoose = (stuckFor > 0.9)
+    if stuckFor > 2.2 then
+        -- Ueberspringen ist nur bei einem NAHEN Wegpunkt sinnvoll: den trifft
+        -- er dann eben nicht genau, der Weg dahinter stimmt aber noch. Ist er
+        -- weit weg, laeuft er in Wahrheit ganz woanders — dann taugt der
+        -- ganze Weg nicht mehr und wird neu gerechnet.
+        local nxtW = (flatNow < 12) and wps[PATH.idx + 1] or nil
+        -- Absprung- und Kletterpunkte werden NICHT uebersprungen: hinter
+        -- ihnen liegt eine Luecke oder eine Leiter, der naechste Punkt ist
+        -- ohne sie gar nicht erreichbar.
+        local skippable = nxtW and not wp.takeoff and wp.kind ~= "climb"
+                          and lineFree(pos, nxtW.Position)
+        if skippable then
+            failNote("wegpunkt_uebersprungen",
+                ("Art %s, %.1f s ohne Annaeherung (%.0f Studs)")
+                    :format(tostring(wp.kind), stuckFor, flatNow))
+            PATH.idx = PATH.idx + 1
+            PATH.idxAt, PATH.prog = now, nil
+            wp = wps[PATH.idx]
+        else
+            failNote("weg_haengt",
+                ("Art %s, %.1f s ohne Annaeherung (%.0f Studs) — neu geplant")
+                    :format(tostring(wp.kind), stuckFor, flatNow))
+            PATH.wps, PATH.at, PATH.lastCalc, PATH.prog = nil, 0, nil, nil
+            AP.pathLoose = false
+            return nil
+        end
+    end
 
     -- KLETTERN. Der Spielcode (Parkour-Modul) setzt shared.touchingTruss nur,
     -- wenn ein Strahl aus der BLICKRICHTUNG des Charakters (LookVector * 4)
@@ -2301,31 +2504,105 @@ local function followPath(pos)
         end
     end
 
-    -- Sprung beim ANLAUF ausloesen statt beim Erreichen: bei ~30 Studs/s ist
-    -- der Absprungpunkt sonst schon ueberlaufen. Pro Wegpunkt genau einmal,
-    -- sonst haengt der Tap-Timer dauerhaft fest.
-    -- Die Ausloesedistanz muss mit dem Tempo mitwachsen, sonst ist sie eine
-    -- feste Strecke bei variabler Geschwindigkeit: 4.5 Studs sind bei
-    -- WalkSpeed 16 ein Vorlauf von 280 ms (er springt viel zu frueh und
-    -- landet vor der Luecke), bei 37 nur noch 120 ms (zu spaet). Konstant
-    -- gehalten wird deshalb die ZEIT bis zum Absprungpunkt.
-    -- NACHFASSEN: ein einziger Versuch je Wegpunkt reicht nicht. Klappt der
-    -- Sprung nicht (Kante gestreift, zu frueh abgesprungen), blieb der Bot
-    -- vor kniehohen Erhoehungen stehen, ueber die er locker kommt — der
-    -- Punkt galt wegen der Fusshoehen-Pruefung nie als erreicht. Darum alle
-    -- 0.45 s erneut, solange er noch davorsteht.
-    if wp.Action == Enum.PathWaypointAction.Jump then
-        local toWp = (wp.Position - pos) * Vector3.new(1, 0, 1)
-        local humNow = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
-        local spdNow = humNow and math.max(humNow.WalkSpeed, 8) or 32
-        local lastTry = PATH.jumped[PATH.idx] or 0
-        if toWp.Magnitude < math.clamp(spdNow * 0.16, 2.5, 7)
-           and now - lastTry > 0.45 then
-            PATH.jumped[PATH.idx] = now
-            -- force: ein Wegpunkt-Sprung ist gezielt, kein Spam. Ohne das
-            -- greift die Bremse fuer anlasslose Spruenge (0.85 s) und der
-            -- Bot kommt Treppen mit mehreren hop-Kanten nicht mehr hoch.
-            tryJump(true)
+    -- ABSPRUNG einer Sprung- oder Hop-Kante. Der Wegpunkt traegt die Marke
+    -- jetzt am richtigen Ende (siehe computeGraph) und weiss, WOHIN gesprungen
+    -- wird — daraus ergeben sich Anlaufrichtung, noetiges Tempo und Zeitpunkt.
+    -- Nachgefasst wird nicht mehr hier, sondern im Flugzustand oben: bleibt
+    -- der Tap wirkungslos (Landeanimation, Rolle, Truss-Beruehrung), sieht
+    -- man das daran, dass der Charakter nicht abhebt — und nur dann wird
+    -- erneut gedrueckt.
+    if wp.takeoff and wp.jumpTo then
+        local line = (wp.jumpTo - wp.Position) * Vector3.new(1, 0, 1)
+        local gap = line.Magnitude
+        if gap > 0.1 then
+            local lineU = line.Unit
+            local toWp = (wp.Position - pos) * Vector3.new(1, 0, 1)
+            local d = toWp.Magnitude
+            local hrpJ = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+            local humJ = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+            local vel = hrpJ and (hrpJ.AssemblyLinearVelocity * Vector3.new(1, 0, 1))
+                        or Vector3.zero
+            local spd = vel.Magnitude
+            local grounded = humJ and humJ.FloorMaterial ~= Enum.Material.Air
+            -- Flugzeit bis auf Zielhoehe, nicht pauschal 2*vy/g: eine hoeher
+            -- gelegene Landung verkuerzt den Flug und braucht deshalb mehr
+            -- Tempo als dieselbe Weite auf gleicher Hoehe.
+            local g, vy = jumpProfile()
+            local dyJ = wp.jumpTo.Y - wp.Position.Y
+            local disc = vy * vy - 2 * g * dyJ
+            local airT = (disc > 0) and ((vy + math.sqrt(disc)) / g) or (vy / g)
+            local need = gap / math.max(airT, 0.05)
+            local along = (spd > 0.1) and vel.Unit:Dot(lineU) or 1
+
+            -- ANLAUF AUF DER SPRUNGLINIE. Der Bogen ist beim Backen als
+            -- Gerade vom Absprung zur Landung geprueft worden. Laeuft der Bot
+            -- den Absprungknoten aus einer anderen Richtung an, steht seine
+            -- tatsaechliche Fahrtrichtung beim Abheben quer dazu — die
+            -- Drehbegrenzung ist auf Wegen zwar aus, die Traegheit des
+            -- Charakters aber nicht (gemessen 27.5 Grad Abweichung zwischen
+            -- gewollter und gefahrener Richtung). Also wird nicht der Knoten
+            -- selbst angesteuert, sondern ein Punkt auf der rueckwaertigen
+            -- Verlaengerung der Sprunglinie: er faehrt damit von hinten auf
+            -- den Absprung zu und liegt beim Abheben schon auf Kurs.
+            -- Nur bei echten Luecken. Eine Treppenstufe ist 4 bis 5.6 Studs
+            -- weit (Nachbarzellen im Raster) — dort waere der Anlaufbogen ein
+            -- Umweg um den eigenen Absprung herum, und Treppen funktionieren
+            -- heute schon zuverlaessig. Erst ab 8 Studs zahlt sich die
+            -- Ausrichtung aus, darunter zaehlt nur der Zeitpunkt.
+            -- Steht der Bot schon JENSEITS des Absprungs (in Sprungrichtung
+            -- hinter dem Knoten), darf der Anlaufbogen nicht greifen: er wuerde
+            -- ihn rueckwaerts um seinen eigenen Absprung herumfuehren — als
+            -- Kreisen sichtbar. Dann geht es direkt auf den Knoten.
+            local past = (pos - wp.Position):Dot(lineU) > 0
+            local wide = gap > 8 and not past
+            local lead = math.max(spd, 8) * 0.07 + 0.9
+            if d > lead then
+                if not wide then
+                    local v = (wp.Position - pos) * Vector3.new(1, 0, 1)
+                    if v.Magnitude > 0.1 then return v.Unit end
+                    return lineU
+                end
+                local aim = wp.Position - lineU * math.clamp(d * 0.55, 0, 6)
+                local v = (aim - pos) * Vector3.new(1, 0, 1)
+                if v.Magnitude > 0.1 then return v.Unit end
+                return lineU
+            end
+
+            -- AM ABSPRUNG. Ausgeloest wird ueber die ZEIT bis zur Kante
+            -- (rund ein Humanoid-Schritt Vorlauf), nicht ueber einen festen
+            -- Radius: bei 14 Studs/s und bei 37 Studs/s liegt derselbe
+            -- Radius eine Viertelsekunde auseinander.
+            local last = PATH.jumped[PATH.idx] or 0
+            local aligned = (not wide) or (spd < 4) or (along > 0.90)
+            if grounded and spd >= need * 0.9 and (aligned or d < 1.2)
+               and now - last > 0.3 then
+                PATH.jumped[PATH.idx] = now
+                PATH.air = {
+                    at = now, to = wp.jumpTo, from = pos, gap = gap,
+                    spd = spd, need = need, tries = 1,
+                    ang = math.deg(math.acos(math.clamp(along, -1, 1))),
+                    kind = wp.jumpKind or "jump",
+                }
+                tryJump(true)
+                -- Der Absprungpunkt ist mit dem Sprung erledigt; ab jetzt
+                -- gilt der Landepunkt. Ohne das muesste er den Knoten auch
+                -- noch "erreichen", waehrend er schon in der Luft ist.
+                PATH.idx = PATH.idx + 1
+                PATH.idxAt = now
+                return lineU
+            end
+            -- Zu langsam fuer die Luecke: nicht trotzdem drueberlaufen.
+            -- Erst Zeit zum Beschleunigen geben, dann lieber den Weg
+            -- verwerfen — ein Sturz kostet mehr als eine Neuplanung.
+            if grounded and d < 2.0 and spd < need * 0.9
+               and now - (PATH.idxAt or now) > 0.4 then
+                failNote("zu_langsam_fuer_sprung",
+                    ("Luecke %.0f Studs braucht %.0f Studs/s, gefahren %.0f")
+                        :format(gap, need, spd))
+                PATH.wps, PATH.at, PATH.lastCalc = nil, 0, nil
+                return nil
+            end
+            return lineU
         end
     end
     -- Der Weg darf jetzt ueber Leitern fuehren. Ein Wegpunkt deutlich ueber uns
@@ -2344,9 +2621,35 @@ local function followPath(pos)
     end
     -- Wegpunkt deutlich hoeher -> springen (Treppe/Absatz). Ebenfalls
     -- wegbezogen, also an der Sprungbremse vorbei.
-    if wp.Position.Y - pos.Y > 3 then
-        tryJump(true)
+    -- Gedrosselt und nur, wenn vor ihm ueberhaupt Platz zum Steigen ist:
+    -- ungedrosselt war das jeden Frame ein Sprungbefehl, und in einer Ecke
+    -- mit einem Wegpunkt ueber dem Kopf huepfte der Bot dort nur noch herum.
+    if wp.Position.Y - pos.Y > 3 and tick() - (AP.risenJumpAt or 0) > 0.5 then
+        local toHigher = (wp.Position - pos) * Vector3.new(1, 0, 1)
+        local wallAhead = toHigher.Magnitude > 0.1
+            and workspace:Raycast(pos + Vector3.new(0, 3.2, 0),
+                                  toHigher.Unit * 3, AP.rp)
+        if not wallAhead then
+            AP.risenJumpAt = tick()
+            tryJump(true)
+        end
     end
+
+    -- DURCHGANG DURCHLAUFEN, NICHT UMKREISEN. Aus der Naehe wird nicht mehr
+    -- der Durchgangspunkt selbst angesteuert, sondern ein Punkt drei Studs
+    -- DAHINTER auf derselben Achse. Ein Punkt, auf den man zielt und den man
+    -- bei vollem Tempo knapp verfehlt, wird umrundet; ein Punkt dahinter
+    -- zieht den Bot hindurch.
+    if wp.kind == "via" and PATH.idx > 1 then
+        local segV = (wp.Position - wps[PATH.idx - 1].Position) * Vector3.new(1, 0, 1)
+        local dV = ((wp.Position - pos) * Vector3.new(1, 0, 1)).Magnitude
+        if segV.Magnitude > 0.1 and dV < 5 then
+            local through = wp.Position + segV.Unit * 3
+            local v = (through - pos) * Vector3.new(1, 0, 1)
+            if v.Magnitude > 0.1 then return v.Unit end
+        end
+    end
+
     local dir = (wp.Position - pos) * Vector3.new(1, 0, 1)
     if dir.Magnitude < 0.1 then return nil end
 
@@ -2543,7 +2846,13 @@ local function pickDirection(pos, goalDir, curVel)
     -- Richtung des Folgers um 17.5 Grad verbogen, obwohl der Graph die
     -- Begehbarkeit bereits geprueft hat. Bleibt er dort wirklich haengen,
     -- faengt das die Wegneuplanung ab.
-    local onPath = AP.usingPath
+    -- AP.pathLoose: der Fortschrittswaechter im Wegpunkt-Folger meldet, dass
+    -- der Bot seit ueber einer Sekunde nicht naeher an seinen Wegpunkt kommt.
+    -- Dann gilt der Weg nur noch als Richtungsvorschlag, und es laeuft
+    -- dieselbe Nahbereichssteuerung wie beim Weglaufen: Wandgleiten und Wahl
+    -- der offensten Richtung. Genau das fehlte, als er vor einem Durchgang
+    -- Kreise drehte, obwohl daneben alles frei war.
+    local onPath = AP.usingPath and not AP.pathLoose
     local blockHit = (not onPath)
         and workspace:Raycast(pos + up, goalDir * 6, AP.rp) or nil
     if not blockHit and not onPath then
@@ -2581,13 +2890,21 @@ local function pickDirection(pos, goalDir, curVel)
     -- der Graph hat die Begehbarkeit bereits geprueft, und die Neuwahl
     -- fuehrt den Bot sichtbar vom Pfad weg — teilweise mitten in eine Wand.
     -- Das Wandgleiten oben bleibt aktiv, damit er nicht stur dagegenrennt.
-    if AP.usingPath then
+    -- Haengt er fest (AP.pathLoose), faellt er bewusst in die freie
+    -- Richtungswahl darunter — dort wird der Weg nur noch gewichtet.
+    if onPath then
         -- Kleine Hindernisse kennt der Graph nicht: sein Raster ist 4 bis 9
         -- Studs weit, Moebel und Deko in Innenraeumen fallen komplett durch.
         -- Die Richtung bleibt daher unveraendert, aber es wird gesprungen
         -- beziehungsweise knapp ausgewichen, statt dagegenzulaufen.
-        local kneeH = workspace:Raycast(pos + Vector3.new(0, 0.6, 0), goalDir * 4, AP.rp)
-        local chestH = workspace:Raycast(pos + Vector3.new(0, 3.2, 0), goalDir * 4, AP.rp)
+        -- Nicht im Flug: gegen Ende eines Sprungbogens trifft der Strahl die
+        -- STIRNSEITE der Zielkante. Der Zweig unten hat den Kurs daraufhin um
+        -- bis zu 40 Grad zur Seite gedreht — direkt vor der Landung, also
+        -- genau dann, wenn nichts mehr korrigiert werden darf.
+        local kneeH = (not PATH.air)
+            and workspace:Raycast(pos + Vector3.new(0, 0.6, 0), goalDir * 4, AP.rp) or nil
+        local chestH = (not PATH.air)
+            and workspace:Raycast(pos + Vector3.new(0, 3.2, 0), goalDir * 4, AP.rp) or nil
         if kneeH and not chestH then
             -- niedrig genug zum Drueberspringen
             if tick() - (AP.pathVaultAt or 0) > 0.5 then
@@ -2819,6 +3136,13 @@ local function hookControlModule()
         if typeof(v) == "Vector3" and v.Magnitude > 0.15 then
             AP.manualUntil = tick() + 0.5        -- eigener Input schlaegt Autopilot
             return v
+        end
+        -- Richtung verfaellt: bricht der Autopilot-Schritt ab (Fehler,
+        -- fehlender Charakter, Rundenwechsel), blieb die zuletzt gesetzte
+        -- Richtung im Hook stehen und der Bot lief stur immer weiter
+        -- geradeaus, ohne dass sie noch jemand aktualisiert haette.
+        if AP.vecAt and tick() - AP.vecAt > 0.4 then
+            AP.vec, AP.vecWorld = nil, nil
         end
         if CFG.autopilot and AP.vec and tick() > AP.manualUntil then
             -- Die Richtung wird als WELTrichtung gehalten und erst hier in
@@ -3325,6 +3649,13 @@ local function autopilotStep(threat, threatD, prey, preyD)
 
     hookControlModule()
 
+    -- Position frueh holen: die Bewegungsunfaehigkeits-Erkennung unten misst
+    -- die eigene Verschiebung und braucht sie schon dort. Vorher stand die
+    -- Definition erst hinter dieser Pruefung, "pos" war dort also ein
+    -- globaler nil-Wert — AP.immPos wurde damit nie gesetzt und der
+    -- Freeze-/Kaefig-Fall nie erkannt.
+    local pos = hrp.Position
+
     -- Bin ich selbst bewegungsunfaehig (Freeze-Modus, Kaefig, Anchor)? Dann
     -- ist jede Steuerung sinnlos — das Spiel verankert den Charakter, und der
     -- Autopilot wuerde nur gegen die Verankerung anrennen.
@@ -3358,7 +3689,6 @@ local function autopilotStep(threat, threatD, prey, preyD)
     AP.frozenLogged = false
     AP.immobile = false
 
-    local pos = hrp.Position
     local goal, mode
 
     -- Klettertest/erzwungenes Klettern laeuft unabhaengig von Runde und Ziel
@@ -3372,6 +3702,7 @@ local function autopilotStep(threat, threatD, prey, preyD)
                 -- Move-Hook mit einer veralteten und die Kamera verbiegt
                 -- den Kurs
                 AP.vec, AP.vecWorld, AP.mode = rel.Unit, cdir.Unit, "KLETTERN"
+                AP.vecAt = tick()
                 return
             end
         end
@@ -4488,7 +4819,9 @@ local function autopilotStep(threat, threatD, prey, preyD)
     -- AYIP: das Juke-Repertoire hat Vorrang vor der normalen Richtung,
     -- solange ein Manoever laeuft. Nur beim Weglaufen und Streifen —
     -- wer jagt, soll nicht vor seinem eigenen Ziel herumtanzen.
-    if goal and (mode == "FLUCHT" or mode == "STREIFEN") then
+    -- Waehrend eines Sprungs nicht finten: ein Manoever in der Luft dreht den
+    -- Bot von seinem Landepunkt weg.
+    if goal and (mode == "FLUCHT" or mode == "STREIFEN") and not PATH.air then
         local lvl = math.clamp(CFG.ayip or 0, 0, 3)
         if lvl > 0 then
             -- Der Parameter "threat" ist nur im Fluchtzweig gesetzt; beim
@@ -4506,7 +4839,18 @@ local function autopilotStep(threat, threatD, prey, preyD)
                 local v = (tp - pos) * Vector3.new(1, 0, 1)
                 if v.Magnitude > 0.1 then toThreat = v.Unit end
             end
-            local jd = jukeStep(pos, goal, toThreat, td, lvl)
+            -- Abgesichert: ein Fehler in einem Manoever hat frueher den
+            -- gesamten Autopilot-Schritt abgebrochen, bevor die Richtung
+            -- gesetzt wurde. Die zuletzt gueltige blieb dann im Move-Hook
+            -- stehen, und der Bot lief stur immer weiter geradeaus -
+            -- gemessen in 91.5 Prozent der Frames mit veralteter Richtung,
+            -- die aelteste 41 Sekunden alt.
+            local okJ, jd = pcall(jukeStep, pos, goal, toThreat, td, lvl)
+            if not okJ then
+                jd = nil
+                JUKE.active, AP.jukeName = nil, nil
+                failNote("juke_fehler", tostring(jd))
+            end
             if jd then
                 goal = jd
                 AP.usingPath = false
@@ -4646,6 +4990,7 @@ local function autopilotStep(threat, threatD, prey, preyD)
     -- zusaetzlich die Weltrichtung merken; der Move-Hook rechnet sie mit
     -- der aktuellen Kamera um, damit Mausdrehungen den Kurs nicht verbiegen
     AP.vecWorld = dir.Unit
+    AP.vecAt = tick()
     AP.mode = mode
 
     local m = RENV.shared.multipliers
@@ -4737,11 +5082,28 @@ local function assistStep(dt)
         -- 32 Studs/s legt er pro Frame einen halben Stud zurueck und
         -- schiesst darueber hinaus. Genau diese Punkte tragen aber die
         -- guten Routen: wer sie verfehlt, faellt auf den Fussweg zurueck.
+        -- HIER STAND DER FEHLER, DER DEN BOT KOMPLETT ANGEHALTEN HAT:
+        -- "pos" ist in dieser Funktion nicht definiert (das ist eine lokale
+        -- Variable von autopilotStep). Der Zugriff lief also auf einen
+        -- globalen nil-Wert, die Rechnung warf einen Fehler, und weil
+        -- assistStep im pcall der Renderstufe haengt, brach damit JEDER
+        -- Frame ab — noch bevor autopilotStep ueberhaupt aufgerufen wurde.
+        -- Zusammen mit dem Verfallsdatum der Richtung im Move-Hook (0.4 s)
+        -- heisst das: der Autopilot bewegt den Charakter gar nicht mehr.
+        local hrpS = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+        local posS = hrpS and hrpS.Position
         local pw = PATH.wps and PATH.wps[PATH.idx]
-        if pw then
+        if pw and posS then
             local k = pw.kind
-            if k == "climb" or k == "zip" or k == "pad" or k == "jump" or k == "via" then
-                local d = ((pw.Position - pos) * Vector3.new(1, 0, 1)).Magnitude
+            -- "jump" ist hier bewusst NICHT mehr dabei. Die Sprungkante
+            -- braucht das volle Tempo: der Bogen ist beim Backen mit
+            -- prof.speed (32) geplant worden, mit 45 % Tempo traegt er
+            -- statt 25 nur noch 11 Studs weit — das war der zweite Grund
+            -- fuer die verpatzten Jump-and-Run-Strecken.
+            if pw.takeoff then
+                -- Absprung: gar keine Bremse, sondern Vollgas.
+            elseif k == "climb" or k == "zip" or k == "pad" or k == "via" then
+                local d = ((pw.Position - posS) * Vector3.new(1, 0, 1)).Magnitude
                 if d < 14 then
                     -- weich herunterregeln statt abrupt bremsen
                     local f = math.clamp(d / 14, 0.45, 1)
