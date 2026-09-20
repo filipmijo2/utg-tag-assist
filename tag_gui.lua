@@ -234,7 +234,12 @@ function ENV.diag()
         out[#out + 1] = ("%-16s n=%d"):format(k, s.n)
     end
     for _, k in ipairs(order) do row(k) end
-    for k in pairs(DIAG.stat) do row(k) end
+    -- alles, was unten eigene Abschnitte hat, hier nicht noch einmal
+    for k in pairs(DIAG.stat) do
+        if not (k:match("^art_") or k:match("^wegquelle_") or k:match("^wegende_")) then
+            row(k)
+        end
+    end
     local wp = DIAG.stat.wegpunkt
     if wp and (wp.n or 0) > 0 then
         out[#out + 1] = "-- Wegpunkte --"
@@ -243,6 +248,50 @@ function ENV.diag()
         out[#out + 1] = "  seitlicher Versatz     " .. diagAvgTxt("wegpunkt", "side", " Studs")
         out[#out + 1] = "  Tempo am Punkt         " .. diagAvgTxt("wegpunkt", "spd", " Studs/s")
     end
+    -- JE FORTBEWEGUNGSART: Trefferquote und wie nah er herankam
+    local arts = {}
+    for k, v in pairs(DIAG.stat) do
+        local kind = k:match("^art_([%w_]+)$")
+        if kind and not kind:match("_ok$") then arts[#arts + 1] = kind end
+    end
+    table.sort(arts)
+    if #arts > 0 then
+        out[#out + 1] = "-- nach Fortbewegungsart (erreicht = unter 4 Studs) --"
+        for _, kind in ipairs(arts) do
+            local a = DIAG.stat["art_" .. kind]
+            local ok = DIAG.stat["art_" .. kind .. "_ok"]
+            local okN = ok and ok.n or 0
+            out[#out + 1] = ("  %-6s n=%-4d erreicht %3d%%   naechste %s  Tempo %s  Dauer %s")
+                :format(kind, a.n, math.floor(okN * 100 / math.max(a.n, 1)),
+                        diagAvgTxt("art_" .. kind, "min", ""),
+                        diagAvgTxt("art_" .. kind, "spd", ""),
+                        diagAvgTxt("art_" .. kind, "zeit", "s"))
+        end
+    end
+
+    -- GANZE WEGE: wie viel davon wird tatsaechlich gefahren?
+    local wg = DIAG.stat.weg
+    if wg and wg.n > 0 then
+        out[#out + 1] = "-- Wege --"
+        out[#out + 1] = ("  %d Wege, im Schnitt %s abgefahren, %s Punkte, %s")
+            :format(wg.n, diagAvgTxt("weg", "anteil", "%"),
+                    diagAvgTxt("weg", "punkte", ""), diagAvgTxt("weg", "dauer", "s"))
+        local q = {}
+        for k, v in pairs(DIAG.stat) do
+            local src = k:match("^wegquelle_(%w+)$")
+            if src then q[#q + 1] = ("%s=%d"):format(src, v.n) end
+        end
+        table.sort(q)
+        if #q > 0 then out[#out + 1] = "  Quelle: " .. table.concat(q, "  ") end
+        local e = {}
+        for k, v in pairs(DIAG.stat) do
+            local w2 = k:match("^wegende_([%w_]+)$")
+            if w2 then e[#e + 1] = ("%s=%d"):format(w2, v.n) end
+        end
+        table.sort(e)
+        if #e > 0 then out[#out + 1] = "  Ende: " .. table.concat(e, "  ") end
+    end
+
     local lo, ld = DIAG.stat.leiter_ok, DIAG.stat.leiter_daneben
     if (lo and lo.n or 0) + (ld and ld.n or 0) > 0 then
         out[#out + 1] = "-- Leitern --"
@@ -2366,8 +2415,10 @@ end
 -- ab, an denen das Raster des Graphen an schmalen Rampen zerreisst.
 local function computeOnce(fromPos, toPos, radius)
     local wps = computeGraph(fromPos, toPos)
-    if wps then return wps end
-    return computeEngine(fromPos, toPos, radius or 1.8)
+    if wps then wps.__src = "graph" return wps end
+    wps = computeEngine(fromPos, toPos, radius or 1.8)
+    if wps then wps.__src = "engine" end
+    return wps
 end
 
 computeEngine = function(fromPos, toPos, radius)
@@ -2534,6 +2585,17 @@ local function diagCloseWaypoint(why)
     end
     diagStat("wegpunkt").n = diagStat("wegpunkt").n + 1
     diagStat("grund_" .. why).n = diagStat("grund_" .. why).n + 1
+    -- JE KANTENART: hat der Bot den Punkt wirklich erreicht? Das ist das
+    -- allgemeine Mass fuer "funktioniert diese Fortbewegungsart" — bei
+    -- Leitern, Schienen, Ziplines und Trampolinen genauso wie beim Gehen.
+    local art = "art_" .. tostring(w.kind)
+    diagStat(art).n = diagStat(art).n + 1
+    diagVal(art, "min", w.min)
+    diagVal(art, "spd", w.spdMin or 0)
+    diagVal(art, "zeit", tick() - w.t0)
+    if w.min < 4 then
+        diagStat(art .. "_ok").n = diagStat(art .. "_ok").n + 1
+    end
     diagStat("modus_" .. tostring(w.mode)).n =
         diagStat("modus_" .. tostring(w.mode)).n + 1
     diagVal("modus_" .. tostring(w.mode), "min", w.min)
@@ -2560,12 +2622,47 @@ local function diagCloseWaypoint(why)
     end
 end
 
+-- Einen ganzen Weg abschliessen: wie weit ist der Bot gekommen?
+local function diagClosePath(why)
+    local P = DIAG.path
+    DIAG.path = nil
+    if not P or not DIAG.on or (P.n or 0) < 2 then return end
+    local done = math.clamp((P.maxIdx - 1) / math.max(P.n - 1, 1), 0, 1)
+    diagStat("weg").n = diagStat("weg").n + 1
+    diagVal("weg", "anteil", done * 100)
+    diagVal("weg", "punkte", P.n)
+    diagVal("weg", "dauer", tick() - P.t0)
+    diagStat("wegende_" .. tostring(why)).n =
+        diagStat("wegende_" .. tostring(why)).n + 1
+    diagStat("wegquelle_" .. tostring(P.src)).n =
+        diagStat("wegquelle_" .. tostring(P.src)).n + 1
+    -- Ein Weg, von dem weniger als die Haelfte gefahren wurde, ist eine
+    -- vergebliche Rechnung — die interessiert einzeln.
+    if done < 0.5 and why ~= "nahbereich" then
+        diagLine("weg_abgebrochen",
+            "%.0f%% von %d Punkten gefahren (%s, %.1fs, Quelle %s, Ende: %s)",
+            done * 100, P.n, tostring(P.mode), tick() - P.t0,
+            tostring(P.src), tostring(why))
+    end
+end
+
 -- Laeuft in jedem Frame mit einem gueltigen Wegpunkt.
 local function diagTick(pos, wps, idx, wp)
     if not DIAG.on then return end
     local hrpD = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
     local spd = hrpD and (hrpD.AssemblyLinearVelocity * Vector3.new(1, 0, 1)).Magnitude or 0
     local flat = ((wp.Position - pos) * Vector3.new(1, 0, 1)).Magnitude
+
+    -- Weg-Identitaet: eine neue Wegpunktliste ist ein neuer Weg
+    local P = DIAG.path
+    if not P or P.wps ~= wps then
+        diagClosePath("neuer_weg")
+        P = { wps = wps, n = #wps, t0 = tick(), maxIdx = idx,
+              src = (wps.__src or "?"), mode = tostring(AP.mode) }
+        DIAG.path = P
+    elseif idx > P.maxIdx then
+        P.maxIdx = idx
+    end
 
     local w = DIAG.wp
     if w and (w.idx ~= idx or w.wps ~= wps) then
@@ -2647,6 +2744,10 @@ local function followPath(pos, mode)
         PATH.air, AP.inAir, AP.pathLoose, PATH.prog = nil, false, false, nil
         if DIAG.wp then diagCloseWaypoint("weg_weg") end
         if DIAG.lad then diagCloseLadder() end
+        if DIAG.path then
+            diagClosePath(PATH.endWhy or "verworfen")
+            PATH.endWhy = nil
+        end
         return nil
     end
 
@@ -3013,6 +3114,7 @@ local function followPath(pos, mode)
             PATH.idxAt, PATH.prog = now, nil
             wp = wps[PATH.idx]
         else
+            PATH.endWhy = "haengt"
             failNote("weg_haengt",
                 ("Art %s, %.1f s ueberfaellig, %.1f s ohne Annaeherung (%.0f Studs) — neu geplant")
                     :format(tostring(wp.kind), math.max(overdue, 0), stuckFor, flatNow))
@@ -5719,8 +5821,17 @@ local function autopilotStep(threat, threatD, prey, preyD)
         -- staendig zwischen zwei Punkten, und der Bot rennt sichtbar hin
         -- und her, ohne je irgendwo anzukommen.
         local held = nowE - (AP.escAt or 0)
+        -- SOLANGE EIN WEG ZU DIESEM ZIEL NOCH GEFAHREN WIRD, NICHT UMDISPONIEREN.
+        -- Jeder Zielwechsel wirft den berechneten Weg weg: gemessen wurden im
+        -- Schnitt nur 26 bis 32 Prozent jedes Weges abgefahren, bei einer
+        -- mittleren Weglebensdauer von 2.7 Sekunden. Das Ziel wurde alle
+        -- hoechstens sechs Sekunden neu gewuerfelt, und weil der neue Punkt
+        -- weit weg lag, galt der alte Weg sofort als veraltet.
+        local onRoute = PATH.wps and PATH.target and AP.escNode
+            and (PATH.target - AP.escNode).Magnitude < 5
+            and (PATH.idx or 1) < #PATH.wps * 0.7
         local needNew = not AP.escNode
-            or held > 6.0
+            or (held > 6.0 and not onRoute)
             or ((AP.escNode - pos) * Vector3.new(1, 0, 1)).Magnitude < 18
         if needNew and not closeDanger and not preyTarget then
             -- Zuerst den Graphen fragen: er kennt Hoehe und Auswege und
@@ -5730,8 +5841,10 @@ local function autopilotStep(threat, threatD, prey, preyD)
             if node then
                 -- einen laufenden Lauf nicht fuer einen minimal anderen
                 -- Punkt aufgeben: der neue muss spuerbar woanders liegen
-                local keepOld = AP.escNode and held < 2.5
-                    and ((node - AP.escNode) * Vector3.new(1, 0, 1)).Magnitude < 40
+                local keepOld = AP.escNode
+                    and (onRoute
+                         or (held < 2.5
+                             and ((node - AP.escNode) * Vector3.new(1, 0, 1)).Magnitude < 40))
                 if not keepOld then
                     AP.escNode, AP.escAt = node, nowE
                 end
@@ -5830,6 +5943,10 @@ local function autopilotStep(threat, threatD, prey, preyD)
         end
         if not AP.longRange then
             wantPath = false
+            -- kein Fehlschlag, sondern der geplante Wechsel: nah genug am
+            -- Ziel uebernimmt die Direktsteuerung. Die Messung soll das
+            -- nicht als abgebrochenen Weg zaehlen.
+            if PATH.wps then PATH.endWhy = "nahbereich" end
             -- bewusster Moduswechsel, kein verlorener Weg: sonst meldet die
             -- Fehlererkennung hier faelschlich "pfad_verloren"
             if PATH.wps then PATH.wps = nil ; PATH.target = nil end
@@ -5853,8 +5970,21 @@ local function autopilotStep(threat, threatD, prey, preyD)
         -- daher kamen 50 Anfragen in 30 s. Neu gerechnet wird jetzt nur bei
         -- fehlendem Weg, bewegtem Ziel (Jagd) oder viel gelaufener Strecke;
         -- die 8 s sind nur noch ein Sicherheitsnetz gegen veraltete Wege.
-        if (not PATH.wps and age > minAge) or moved > 18 or runSince > 70
-           or age > 8 then
+        -- WEGE NICHT WEGWERFEN, DIE NOCH GEFAHREN WERDEN.
+        -- Gemessen ueber 56 Wege: im Schnitt wurden nur 26 Prozent davon
+        -- abgefahren, 46 endeten vorzeitig, und der Grund war fast immer
+        -- "neuer Weg" — der alte war noch gut, wurde aber nach 70 gelaufenen
+        -- Studs (bei 28 Studs/s also alle 2.5 s) durch einen frischen
+        -- ersetzt. Jede Rechnung kostet 12 bis 30 ms und setzt den
+        -- Fortschritt zurueck.
+        -- Die Strecken-Regel greift deshalb nur noch, wenn der Weg auch
+        -- weitgehend abgefahren ist; laeuft der Bot noch mittendrin, bleibt
+        -- sein Weg stehen. Ein bewegtes Ziel (Jagd) rechnet weiter sofort neu.
+        local wpsNow = PATH.wps
+        local nearEnd = (not wpsNow) or #wpsNow < 2
+            or (PATH.idx or 1) >= #wpsNow * 0.6
+        if (not PATH.wps and age > minAge) or moved > 18
+           or (runSince > 70 and nearEnd) or age > 8 then
             local v = pathTarget - pos
             local cands = { pathTarget }
             local down = workspace:Raycast(pathTarget + Vector3.new(0, 4, 0), Vector3.new(0, -80, 0), AP.rp)
@@ -5885,6 +6015,9 @@ local function autopilotStep(threat, threatD, prey, preyD)
         end
     else
         AP.usingPath = false
+        -- (Ein Versuch, einen gerade berechneten Weg eine Sekunde lang zu
+        --  halten, hat die Rechnerei NICHT verringert: 122 statt 60 Wege im
+        --  selben Zeitraum. Wieder raus.)
         PATH.wps = nil
     end
 
