@@ -53,6 +53,9 @@ local CFG = {
     preset      = 3,       -- fest auf Maximum (kein Umschalten mehr)
     -- Sound nach einer gelungenen Finte (rein lokal, siehe Abschnitt 5c)
     jukeSound   = false,
+    -- zusaetzlich ueber das virtuelle Mikrofon in den Voicechat geben
+    -- (braucht das Begleitprogramm utg_vc_player.py)
+    jukeSoundVC = true,
     -- volle Lautstaerke: der Sound soll den Moment markieren, und er laeuft
     -- ohnehin nur beim eigenen Spieler
     jukeSoundVol = 1.0,
@@ -1954,6 +1957,7 @@ local function saveSettings()
             autopilot = CFG.autopilot and true or false,
             ayip = CFG.ayip or 0,
             jukeSound = CFG.jukeSound and true or false,
+            jukeSoundVC = CFG.jukeSoundVC and true or false,
             jukeSoundVol = CFG.jukeSoundVol or 1.0,
             -- 3rd Person wird BEWUSST nicht gesichert: der Modus haengt die
             -- Kamera hinter den Charakter, und wer ihn einmal versehentlich
@@ -1972,6 +1976,7 @@ do
             if d.autopilot ~= nil then CFG.autopilot = d.autopilot end
             if type(d.ayip) == "number" then CFG.ayip = math.clamp(d.ayip, 0, 3) end
             if d.jukeSound ~= nil then CFG.jukeSound = d.jukeSound end
+            if d.jukeSoundVC ~= nil then CFG.jukeSoundVC = d.jukeSoundVC end
             if type(d.jukeSoundVol) == "number" then
                 CFG.jukeSoundVol = math.clamp(d.jukeSoundVol, 0, 2)
             end
@@ -4479,6 +4484,22 @@ end
 
 -- Liest beide Quellen neu ein und legt je Eintrag eine Sound-Instanz an.
 -- Rueckgabe: Anzahl, Anzahl Dateien, Anzahl IDs.
+-- Die Roblox-Gesamtlautstaerke zieht unseren Sound mit herunter. Steht sie
+-- zum Beispiel auf 20 Prozent (gemessen genau das), kommt von einem Sound
+-- mit Volume 0.8 effektiv nur 0.16 an — man hoert schlicht nichts. Roblox
+-- laesst Volume bis 10 zu, also wird gegengerechnet: die Finte soll
+-- unabhaengig vom Regler des Spiels gleich laut sein.
+local function jukeVolume()
+    local want = CFG.jukeSoundVol or 1.0
+    local master = 1
+    pcall(function()
+        master = UserSettings():GetService("UserGameSettings").MasterVolume or 1
+    end)
+    if master < 0.02 then master = 0.02 end
+    return math.clamp(want / master, want, 6)
+end
+ENV.jukeVolume = jukeVolume
+
 -- Billiger Fingerabdruck der beiden Quellen: Anzahl Dateien plus Laenge der
 -- ID-Datei. Aendert er sich, wird neu eingelesen — so genuegt es, eine Datei
 -- in den Ordner zu legen, ohne irgendetwas umzuschalten.
@@ -4566,7 +4587,7 @@ function ENV.reloadSounds()
             local s = Instance.new("Sound")
             s.Name = e.name
             s.SoundId = e.id
-            s.Volume = CFG.jukeSoundVol or 1.0
+            s.Volume = jukeVolume()
             s.Parent = holder
             SND.list[#SND.list+1] = s
         end)
@@ -4575,16 +4596,43 @@ function ENV.reloadSounds()
     return #SND.list, nFile, nId, nDef, nWeb
 end
 
+-- AUSLOESER FUER DEN VOICECHAT.
+-- Roblox uebertraegt im VC nur das Mikrofon; ein Sound, den das Spiel selbst
+-- abspielt, bleibt immer lokal — daran laesst sich von innen nichts aendern.
+-- Deshalb schreibt das Skript hier nur ein Signal in eine Datei. Das
+-- Begleitprogramm utg_vc_player.py liest es und spielt eine Audiodatei auf
+-- das virtuelle Mikrofon (Voicemeeter / VB-CABLE), das Roblox als Eingang
+-- benutzt. Erst dadurch hoeren andere Spieler etwas.
+local VC_TRIGGER, VC_ALIVE = "utg_vc_play.txt", "utg_vc_alive.txt"
+local vcCount = 0
+local function vcTrigger()
+    if type(writefile) ~= "function" then return end
+    vcCount = vcCount + 1
+    pcall(writefile, VC_TRIGGER, tostring(vcCount) .. " " .. tostring(os.time()))
+end
+
+-- Laeuft das Begleitprogramm? Es schreibt jede Sekunde einen Zeitstempel.
+function ENV.vcAlive()
+    if type(isfile) ~= "function" or not isfile(VC_ALIVE) then return false end
+    local ok, txt = pcall(readfile, VC_ALIVE)
+    if not ok then return false end
+    local t = tonumber((tostring(txt):match("%d+")))
+    return t ~= nil and math.abs(os.time() - t) < 8
+end
+
 local function playJukeSound()
     if #SND.list == 0 then return end
     local s = SND.list[math.random(1, #SND.list)]
     if not s or not s.Parent then return end
     pcall(function()
-        s.Volume = CFG.jukeSoundVol or 1.0
+        s.Volume = jukeVolume()
         s.TimePosition = 0
         s:Play()
     end)
     SND.lastName = s.Name
+    -- und nach draussen: das Begleitprogramm spielt dieselbe Gelegenheit
+    -- auf das virtuelle Mikrofon, damit die anderen es auch hoeren
+    if CFG.jukeSoundVC then vcTrigger() end
 end
 ENV.playJukeSound = playJukeSound     -- zum Ausprobieren der Lautstaerke
 
@@ -4602,9 +4650,14 @@ function ENV.testSound()
             if s.PlaybackLoudness > loud then loud = s.PlaybackLoudness end
         end
     end
-    return ("%d Sounds geladen, gespielt: %s, lauteste Stelle %.0f — %s")
-        :format(#SND.list, tostring(SND.lastName), loud,
-                loud > 0 and "hoerbar" or "STUMM (Spiel-Lautstaerke pruefen)")
+    local master = 1
+    pcall(function()
+        master = UserSettings():GetService("UserGameSettings").MasterVolume or 1
+    end)
+    return ("%d Sounds, gespielt: %s | Roblox-Gesamtlautstaerke %.0f%%, "
+            .. "Sound-Volume dagegen %.1f | lauteste Stelle %.0f — %s")
+        :format(#SND.list, tostring(SND.lastName), master * 100, jukeVolume(), loud,
+                loud > 0 and "hoerbar" or "STUMM")
 end
 
 -- Ein Manoever beenden und zur Wirkungsmessung anmelden.
@@ -7219,6 +7272,9 @@ task.spawn(function()
         -- Sound-Ordner im Blick behalten: alle fuenf Sekunden schauen, ob
         -- Dateien dazugekommen sind. Dann reicht "Datei reinlegen".
         sndCheck = sndCheck + 1
+        if CFG.jukeSound and CFG.jukeSoundVC and sndCheck % 20 == 0 then
+            state.vcOk = ENV.vcAlive()
+        end
         if CFG.jukeSound and sndCheck % 33 == 0 then
             local fp = sndFingerprint()
             if fp ~= SND.fp then
@@ -7253,7 +7309,10 @@ task.spawn(function()
                 state.tagsOk or 0, state.tagsMiss or 0)
             .. nl .. ("  %s   AYIP %s%s"):format(modeTxt,
                 (CFG.ayip or 0) == 0 and "aus" or tostring(CFG.ayip),
-                CFG.jukeSound and ("   Sounds " .. tostring(state.sndCount or 0)) or "")
+                CFG.jukeSound and ("   Sounds " .. tostring(state.sndCount or 0)
+                    .. (CFG.jukeSoundVC
+                        and (state.vcOk and "  VC: an" or "  VC: Player aus") or ""))
+                or "")
     end
 end)
 

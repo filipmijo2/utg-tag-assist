@@ -54,3 +54,36 @@ Mikrofon, keine Übertragung an andere Spieler.
 Trefferquote je Fortbewegungsart (gehen, Durchgang, Sprung, Leiter, Schiene,
 Zipline, Trampolin), wie viel Prozent jedes berechneten Weges tatsächlich
 abgefahren wurde, und warum Wege enden. `ENV.diagReset()` setzt zurück.
+
+## Finten-Sound im Voicechat (optional)
+
+Roblox überträgt im Voicechat **nur das Mikrofon**. Ein Sound, den das Spiel
+selbst abspielt, bleibt immer lokal — daran lässt sich von innen nichts
+ändern. Damit andere ihn hören, muss er über ein virtuelles Mikrofon laufen.
+Dafür liegt `utg_vc_player.py` bei:
+
+```
+tag_gui.lua  --(schreibt utg_vc_play.txt)-->  utg_vc_player.py
+utg_vc_player.py  --(spielt Datei)-->  Voicemeeter Input / CABLE Input
+Voicemeeter / VB-CABLE  --(als Mikrofon)-->  Roblox  -->  alle hören es
+```
+
+**Einmalig einrichten**
+
+1. `pip install sounddevice soundfile`
+2. Echte Audiodateien (`.wav .mp3 .ogg .flac`) in den Ordner `utg_sounds` im
+   Executor-Verzeichnis legen. Roblox-Asset-IDs helfen hier **nicht** — für
+   den Voicechat braucht es Dateien auf der Platte.
+3. `utg_vc_start.bat` starten (oder `python -u utg_vc_player.py`). Das
+   Programm sucht sich Voicemeeter bzw. VB-CABLE selbst und prüft über die
+   Voicemeeter-Fernsteuerung, ob der Weg zum virtuellen Mikrofon (B1) offen
+   ist — falls nicht, schaltet es ihn ein.
+4. In Roblox: Einstellungen → Audio → Eingabegerät auf `Voicemeeter Out B1`
+   (bzw. `CABLE Output`) stellen.
+
+Im Statusfeld des Tools steht dann `VC: an`, solange das Programm läuft.
+Fenster zu = wieder nur lokaler Sound, sonst ändert sich nichts.
+
+`python utg_vc_player.py --list` zeigt alle Ausgabegeräte,
+`--test` spielt sofort einen Sound zur Kontrolle. Gerät und Lautstärke lassen
+sich in `utg_vc_config.json` festnageln.
