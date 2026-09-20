@@ -16,7 +16,7 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/filipmijo2/utg-tag-as
 | **AYIP: aus / 1 / 2 / 3** | Juke-Stufen. Aus = ruhig. Höher = mehr und schärfere Haken |
 | **Finten-Abstand** | Slider 8–28 Studs: ab welchem Abstand gefintet wird |
 | **3rd Person [T]** | Kamera hinter den Charakter, Mausrad = Abstand |
-| **Finten-Sound** | Spielt 0,1 s nach jeder gelungenen Finte einen Sound — nur lokal, kein Voicechat |
+| **Finten-Sound** | Spielt 0,05 s nach jeder gelungenen Finte einen Sound — nur lokal, kein Voicechat |
 | RightControl | GUI aus-/einblenden |
 
 ## Was drin ist
@@ -44,7 +44,7 @@ Eigene Sounds, beides beliebig lang und alle 5 s automatisch übernommen:
 * **Eigene Dateien** — `.mp3` `.ogg` `.wav` `.flac` in den Ordner `utg_sounds`
   im Executor-Ordner legen.
 
-Gespielt wird ein zufälliger Eintrag, 0,1 s nach der Finte, und nur wenn man
+Gespielt wird ein zufälliger Eintrag, 0,05 s nach der Finte, und nur wenn man
 dabei nicht gefangen wurde. Der Sound läuft ausschließlich lokal — kein
 Mikrofon, keine Übertragung an andere Spieler.
 
