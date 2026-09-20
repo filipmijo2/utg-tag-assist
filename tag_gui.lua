@@ -1663,7 +1663,17 @@ do
                 b[#b+1] = n
             end
         end
-        local span = math.ceil((prof.reach * 0.9) / cell)
+        -- WEITE SPRUENGE TRAGEN NICHT — GEMESSEN.
+        -- Ueber 176 Spruenge aus echten Runden: bis 8 Studs Luecke landen
+        -- 96 bis 100 Prozent, 8 bis 14 Studs noch ordentlich, ab 14 Studs
+        -- nur noch 16 bis 18 Prozent. Die Physik gaebe mehr her (reach
+        -- rechnet 33 Studs), die Steuerung aber nicht: in der Luft driftet
+        -- er, und der Landeknoten liegt oft auf einer schmalen Kante.
+        -- Der Graph bekommt deshalb nur Sprungkanten, die auch ankommen —
+        -- alles Weitere geht ueber Umwege, Leitern oder Faelle.
+        local JUMP_MAX = 14
+        local reachCap = math.min(prof.reach * 0.9, JUMP_MAX)
+        local span = math.ceil(reachCap / cell)
         local jumps, drops = 0, 0
         for i, a in ipairs(rim) do
             for dx = -span, span do
@@ -1674,7 +1684,7 @@ do
                             if o.id ~= a.id then
                                 local flat = ((o.p - a.p) * Vector3.new(1,0,1)).Magnitude
                                 local dy = o.p.Y - a.p.Y
-                                if flat <= prof.reach * 0.9 and math.abs(dy) > CFG.stepUp then
+                                if flat <= reachCap and math.abs(dy) > CFG.stepUp then
                                     local lipJ = Vector3.new(a.p.X, o.p.Y + 1.8, a.p.Z)
                                     if dy > 0 and dy <= prof.rise and arcClear(a.p, o.p, prof)
                                        and not cast(a.p + Vector3.new(0, 1, 0),
@@ -1901,8 +1911,12 @@ do
             local t = byComp[c] ; if not t then t = {} byComp[c] = t end
             t[#t + 1] = i
         end
+        -- FALLEN TRAEGT WEITER ALS SPRINGEN. Seit die Sprungkanten auf 14
+        -- Studs gedeckelt sind (weil weite Spruenge gemessen nur zu 18
+        -- Prozent ankommen), fehlen Bruecken. Ein Fall nach unten ist aber
+        -- immer zuverlaessig — dafuer darf die Suche deutlich weiter reichen.
         local linked = 0
-        local span = math.ceil(28 / cell)
+        local span = math.ceil(46 / cell)
         for c, ids in pairs(byComp) do
             -- die groesste Insel selbst nicht behandeln
             local isBiggest = true
@@ -1912,7 +1926,7 @@ do
             if not isBiggest then
                 local made = 0
                 for _, id in ipairs(ids) do
-                    if made >= 3 then break end
+                    if made >= 5 then break end
                     local a = nodes[id]
                     for dx = -span, span do
                         for dz = -span, span do
@@ -1922,14 +1936,16 @@ do
                                     if comp[o.id] ~= c and size[comp[o.id]] > size[c] then
                                         local flat = ((o.p - a.p) * Vector3.new(1,0,1)).Magnitude
                                         local dy = o.p.Y - a.p.Y
-                                        if flat < 28 then
+                                        if flat < 46 then
                                             if dy < -1 and dy > -70
+                                               and flat <= math.max(14, math.abs(dy) * 0.9)
                                                and not cast(a.p + Vector3.new(0,1,0),
                                                             (o.p - a.p) + Vector3.new(0,-1,0)) then
                                                 addEdge(a, o, "drop",
                                                         math.sqrt(2*math.abs(dy)/prof.g) + flat/prof.speed)
                                                 linked = linked + 1 ; made = made + 1
-                                            elseif flat <= prof.reach * 0.9 and dy <= prof.rise
+                                            elseif flat <= math.min(prof.reach * 0.9, 14)
+                                                   and dy <= prof.rise
                                                    and arcClear(a.p, o.p, prof) then
                                                 addEdge(a, o, "jump", flat/prof.speed + 0.25)
                                                 addEdge(o, a, "jump", flat/prof.speed + 0.25)
@@ -1937,12 +1953,12 @@ do
                                             end
                                         end
                                     end
-                                    if made >= 3 then break end
+                                    if made >= 5 then break end
                                 end
                             end
-                            if made >= 3 then break end
+                            if made >= 5 then break end
                         end
-                        if made >= 3 then break end
+                        if made >= 5 then break end
                     end
                 end
             end
@@ -2141,7 +2157,7 @@ do
     
         local lines = string.split(blob, "\n")
         local head = string.split(lines[1] or "", "|")
-        if head[1] ~= "UTGNAV10" then return nil end
+        if head[1] ~= "UTGNAV11" then return nil end
         local cell = tonumber(head[3])
         local bbv = string.split(head[4] or "", ",")
         if not cell or #bbv < 6 then return nil end
@@ -2201,7 +2217,7 @@ do
         -- stueckweise zusammensetzen: ein einzelner String mit Millionen
         -- Verkettungen sprengt den Speicher
         local parts = {
-            ("UTGNAV10|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
+            ("UTGNAV11|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
                 r1(G.bb.min.X), r1(G.bb.min.Y), r1(G.bb.min.Z),
                 r1(G.bb.max.X), r1(G.bb.max.Y), r1(G.bb.max.Z))
         }
@@ -3757,11 +3773,20 @@ local function followPath(pos, mode)
             -- Radius: bei 14 Studs/s und bei 37 Studs/s liegt derselbe
             -- Radius eine Viertelsekunde auseinander.
             local last = PATH.jumped[PATH.idx] or 0
-            local aligned = (not wide) or (spd < 4) or (along > 0.90)
+            -- AUSRICHTUNG IST BEI WEITEN SPRUENGEN PFLICHT.
+            -- Gemessen ueber 176 Spruenge: bis 8 Studs Luecke landen 100
+            -- Prozent, darueber nur 12 bis 34 — und der Winkelfehler beim
+            -- Absprung lag im Schnitt bei 54 Grad (gelandet) bzw. 78 Grad
+            -- (daneben). Er springt also quer zur Sprunglinie. Schuld war
+            -- die Hintertuer "d < 1.2": stand er nah genug am Absprung,
+            -- wurde ohne jede Ausrichtung gesprungen. Bei kurzen Huepfern
+            -- ist das egal, bei weiten entscheidet es alles.
+            local aligned = (not wide) or (spd < 4) or (along > 0.87)
             -- 0.9 -> 0.85: wer schneller ankommt, springt auch hoeher
             -- (JumpPower folgt der WalkSpeed), der Bogen faellt also besser
             -- aus als die statische Rechnung annimmt.
-            if grounded and spd >= need * 0.75 and (aligned or d < 1.2)
+            if grounded and spd >= need * 0.75
+               and (aligned or (not wide and d < 1.2))
                and now - last > 0.3 then
                 PATH.jumped[PATH.idx] = now
                 PATH.air = {
@@ -3778,6 +3803,18 @@ local function followPath(pos, mode)
                 PATH.idxAt = now
                 return lineU
             end
+            -- QUER ZUR SPRUNGLINIE: nicht springen, sondern einschwenken.
+            -- Ein kurzer Bogen zurueck auf die Linie kostet eine halbe
+            -- Sekunde, ein Sprung im falschen Winkel den ganzen Weg.
+            if wide and grounded and not aligned and d < 3 then
+                diagStat("sprung_eingeschwenkt").n =
+                    diagStat("sprung_eingeschwenkt").n + 1
+                local back = wp.Position - lineU * 6
+                local v = (back - pos) * Vector3.new(1, 0, 1)
+                if v.Magnitude > 0.1 then return v.Unit end
+                return -lineU
+            end
+
             -- ZU LANGSAM FUER DIE LUECKE: nicht gleich den ganzen Weg
             -- wegwerfen. Gemessen endeten 20 von 110 Wegen genau hier — das
             -- Veto war teurer als das Problem, das es verhindern sollte.
