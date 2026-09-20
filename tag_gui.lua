@@ -1671,7 +1671,12 @@ do
         -- er, und der Landeknoten liegt oft auf einer schmalen Kante.
         -- Der Graph bekommt deshalb nur Sprungkanten, die auch ankommen —
         -- alles Weitere geht ueber Umwege, Leitern oder Faelle.
-        local JUMP_MAX = 14
+        -- Nachgemessen an 3666 Ereignissen: bis 8 Studs landen 96 Prozent,
+        -- 8 bis 14 Studs nur 31, darueber 18. Und jeder misslungene Sprung
+        -- kostet den ganzen Weg: "absprung_verpasst" und "sprung_daneben"
+        -- zusammen waren 20 Prozent aller Wegenden. Der Deckel geht deshalb
+        -- auf 9 Studs — das ist der Bereich, in dem es wirklich klappt.
+        local JUMP_MAX = 9
         local reachCap = math.min(prof.reach * 0.9, JUMP_MAX)
         local span = math.ceil(reachCap / cell)
         local jumps, drops = 0, 0
@@ -2157,7 +2162,7 @@ do
     
         local lines = string.split(blob, "\n")
         local head = string.split(lines[1] or "", "|")
-        if head[1] ~= "UTGNAV11" then return nil end
+        if head[1] ~= "UTGNAV12" then return nil end
         local cell = tonumber(head[3])
         local bbv = string.split(head[4] or "", ",")
         if not cell or #bbv < 6 then return nil end
@@ -2217,7 +2222,7 @@ do
         -- stueckweise zusammensetzen: ein einzelner String mit Millionen
         -- Verkettungen sprengt den Speicher
         local parts = {
-            ("UTGNAV11|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
+            ("UTGNAV12|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
                 r1(G.bb.min.X), r1(G.bb.min.Y), r1(G.bb.min.Z),
                 r1(G.bb.max.X), r1(G.bb.max.Y), r1(G.bb.max.Z))
         }
@@ -3298,7 +3303,7 @@ local function followPath(pos, mode)
                 local segT = (wp.Position - wps[PATH.idx - 1].Position) * Vector3.new(1, 0, 1)
                 behind = segT.Magnitude > 0.1 and segT.Unit:Dot(-flat) > 0
             end
-            if behind or now - (PATH.idxAt or now) > 2 then
+            if behind or now - (PATH.idxAt or now) > 3 then
                 PATH.endWhy = "absprung_verpasst"
                     failNote("absprung_verpasst",
                     ("%.0f Studs vom Absprung, kein Sprung ausgeloest")
