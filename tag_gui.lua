@@ -2506,7 +2506,7 @@ local function diagCloseWaypoint(why)
             "Art %s: %.1f Studs drueber (dichteste %.1f, seitlich %.1f, "
             .. "Tempo %.0f, Anlauf %.0f, %.1fs, Ende: %s)",
             w.kind, w.over, w.min, w.side, w.spdMin or 0, w.d0, tick() - w.t0, why)
-    elseif w.min > 6 and why ~= "neuer_weg" then
+    elseif w.min > 6 and why ~= "neuer_weg" and why ~= "weg_weg" then
         diagStat("nah_" .. tostring(w.mode)).n = diagStat("nah_" .. tostring(w.mode)).n + 1
         diagLine("nie_nah_dran",
             "Art %s: dichteste %.1f (seitlich %.1f, Tempo %.0f, Anlauf %.0f, "
@@ -2785,20 +2785,38 @@ local function followPath(pos, mode)
             --  war toter Code: der allgemeine Notausgang unten greift schon
             --  bei 0.5 s und deckt denselben Fall ab.)
             -- oder schon daran vorbei: hinter der Ebene senkrecht zum Wegstueck
+            -- SCHON VORBEI — aber nur, wenn er auch NEBEN dem Punkt vorbei
+            -- ist und nicht quer daneben. Ohne Seitengrenze galt ein Wegpunkt
+            -- als erledigt, an dem er 9.5 Studs seitlich vorbeigelaufen ist:
+            -- gemessen 11 solcher Faelle mit 5 bis 9.5 Studs Versatz, alle
+            -- als "nie nah dran" aufgefallen. Hinter der Ebene UND weit
+            -- daneben heisst nicht "geschafft", sondern "verfehlt" — dann
+            -- soll der Fortschrittswaechter uebernehmen.
             if not reached and PATH.idx > 1 and flat.Magnitude < passNow and heightOk then
                 local seg = (wp.Position - wps[PATH.idx - 1].Position) * Vector3.new(1, 0, 1)
                 if seg.Magnitude > 0.1 and seg.Unit:Dot(-flat) > 0 then
-                    reached = true
-                    reachedWhy = "vorbeigelaufen"
+                    local u = seg.Unit
+                    local side = (-flat - u * (-flat):Dot(u)).Magnitude
+                    if side < (flee and 6.0 or 4.0) then
+                        reached = true
+                        reachedWhy = "vorbeigelaufen"
+                    end
                 end
             end
             -- NIE UMDREHEN, UM EINEN PUNKT NACHZUHOLEN. Beim Weglaufen gilt
             -- ein Wegpunkt, der hinter dem Bot liegt, ohne Abstandsgrenze als
             -- erledigt — auch wenn er ihn um zehn Studs verfehlt hat. Kehrt
             -- machen heisst dem Verfolger entgegenlaufen.
+            -- Beim Weglaufen ohne Abstandsgrenze, aber ebenfalls nicht quer
+            -- daneben: sonst gilt ein Punkt als erledigt, den er um zwanzig
+            -- Studs verfehlt hat, und der Weg dahinter passt nicht mehr.
             if not reached and flee and not exactHere and PATH.idx > 1 then
                 local seg = (wp.Position - wps[PATH.idx - 1].Position) * Vector3.new(1, 0, 1)
-                if seg.Magnitude > 0.1 and seg.Unit:Dot(-flat) > 0 then
+                if seg.Magnitude > 0.1 and seg.Unit:Dot(-flat) > 0
+                   and (function()
+                           local u = seg.Unit
+                           return (-flat - u * (-flat):Dot(u)).Magnitude < 9.0
+                       end)() then
                     reached = true
                     reachedWhy = "hinter_mir_flucht"
                 end
@@ -5718,11 +5736,21 @@ local function autopilotStep(threat, threatD, prey, preyD)
         -- die freie Steuerung lief dann auf die Position ueber ihm zu und
         -- kreiste dort, weil sie da nie ankommt. Wer in einer Hoehle oder
         -- einem Stockwerk darunter sitzt, braucht immer eine Route.
-        local toGoal = (pathTarget - pos).Magnitude
+        -- HOEHE ZAEHLT IN DIESER ENTSCHEIDUNG MEHRFACH.
+        -- Fuer die freie Nahbereichssteuerung ist ein Ziel 20 Studs ueber dem
+        -- Bot nicht "20 Studs weg" — sie kann gar nicht hoch, sie laeuft nur
+        -- darunter herum. Horizontale Strecke frisst sie dagegen einfach weg.
+        -- Deshalb geht der Hoehenunterschied dreifach in die Entfernung ein,
+        -- die ueber Route oder Direktsteuerung entscheidet.
+        local dxz = ((pathTarget - pos) * Vector3.new(1, 0, 1)).Magnitude
+        local dyG = math.abs(pathTarget.Y - pos.Y)
+        local toGoal = math.sqrt(dxz * dxz + (dyG * 3) ^ 2)
         -- Hoehenunterschied bleibt Sache des Graphen, auch auf kurze
         -- Distanz: eine Leiter direkt vor der Nase findet die freie
-        -- Steuerung nie.
-        local climbNeed = math.abs(pathTarget.Y - pos.Y) > 8
+        -- Steuerung nie. Schwelle von 8 auf 6 Studs gesenkt — schon eine
+        -- Kistenreihe oder ein Absatz reicht, um die Direktsteuerung
+        -- scheitern zu lassen.
+        local climbNeed = dyG > 6
         -- Gemessen nach Modus getrennt (GlassHouses, je Minute):
         --   FLUCHT   mit Route 337 Fehler, ohne Route  96
         --   STREIFEN mit Route  34 Fehler, ohne Route  29
