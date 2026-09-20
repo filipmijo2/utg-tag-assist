@@ -903,6 +903,7 @@ do
             reach = speed * air,      -- flache Sprungweite, hier ~25 Studs
             rise = (vy * vy) / (2 * g),  -- Sprunghoehe, hier ~5.5 Studs
             climbSpeed = 8,           -- Leiter
+            railSpeed = 42,           -- Grindschiene (geschaetzt, wie Zipline)
             wallSpeed = 38,           -- gemessene Wallride-Steigkette
             zipSpeed = 40,
         }
@@ -1542,6 +1543,48 @@ do
                 end
             end
         end
+        -- 4f) RAILS (Grindschienen).
+        -- Gemessen auf Craigville: 15 Gruppen "RailgrindBeam" (Model) mit je
+        -- ein bis sieben Teilen "RailPart", lange duenne Balken von 14 bis 57
+        -- Studs entlang ihrer laengsten Achse, CanCollide = false. Das
+        -- Attribut RailGrind traegt wie bei der Zipline das ELTERNTEIL.
+        -- Ausgeloest wird der Grind, indem man auf der Schiene landet — also
+        -- wird ihr Ende als Knoten angebunden und der Weg dorthin gesprungen.
+        local rails = 0
+        for _, d in ipairs(mapRoot:GetDescendants()) do
+            if d:IsA("BasePart") and d.Parent
+               and d.Parent:GetAttribute("RailGrind") ~= nil then
+                -- laengste Achse ist die Fahrtrichtung
+                local sz, cf = d.Size, d.CFrame
+                local axis, len = cf.RightVector, sz.X
+                if sz.Y > len then axis, len = cf.UpVector, sz.Y end
+                if sz.Z > len then axis, len = cf.LookVector, sz.Z end
+                if len > 6 then
+                    local e1 = d.Position + axis * (len * 0.5)
+                    local e2 = d.Position - axis * (len * 0.5)
+                    -- etwas ueber der Schiene ansetzen: dort steht man beim
+                    -- Grinden, und dort liegen auch die Knoten
+                    local up = Vector3.new(0, 2, 0)
+                    local n1 = nearest(grid, bb, cell, e1 + up, 16, 12)
+                    local n2 = nearest(grid, bb, cell, e2 + up, 16, 12)
+                    if n1 and n2 and n1.id ~= n2.id then
+                        local t = len / prof.railSpeed
+                        -- bergab ist die Schiene schneller und sicherer als
+                        -- bergauf; hoch geht nur mit Schwung
+                        if n2.p.Y < n1.p.Y then
+                            addEdge(n1, n2, "rail", t)
+                            addEdge(n2, n1, "rail", t * 1.8)
+                        else
+                            addEdge(n2, n1, "rail", t)
+                            addEdge(n1, n2, "rail", t * 1.8)
+                        end
+                        rails = rails + 1
+                    end
+                end
+            end
+            breathe()
+        end
+
         for _, group in pairs(zipGroups) do
             local lo, hi
             for _, part in ipairs(group) do
@@ -1558,7 +1601,7 @@ do
             end
             breathe()
         end
-        return zips, pads
+        return zips, pads, rails
     end
     
     ------------------------------------------------------------------
@@ -1582,6 +1625,7 @@ do
         wallrun = 1.60,
         pad  = 0.22,        -- Trampolin
         zip  = 0.20,        -- Zipline
+        rail = 0.24,        -- Grindschiene
     }
     -- Zusaetzlicher Abschlag auf JEDE Kante, die Hoehe gewinnt — auch auf
     -- gewoehnliche Wege ueber Treppen und Rampen.
@@ -1709,7 +1753,7 @@ do
         local j, d, rim = buildJumpDrop(nodes, grid, cell, prof)
         stats.jump, stats.drop, stats.rim = j, d, #rim
         stats.wallrun, stats.wallParts = 0, 0   -- siehe 4d: bewusst ausgeschlossen
-        stats.zip, stats.pad = buildHelpers(nodes, grid, bb, cell, mapRoot, prof)
+        stats.zip, stats.pad, stats.rail = buildHelpers(nodes, grid, bb, cell, mapRoot, prof)
     
         NAV.graph = { nodes = nodes, grid = grid, cell = cell, bb = bb,
                       prof = prof, map = mapRoot.Name, stats = stats }
@@ -1731,7 +1775,8 @@ do
     -- Knoten eine Zeile "x,y,z>ziel:art:kosten,..." mit einem Buchstaben je
     -- Kantenart — das ist rund ein Viertel so gross und laedt deutlich schneller.
     local KIND2CH = { walk="w", hop="h", step="s", jump="j", drop="d",
-                      climb="c", zip="z", pad="p", wallrun="r", roll="o" }
+                      climb="c", zip="z", pad="p", wallrun="r", roll="o",
+                      rail="g" }
     local CH2KIND = {}
     for k, v in pairs(KIND2CH) do CH2KIND[v] = k end
     
@@ -1746,7 +1791,7 @@ do
     
         local lines = string.split(blob, "\n")
         local head = string.split(lines[1] or "", "|")
-        if head[1] ~= "UTGNAV8" then return nil end
+        if head[1] ~= "UTGNAV9" then return nil end
         local cell = tonumber(head[3])
         local bbv = string.split(head[4] or "", ",")
         if not cell or #bbv < 6 then return nil end
@@ -1806,7 +1851,7 @@ do
         -- stueckweise zusammensetzen: ein einzelner String mit Millionen
         -- Verkettungen sprengt den Speicher
         local parts = {
-            ("UTGNAV8|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
+            ("UTGNAV9|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
                 r1(G.bb.min.X), r1(G.bb.min.Y), r1(G.bb.min.Z),
                 r1(G.bb.max.X), r1(G.bb.max.Y), r1(G.bb.max.Z))
         }
@@ -2588,6 +2633,7 @@ local function wpsExact(wps, idx)
     if not w then return false end
     local k = w.kind
     return w.takeoff or k == "climb" or k == "zip" or k == "pad" or k == "via"
+        or k == "rail"
 end
 
 -- liefert die Richtung zum naechsten Wegpunkt (oder nil, wenn kein Pfad taugt).
@@ -3066,6 +3112,19 @@ local function followPath(pos, mode)
             end
             local v = (best.Position - pos) * Vector3.new(1, 0, 1)
             if v.Magnitude > 0.1 then return v.Unit end
+        end
+    end
+
+    -- RAIL (Grindschiene). Der Spielcode startet den Grind, wenn man auf der
+    -- Schiene LANDET — anlaufen allein reicht nicht. Also einmal aufspringen,
+    -- solange dieser Wegpunkt gilt, und dabei Tempo behalten (die Schiene
+    -- lebt vom Schwung, gebremst wird hier bewusst nicht).
+    if wp.kind == "rail" then
+        local humR = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+        local grounded = humR and humR.FloorMaterial ~= Enum.Material.Air
+        if grounded and tick() - (AP.railJumpAt or 0) > 1.0 then
+            AP.railJumpAt = tick()
+            tryJump(true)
         end
     end
 
