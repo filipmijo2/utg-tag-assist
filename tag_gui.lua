@@ -4585,17 +4585,19 @@ function ENV.reloadSounds()
         end
     end
 
-    -- RANGFOLGE STATT MISCHEN. Wer eine Liste pflegt, will genau die hoeren
-    -- und nicht zusaetzlich zwoelf mitgelieferte dazwischen. Es gewinnt die
-    -- erste Quelle, die ueberhaupt etwas liefert:
-    --   1. geteilte Liste auf GitHub   (gemeinsam gepflegt, hat Vorrang)
-    --   2. eigene Dateien / eigene IDs auf der Platte
+    -- RANGFOLGE STATT MISCHEN. Es gewinnt die erste Quelle, die etwas
+    -- liefert — und das sind die EIGENEN DATEIEN im Ordner utg_sounds.
+    -- Grund: dieselben Dateien gehen auch in den Voicechat. Nur so hoeren
+    -- alle dasselbe; eine Roblox-Asset-ID kann das Begleitprogramm nicht
+    -- abspielen, die kennt nur Roblox.
+    --   1. eigene Dateien im Ordner   (gilt auch im Voicechat)
+    --   2. geteilte Liste auf GitHub  (nur im Spiel hoerbar)
     --   3. die mitgelieferten Spiel-Sounds als Rueckfall
-    local web = fetchWebSounds(false)
+    local web = (#entries == 0) and fetchWebSounds(false) or {}
     local nWeb, nDef = 0, 0
-    if #web > 0 then
-        entries = {}
-        nFile, nId = 0, 0
+    if #entries > 0 then
+        -- Dateien gefunden: dabei bleibt es
+    elseif #web > 0 then
         for _, e in ipairs(web) do
             entries[#entries + 1] = { id = "rbxassetid://" .. e.id, name = e.name }
             nWeb = nWeb + 1
