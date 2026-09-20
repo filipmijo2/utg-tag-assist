@@ -7110,6 +7110,14 @@ local function assistStep(dt)
         if sp > wantSpeed then wantSpeed, wantAccel = sp, lerp(1, p.escAccel, f) end
     end
 
+    -- OHNE AYIP UND OHNE NAHEN VERFOLGER: hoechstens +7 Prozent.
+    -- Tempo faellt vor allem dann auf, wenn gar kein Grund dafuer zu sehen
+    -- ist — laeuft niemand in der Naehe, wirkt ein schneller Laeufer sofort
+    -- verdaechtig. Nah dran bleibt die volle Rampe, da rettet sie den Fang.
+    if (CFG.ayip or 0) == 0 and (not threatD or threatD > 25) then
+        wantSpeed = math.min(wantSpeed, 1.07)
+    end
+
     -- GEGENSEITIGE MODI (FFA Royal, Slasher, Team): dort ist man gleichzeitig
     -- Jaeger und Gejagter, also greifen Flucht- und Jagdboost abwechselnd und
     -- praktisch dauerhaft. Genau dort faellt Tempo am meisten auf, weil alle
