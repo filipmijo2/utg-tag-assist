@@ -53,9 +53,11 @@ local CFG = {
     preset      = 3,       -- fest auf Maximum (kein Umschalten mehr)
     -- Sound nach einer gelungenen Finte (rein lokal, siehe Abschnitt 5c)
     jukeSound   = false,
-    -- zusaetzlich ueber das virtuelle Mikrofon in den Voicechat geben
-    -- (braucht das Begleitprogramm utg_vc_player.py)
-    jukeSoundVC = true,
+    -- Die beiden Wege sind getrennt schaltbar: der eine spielt den Sound
+    -- im Spiel (nur man selbst hoert ihn), der andere schickt ihn ueber das
+    -- virtuelle Mikrofon in den Voicechat (nur die anderen hoeren ihn).
+    jukeSoundSelf = true,   -- selbst mithoeren
+    jukeSoundVC = true,     -- braucht das Begleitprogramm utg_vc_player.py
     -- volle Lautstaerke: der Sound soll den Moment markieren, und er laeuft
     -- ohnehin nur beim eigenen Spieler
     jukeSoundVol = 1.0,
@@ -1958,6 +1960,7 @@ local function saveSettings()
             ayip = CFG.ayip or 0,
             jukeSound = CFG.jukeSound and true or false,
             jukeSoundVC = CFG.jukeSoundVC and true or false,
+            jukeSoundSelf = CFG.jukeSoundSelf and true or false,
             jukeSoundVol = CFG.jukeSoundVol or 1.0,
             -- 3rd Person wird BEWUSST nicht gesichert: der Modus haengt die
             -- Kamera hinter den Charakter, und wer ihn einmal versehentlich
@@ -1977,6 +1980,7 @@ do
             if type(d.ayip) == "number" then CFG.ayip = math.clamp(d.ayip, 0, 3) end
             if d.jukeSound ~= nil then CFG.jukeSound = d.jukeSound end
             if d.jukeSoundVC ~= nil then CFG.jukeSoundVC = d.jukeSoundVC end
+            if d.jukeSoundSelf ~= nil then CFG.jukeSoundSelf = d.jukeSoundSelf end
             if type(d.jukeSoundVol) == "number" then
                 CFG.jukeSoundVol = math.clamp(d.jukeSoundVol, 0, 2)
             end
@@ -4657,15 +4661,20 @@ local function playJukeSound()
     if #SND.list == 0 then return end
     local s = SND.list[math.random(1, #SND.list)]
     if not s or not s.Parent then return end
-    pcall(function()
-        s.Volume = jukeVolume()
-        s.TimePosition = 0
-        s:Play()
-    end)
-    -- nach zwei Sekunden hart abschneiden, egal wie lang die Datei ist
-    task.delay(JUKE_SOUND_MAX, function()
-        if s and s.Parent and s.IsPlaying then pcall(function() s:Stop() end) end
-    end)
+    -- SELBST MITHOEREN ist ein eigener Schalter: wer den Sound nur nach
+    -- draussen schicken will, soll ihn sich nicht selbst ins Ohr setzen —
+    -- und umgekehrt.
+    if CFG.jukeSoundSelf then
+        pcall(function()
+            s.Volume = jukeVolume()
+            s.TimePosition = 0
+            s:Play()
+        end)
+        -- nach zwei Sekunden hart abschneiden, egal wie lang die Datei ist
+        task.delay(JUKE_SOUND_MAX, function()
+            if s and s.Parent and s.IsPlaying then pcall(function() s:Stop() end) end
+        end)
+    end
     SND.lastName = s.Name
     -- und nach draussen: das Begleitprogramm spielt dieselbe Gelegenheit
     -- auf das virtuelle Mikrofon, damit die anderen es auch hoeren
@@ -7169,6 +7178,24 @@ local _, rSnd = makeButton("Finten-Sound", function() return CFG.jukeSound end,
                     .. "Ordner 'utg_sounds' legen oder Asset-IDs zeilenweise in "
                     .. "'utg_sounds.txt' schreiben")
             end
+        end
+        if ENV.saveSettings then ENV.saveSettings() end
+    end)
+
+local _, rSelf = makeButton("   ... selbst mithoeren",
+    function() return CFG.jukeSoundSelf end,
+    function()
+        CFG.jukeSoundSelf = not CFG.jukeSoundSelf
+        if ENV.saveSettings then ENV.saveSettings() end
+    end)
+
+local _, rVC = makeButton("   ... in den Voicechat",
+    function() return CFG.jukeSoundVC end,
+    function()
+        CFG.jukeSoundVC = not CFG.jukeSoundVC
+        if CFG.jukeSoundVC and not ENV.vcAlive() then
+            LOG("Voicechat-Ausgabe an, aber das Begleitprogramm laeuft nicht "
+                .. "— utg_vc_start.bat starten")
         end
         if ENV.saveSettings then ENV.saveSettings() end
     end)
