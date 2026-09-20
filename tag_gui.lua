@@ -58,9 +58,10 @@ local CFG = {
     -- virtuelle Mikrofon in den Voicechat (nur die anderen hoeren ihn).
     jukeSoundSelf = true,   -- selbst mithoeren
     jukeSoundVC = true,     -- braucht das Begleitprogramm utg_vc_player.py
-    -- volle Lautstaerke: der Sound soll den Moment markieren, und er laeuft
-    -- ohnehin nur beim eigenen Spieler
-    jukeSoundVol = 1.0,
+    -- Deutlich ueber voll: der Sound soll den Moment markieren und sich
+    -- gegen den Spielton durchsetzen. Er laeuft ohnehin nur beim eigenen
+    -- Spieler, und Roblox laesst Volume bis 10 zu.
+    jukeSoundVol = 1.6,
 }
 
 -- Die frueheren Einzelschalter haengen jetzt alle am Autopilot-Schalter.
@@ -1961,7 +1962,7 @@ local function saveSettings()
             jukeSound = CFG.jukeSound and true or false,
             jukeSoundVC = CFG.jukeSoundVC and true or false,
             jukeSoundSelf = CFG.jukeSoundSelf and true or false,
-            jukeSoundVol = CFG.jukeSoundVol or 1.0,
+            jukeSoundVol = CFG.jukeSoundVol or 1.6,
             -- 3rd Person wird BEWUSST nicht gesichert: der Modus haengt die
             -- Kamera hinter den Charakter, und wer ihn einmal versehentlich
             -- anhatte, bekam ihn bei jeder Injektion zurueck, ohne die
@@ -4515,13 +4516,15 @@ end
 -- laesst Volume bis 10 zu, also wird gegengerechnet: die Finte soll
 -- unabhaengig vom Regler des Spiels gleich laut sein.
 local function jukeVolume()
-    local want = CFG.jukeSoundVol or 1.0
+    local want = CFG.jukeSoundVol or 1.6
     local master = 1
     pcall(function()
         master = UserSettings():GetService("UserGameSettings").MasterVolume or 1
     end)
     if master < 0.02 then master = 0.02 end
-    return math.clamp(want / master, want, 6)
+    -- Deckel auf 10, dem Hoechstwert von Roblox: bei einer
+    -- Gesamtlautstaerke von 20 Prozent braucht es den auch.
+    return math.clamp(want / master, want, 10)
 end
 ENV.jukeVolume = jukeVolume
 
