@@ -159,6 +159,119 @@ end
 pcall(function() writefile(LOGFILE, "=== UTG Tag Assist gestartet " .. os.date("%d.%m. %H:%M:%S") .. " ===\n") end)
 
 ------------------------------------------------------------------
+-- 2b) DAUER-DIAGNOSE
+--     Laeuft immer mit und misst die beiden Fehlerbilder, die sich im
+--     Spiel schlecht beobachten lassen:
+--       1. UEBERSCHIESSEN — wie weit faehrt der Bot ueber einen Wegpunkt
+--          hinaus, mit welchem Tempo und wie schief lief er ihn an?
+--       2. LEITERN — wie nah kam er an den Truss, hat das Spiel
+--          touchingTruss gesetzt, wie viel Hoehe kam dabei heraus?
+--     Geschrieben wird gepuffert in utg_diag.txt (nie pro Ereignis), die
+--     Datei bleibt auf die letzten 600 Zeilen begrenzt. Auswertung ueber
+--     ENV.diag() — die Zusammenfassung landet auch in der Datei.
+------------------------------------------------------------------
+local DIAGFILE = "utg_diag.txt"
+local DIAG = {
+    on = true,
+    ring = {},         -- letzte Zeilen, Ringpuffer
+    dirty = false, lastWrite = 0,
+    stat = {},         -- Zaehler und Mittelwerte je Ereignisart
+    wp = nil,          -- laufende Messung am aktuellen Wegpunkt
+    lad = nil,         -- laufende Messung an einer Leiter
+}
+local DIAG_MAX = 600
+
+local function diagStat(kind)
+    local s = DIAG.stat[kind]
+    if not s then s = { n = 0 } DIAG.stat[kind] = s end
+    return s
+end
+
+-- Mittelwert und Maximum einer Groesse mitfuehren
+local function diagVal(kind, key, v)
+    local s = diagStat(kind)
+    s[key .. "_sum"] = (s[key .. "_sum"] or 0) + v
+    s[key .. "_n"] = (s[key .. "_n"] or 0) + 1
+    if not s[key .. "_max"] or v > s[key .. "_max"] then s[key .. "_max"] = v end
+end
+
+local function diagLine(kind, fmt, ...)
+    if not DIAG.on then return end
+    diagStat(kind).n = diagStat(kind).n + 1
+    local ok, txt = pcall(string.format, fmt, ...)
+    local line = os.date("%H:%M:%S ") .. kind .. "  " .. (ok and txt or "?")
+    DIAG.ring[#DIAG.ring + 1] = line
+    if #DIAG.ring > DIAG_MAX then table.remove(DIAG.ring, 1) end
+    DIAG.dirty = true
+end
+
+-- Ganze Datei neu schreiben statt anzuhaengen: so bleibt sie klein und es
+-- gibt keinen Lesevorgang ueber eine wachsende Datei.
+local function diagFlush(force)
+    if not DIAG.dirty or type(writefile) ~= "function" then return end
+    local now = tick()
+    if not force and now - DIAG.lastWrite < 3 then return end
+    DIAG.lastWrite, DIAG.dirty = now, false
+    pcall(writefile, DIAGFILE, table.concat(DIAG.ring, "\n") .. "\n")
+end
+
+local function diagAvgTxt(kind, key, unit)
+    local s = DIAG.stat[kind]
+    if not s or not s[key .. "_n"] or s[key .. "_n"] == 0 then return "-" end
+    return ("%.1f%s (max %.1f)"):format(s[key .. "_sum"] / s[key .. "_n"],
+                                        unit or "", s[key .. "_max"] or 0)
+end
+
+function ENV.diag()
+    local out = { "=== DIAGNOSE " .. os.date("%H:%M:%S") .. " ===" }
+    local order = { "wegpunkt", "ueberschossen", "leiter_ok", "leiter_daneben",
+                    "leiter_abbruch" }
+    local seen = {}
+    local function row(k)
+        local s = DIAG.stat[k]
+        if not s or seen[k] then return end
+        seen[k] = true
+        out[#out + 1] = ("%-16s n=%d"):format(k, s.n)
+    end
+    for _, k in ipairs(order) do row(k) end
+    for k in pairs(DIAG.stat) do row(k) end
+    local wp = DIAG.stat.wegpunkt
+    if wp and (wp.n or 0) > 0 then
+        out[#out + 1] = "-- Wegpunkte --"
+        out[#out + 1] = "  dichteste Annaeherung  " .. diagAvgTxt("wegpunkt", "min", " Studs")
+        out[#out + 1] = "  Ueberschuss danach     " .. diagAvgTxt("wegpunkt", "over", " Studs")
+        out[#out + 1] = "  seitlicher Versatz     " .. diagAvgTxt("wegpunkt", "side", " Studs")
+        out[#out + 1] = "  Tempo am Punkt         " .. diagAvgTxt("wegpunkt", "spd", " Studs/s")
+    end
+    local lo, ld = DIAG.stat.leiter_ok, DIAG.stat.leiter_daneben
+    if (lo and lo.n or 0) + (ld and ld.n or 0) > 0 then
+        out[#out + 1] = "-- Leitern --"
+        out[#out + 1] = ("  geklettert %d, danebengelaufen %d, abgebrochen %d")
+            :format(lo and lo.n or 0, ld and ld.n or 0,
+                    (DIAG.stat.leiter_abbruch or {}).n or 0)
+        out[#out + 1] = "  dichteste Annaeherung  " .. diagAvgTxt("leiter_daneben", "min", " Studs")
+        out[#out + 1] = "  Tempo dabei            " .. diagAvgTxt("leiter_daneben", "spd", " Studs/s")
+        out[#out + 1] = "  Tempo beim Greifen     " .. diagAvgTxt("leiter_ok", "spd", " Studs/s")
+    end
+    out[#out + 1] = "-- letzte Ereignisse --"
+    for i = math.max(1, #DIAG.ring - 25), #DIAG.ring do
+        out[#out + 1] = "  " .. DIAG.ring[i]
+    end
+    local txt = table.concat(out, "\n")
+    DIAG.ring[#DIAG.ring + 1] = txt
+    DIAG.dirty = true
+    diagFlush(true)
+    return txt
+end
+
+function ENV.diagReset()
+    DIAG.stat, DIAG.ring, DIAG.wp, DIAG.lad = {}, {}, nil, nil
+    DIAG.dirty = true
+    diagFlush(true)
+    return "Diagnose zurueckgesetzt"
+end
+
+------------------------------------------------------------------
 -- 3) Rollen-Logik: wer darf wen taggen?
 ------------------------------------------------------------------
 local function myRole()
@@ -2314,6 +2427,136 @@ local function jumpProfile()
     return g, vy
 end
 
+-- Eine Leitermessung abschliessen und einordnen.
+local function diagCloseLadder()
+    local l = DIAG.lad
+    DIAG.lad = nil
+    if not l or not DIAG.on then return end
+    local kind = (l.climbing or (l.gain or 0) > 3) and "leiter_ok" or "leiter_daneben"
+    diagVal(kind, "min", l.min)
+    diagVal(kind, "spd", l.spdMin or 0)
+    diagLine(kind,
+        "Abstand %.1f, Tempo dabei %.0f, touchingTruss=%s, Hoehe %+.0f, %.1fs, %s",
+        l.min, l.spdMin or 0, tostring(l.touched), l.gain or 0,
+        tick() - l.t0, l.loose and "weiche Steuerung" or "harter Weg")
+end
+
+-- Eine Wegpunktmessung abschliessen.
+local function diagCloseWaypoint(why)
+    local w = DIAG.wp
+    DIAG.wp = nil
+    if not w or not DIAG.on then return end
+    why = why or "?"
+    -- Respawn, Rundenwechsel oder Teleport setzen den Charakter irgendwohin.
+    -- Solche Spruenge sind kein Fahrfehler und wuerden jeden Schnitt
+    -- unbrauchbar machen (gemessen einmal 1881 Studs "Ueberschuss").
+    if (w.over or 0) > 60 or (w.min or 0) > 200 then
+        diagStat("sprung_verworfen").n = diagStat("sprung_verworfen").n + 1
+        return
+    end
+    diagStat("wegpunkt").n = diagStat("wegpunkt").n + 1
+    diagStat("grund_" .. why).n = diagStat("grund_" .. why).n + 1
+    diagStat("modus_" .. tostring(w.mode)).n =
+        diagStat("modus_" .. tostring(w.mode)).n + 1
+    diagVal("modus_" .. tostring(w.mode), "min", w.min)
+    diagVal("wegpunkt", "min", w.min)
+    diagVal("wegpunkt", "over", w.over)
+    diagVal("wegpunkt", "side", w.side)
+    diagVal("wegpunkt", "spd", w.spdMin or 0)
+    -- Ueberschiessen: er war schon dicht dran und hat sich dann wieder
+    -- entfernt, obwohl derselbe Wegpunkt noch galt.
+    -- Nur echtes Ueberschiessen melden: er war dicht dran (unter 4 Studs)
+    -- und hat sich dann wieder entfernt. Ein Wegpunkt, der nie nah war, ist
+    -- ein anderes Problem und wird getrennt gezaehlt.
+    if w.over > 3 and w.min < 4 then
+        diagLine("ueberschossen",
+            "Art %s: %.1f Studs drueber (dichteste %.1f, seitlich %.1f, "
+            .. "Tempo %.0f, Anlauf %.0f, %.1fs, Ende: %s)",
+            w.kind, w.over, w.min, w.side, w.spdMin or 0, w.d0, tick() - w.t0, why)
+    elseif w.min > 6 and why ~= "neuer_weg" then
+        diagStat("nah_" .. tostring(w.mode)).n = diagStat("nah_" .. tostring(w.mode)).n + 1
+        diagLine("nie_nah_dran",
+            "Art %s: dichteste %.1f (seitlich %.1f, Tempo %.0f, Anlauf %.0f, "
+            .. "%.1fs, Ende: %s)",
+            w.kind, w.min, w.side, w.spdMin or 0, w.d0, tick() - w.t0, why)
+    end
+end
+
+-- Laeuft in jedem Frame mit einem gueltigen Wegpunkt.
+local function diagTick(pos, wps, idx, wp)
+    if not DIAG.on then return end
+    local hrpD = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+    local spd = hrpD and (hrpD.AssemblyLinearVelocity * Vector3.new(1, 0, 1)).Magnitude or 0
+    local flat = ((wp.Position - pos) * Vector3.new(1, 0, 1)).Magnitude
+
+    local w = DIAG.wp
+    if w and (w.idx ~= idx or w.wps ~= wps) then
+        -- Eine Neuberechnung tauscht die ganze Wegpunktliste aus; das ist
+        -- kein Ueberschiessen, sondern ein neuer Weg.
+        diagCloseWaypoint(w.wps ~= wps and "neuer_weg" or PATH.reason)
+        w = nil
+    end
+    if not w then
+        w = { idx = idx, kind = tostring(wp.kind), d0 = flat, t0 = tick(),
+              min = flat, over = 0, side = 0, spdMin = spd, wps = wps,
+              mode = tostring(AP.mode) }
+        if idx > 1 and wps[idx - 1] then
+            w.seg = (wp.Position - wps[idx - 1].Position) * Vector3.new(1, 0, 1)
+        end
+        DIAG.wp = w
+    end
+    if flat < w.min then
+        w.min, w.spdMin, w.over = flat, spd, 0
+        -- seitlicher Versatz zur Sollinie im dichtesten Moment: zeigt, ob er
+        -- den Punkt verfehlt, weil er neben der Linie laeuft
+        if w.seg and w.seg.Magnitude > 0.1 then
+            local u = w.seg.Unit
+            local rel = (pos - wp.Position) * Vector3.new(1, 0, 1)
+            w.side = (rel - u * rel:Dot(u)).Magnitude
+        end
+    else
+        local o = flat - w.min
+        if o > w.over then w.over = o end
+    end
+
+    -- Leitern gesondert: hier zaehlt, ob das Spiel den Truss ueberhaupt
+    -- erkannt hat (shared.touchingTruss) und mit welchem Tempo er ankam.
+    if wp.kind == "climb" then
+        local lad = AP.ladder
+        local l = DIAG.lad
+        if lad and lad.Parent
+           and ((lad.Position - pos) * Vector3.new(1, 0, 1)).Magnitude < 25
+           and (not l or l.part ~= lad) then
+            diagCloseLadder()
+            l = { part = lad, t0 = tick(), y0 = pos.Y, min = 1e9, spdMin = 0,
+                  touched = false, climbing = false, gain = 0,
+                  loose = AP.pathLoose and true or false }
+            DIAG.lad = l
+        end
+        if l and l.part and l.part.Parent then
+            local d = ((l.part.Position - pos) * Vector3.new(1, 0, 1)).Magnitude
+            if d < l.min then l.min, l.spdMin = d, spd end
+            if RENV.shared.touchingTruss then l.touched = true end
+            local humD = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+            if humD and humD:GetState() == Enum.HumanoidStateType.Climbing then
+                l.climbing = true
+            end
+            l.gain = pos.Y - l.y0
+        end
+    elseif DIAG.lad then
+        diagCloseLadder()
+    end
+end
+
+-- Punkte, an denen die Position wirklich stimmen muss: dort greift eine
+-- Spielmechanik (Truss, Zipline, Trampolin) oder es geht durch eine Tuer.
+local function wpsExact(wps, idx)
+    local w = wps and wps[idx]
+    if not w then return false end
+    local k = w.kind
+    return w.takeoff or k == "climb" or k == "zip" or k == "pad" or k == "via"
+end
+
 -- liefert die Richtung zum naechsten Wegpunkt (oder nil, wenn kein Pfad taugt).
 -- "mode" entscheidet ueber die Strenge: beim Weglaufen ist der Weg nur eine
 -- Richtung, beim Jagen ein Ziel.
@@ -2323,6 +2566,8 @@ local function followPath(pos, mode)
         -- kein Weg mehr, also auch kein laufender Sprung: der Flugzustand
         -- sperrt sonst dauerhaft Ausweichen und Finten
         PATH.air, AP.inAir, AP.pathLoose, PATH.prog = nil, false, false, nil
+        if DIAG.wp then diagCloseWaypoint("weg_weg") end
+        if DIAG.lad then diagCloseLadder() end
         return nil
     end
 
@@ -2396,7 +2641,18 @@ local function followPath(pos, mode)
     -- kostet genau das, was die Flucht gewinnen soll. Beim Jagen zaehlt
     -- dagegen der genaue Punkt, dort bleibt alles wie es war.
     local flee = (mode == "FLUCHT")
-    local tightR   = flee and 6.0 or 3.0    -- Annahmeradius
+    -- ABER: Leiter, Zipline und Trampolin muessen auch auf der Flucht genau
+    -- getroffen werden — ein Annahmeradius von 6 Studs haekt die Leiter ab,
+    -- waehrend der Bot noch daneben steht. Gemessen wurde genau das: 39 % der
+    -- Wegpunkte hatten als dichteste Annaeherung 6.0 bis 6.5 Studs, Grund
+    -- "radius". Fuer gewoehnliche Gehpunkte bleibt es locker.
+    -- Grundwerte; je Wegpunkt wird unten nachgeschaerft, sobald ein genauer
+    -- Punkt drankommt (Leiter, Zipline, Trampolin, Durchgang, Absprung).
+    -- 6.0 war zu grosszuegig: gemessen kam der Bot bei 63 % der Wegpunkte im
+    -- Fluchtmodus nie naeher als 6 Studs heran, der Weg wurde faktisch nur
+    -- gestreift. 4.5 bleibt lockerer als beim Jagen (3.0), haelt ihn aber
+    -- auf der Spur.
+    local tightR   = flee and 4.5 or 3.0
     local passR    = flee and 14 or 7.2     -- "schon vorbei" gilt bis hierhin
     local upTol    = flee and 4.0 or 2.5    -- wie hoch der Punkt liegen darf
     local advMax   = flee and 4 or 2        -- Wegpunkte pro Frame
@@ -2405,7 +2661,11 @@ local function followPath(pos, mode)
         local wp = wps[PATH.idx]
         local flat = (wp.Position - pos) * Vector3.new(1, 0, 1)
         local dy = math.abs(wp.Position.Y - pos.Y)
-        local reached
+        local reached, reachedWhy
+        -- Genaue Punkte bleiben eng, auch beim Weglaufen
+        local exactHere = wpsExact(wps, PATH.idx)
+        local tightNow = exactHere and 3.0 or tightR
+        local passNow  = exactHere and 7.2 or passR
         if wp.takeoff then
             -- EIN ABSPRUNGPUNKT WIRD NUR DURCH DEN SPRUNG SELBST ERLEDIGT.
             -- Sonst gewinnt das normale Abhaken (Radius 3.0) das Rennen gegen
@@ -2474,6 +2734,7 @@ local function followPath(pos, mode)
                 end
                 if not reached and flat.Magnitude < 1.4 and heightOk then
                     reached = true
+                    reachedWhy = "via_radius"
                 end
                 -- Ventil: ein Durchgang, der nach ueber einer Sekunde immer
                 -- noch nicht passiert ist, wird nicht getroffen — bei 32
@@ -2483,24 +2744,31 @@ local function followPath(pos, mode)
                 if not reached and flat.Magnitude < 5 and heightOk
                    and now - (PATH.idxAt or now) > 1.2 then
                     reached = true
+                    reachedWhy = "via_ventil"
                 end
             else
-                reached = flat.Magnitude < tightR and heightOk
+                reached = flat.Magnitude < tightNow and heightOk
             -- (Ein eigenes Ventil fuer Durchgaenge stand hier mit 0.6 s und
             --  war toter Code: der allgemeine Notausgang unten greift schon
             --  bei 0.5 s und deckt denselben Fall ab.)
             -- oder schon daran vorbei: hinter der Ebene senkrecht zum Wegstueck
-            if not reached and PATH.idx > 1 and flat.Magnitude < passR and heightOk then
+            if not reached and PATH.idx > 1 and flat.Magnitude < passNow and heightOk then
                 local seg = (wp.Position - wps[PATH.idx - 1].Position) * Vector3.new(1, 0, 1)
-                if seg.Magnitude > 0.1 and seg.Unit:Dot(-flat) > 0 then reached = true end
+                if seg.Magnitude > 0.1 and seg.Unit:Dot(-flat) > 0 then
+                    reached = true
+                    reachedWhy = "vorbeigelaufen"
+                end
             end
             -- NIE UMDREHEN, UM EINEN PUNKT NACHZUHOLEN. Beim Weglaufen gilt
             -- ein Wegpunkt, der hinter dem Bot liegt, ohne Abstandsgrenze als
             -- erledigt — auch wenn er ihn um zehn Studs verfehlt hat. Kehrt
             -- machen heisst dem Verfolger entgegenlaufen.
-            if not reached and flee and PATH.idx > 1 then
+            if not reached and flee and not exactHere and PATH.idx > 1 then
                 local seg = (wp.Position - wps[PATH.idx - 1].Position) * Vector3.new(1, 0, 1)
-                if seg.Magnitude > 0.1 and seg.Unit:Dot(-flat) > 0 then reached = true end
+                if seg.Magnitude > 0.1 and seg.Unit:Dot(-flat) > 0 then
+                    reached = true
+                    reachedWhy = "hinter_mir_flucht"
+                end
             end
             end
             -- Notausgang: haengt er eine halbe Sekunde am selben Punkt und
@@ -2522,12 +2790,14 @@ local function followPath(pos, mode)
                     return nil
                 end
                 reached = true
+                reachedWhy = "notausgang"
             end
         end
         if not reached then break end
         PATH.idx = PATH.idx + 1
         PATH.idxAt = now
         advanced = advanced + 1
+        PATH.reason = reachedWhy or "radius"
     end
     if not PATH.idxAt then PATH.idxAt = now end
     if PATH.idx > #wps then PATH.wps = nil return nil end
@@ -2574,6 +2844,7 @@ local function followPath(pos, mode)
     if AP.jukeName or tick() < (AP.manualUntil or 0) then
         pr.at, pr.t0 = now, now
     end
+    diagTick(pos, wps, PATH.idx, wp)
     local stuckFor = now - pr.at
     local overdue = now - pr.t0 - pr.budget       -- wie lange ueberfaellig
     -- BEIM WEGLAUFEN GRUNDSAETZLICH WEICH. Der Weg liefert dort nur die
@@ -2584,6 +2855,11 @@ local function followPath(pos, mode)
     -- Sonst: ueberfaellig ODER ohne Annaeherung. Zurueck auf hart geht es von
     -- selbst, sobald wieder ein Wegpunkt abgehakt ist — dann ist pr neu.
     AP.pathLoose = flee or (overdue > 0) or (stuckFor > 0.9)
+    -- An einem genauen Punkt hat der Folger das letzte Wort. Sonst waehlt die
+    -- freie Nahbereichssteuerung die "offenste" Richtung — und eine Leiter
+    -- ist fuer sie ein Hindernis, von dem sie wegsteuert. Genau so entstand
+    -- das seitliche Vorbeifliegen an Leitern.
+    AP.pathExact = wpsExact(wps, PATH.idx)
 
     -- WIEDER IN DEN WEG EINSTEIGEN. Faehrt die Nahbereichssteuerung, landet
     -- der Bot oft neben dem verpassten Punkt, aber laengst auf Hoehe eines
@@ -2607,6 +2883,7 @@ local function followPath(pos, mode)
             if w2.takeoff then break end
         end
         if jumpTo then
+            PATH.reason = "wiedereinstieg"
             PATH.idx, PATH.idxAt, PATH.prog = jumpTo, now, nil
             wp = wps[jumpTo]
             flatNow = ((wp.Position - pos) * Vector3.new(1, 0, 1)).Magnitude
@@ -2634,6 +2911,7 @@ local function followPath(pos, mode)
             failNote("wegpunkt_uebersprungen",
                 ("Art %s, %.1f s ueberfaellig, %.1f s ohne Annaeherung (%.0f Studs)")
                     :format(tostring(wp.kind), math.max(overdue, 0), stuckFor, flatNow))
+            PATH.reason = "uebersprungen"
             PATH.idx = PATH.idx + 1
             PATH.idxAt, PATH.prog = now, nil
             wp = wps[PATH.idx]
@@ -3083,7 +3361,7 @@ local function pickDirection(pos, goalDir, curVel)
     -- dieselbe Nahbereichssteuerung wie beim Weglaufen: Wandgleiten und Wahl
     -- der offensten Richtung. Genau das fehlte, als er vor einem Durchgang
     -- Kreise drehte, obwohl daneben alles frei war.
-    local onPath = AP.usingPath and not AP.pathLoose
+    local onPath = AP.usingPath and (AP.pathExact or not AP.pathLoose)
     local blockHit = (not onPath)
         and workspace:Raycast(pos + up, goalDir * 6, AP.rp) or nil
     if not blockHit and not onPath then
@@ -5769,20 +6047,32 @@ local function assistStep(dt)
         -- heisst das: der Autopilot bewegt den Charakter gar nicht mehr.
         local hrpS = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
         local posS = hrpS and hrpS.Position
-        -- Nicht bremsen, solange der Weg nur ein Vorschlag ist (Weglaufen,
-        -- oder Folger haengt): dort wird kein Punkt genau getroffen, das
-        -- Abbremsen waere reiner Tempoverlust vor dem Verfolger.
-        local pw = (not AP.pathLoose) and PATH.wps and PATH.wps[PATH.idx] or nil
+        -- VOR GENAUEN PUNKTEN WIRD GEBREMST — AUCH BEIM WEGLAUFEN.
+        -- Gemessen an 9 Leiteranlaeufen: in allen Fehlversuchen kam er mit
+        -- 32 bis 35 Studs/s an, blieb 0.0 bis 0.4 s im Greifbereich und
+        -- shared.touchingTruss wurde kein einziges Mal gesetzt. Der eine
+        -- saubere Aufstieg lief mit 14 Studs/s. Das Spiel prueft den Truss
+        -- mit einem Strahl aus der Blickrichtung auf 6 Studs — bei 34
+        -- Studs/s ist dieses Fenster in 90 Millisekunden durchquert.
+        -- Der Tempoverlust vor dem Verfolger ist der Preis dafuer, dass die
+        -- Leiter ueberhaupt genommen wird; oben ist man ohnehin sicherer.
+        local pw = PATH.wps and PATH.wps[PATH.idx] or nil
         if pw and posS then
             local k = pw.kind
-            -- "jump" ist hier bewusst NICHT mehr dabei. Die Sprungkante
-            -- braucht das volle Tempo: der Bogen ist beim Backen mit
-            -- prof.speed (32) geplant worden, mit 45 % Tempo traegt er
-            -- statt 25 nur noch 11 Studs weit — das war der zweite Grund
-            -- fuer die verpatzten Jump-and-Run-Strecken.
+            -- "jump" ist hier bewusst NICHT dabei. Die Sprungkante braucht
+            -- das volle Tempo: der Bogen ist mit prof.speed (32) geplant,
+            -- mit halbem Tempo traegt er statt 25 nur noch 11 Studs weit.
             if pw.takeoff then
                 -- Absprung: gar keine Bremse, sondern Vollgas.
-            elseif k == "climb" or k == "zip" or k == "pad" or k == "via" then
+            elseif k == "climb" then
+                -- Leitern besonders frueh und deutlich: ab 16 Studs
+                -- herunterregeln, im Greifbereich auf gut ein Drittel.
+                local d = ((pw.Position - posS) * Vector3.new(1, 0, 1)).Magnitude
+                if d < 16 then
+                    wantSpeed = math.min(wantSpeed, math.clamp(d / 16, 0.36, 1))
+                    wantAccel = math.min(wantAccel, 1.1)
+                end
+            elseif k == "zip" or k == "pad" or k == "via" then
                 local d = ((pw.Position - posS) * Vector3.new(1, 0, 1)).Magnitude
                 if d < 14 then
                     -- weich herunterregeln statt abrupt bremsen
@@ -6486,6 +6776,7 @@ end)
 conns[#conns + 1] = RunService.Heartbeat:Connect(function()
     traceSample()
     flushLog(false)
+    diagFlush(false)
 end)
 
 -- War der Finten-Sound beim letzten Mal an, gleich die Sounds einlesen —
