@@ -1,0 +1,33 @@
+# GETEILTE SOUNDLISTE — Finten-Sounds fuer UTG Tag Assist
+#
+# Hier einfach reinschreiben, eine Zeile je Sound. Das Skript liest die
+# Datei bei jedem Start direkt von GitHub, ihr muesst nichts neu laden
+# und nichts installieren.
+#
+# ERLAUBT IST ALLES DAVON — Link oder nackte Nummer, egal:
+#   123456789
+#   rbxassetid://123456789
+#   https://www.roblox.com/library/123456789/Irgendein-Sound
+#   https://create.roblox.com/store/asset/123456789/Irgendein-Sound
+#
+# Hinter der Nummer darf stehen was will, zum Beispiel ein Name:
+#   9113631914   Knochenbrecher
+#
+# Zeilen mit # oder -- am Anfang werden ignoriert.
+# Kaputte oder geloeschte IDs stoeren nicht, die werden einfach still
+# uebersprungen.
+#
+# ---------------------------------------------------------------------
+
+9113631914        NoTagBackBreak - der Knochenbrecher
+5148302439        bonk
+87343799036402    TrickBoom
+6161421479        Woohoo
+8255306220        crit
+3779096010        buda
+140481958643535   YellowFlash
+6655708496        win2
+3779053277        zoom
+5077617448        waaoom
+7274429332        Fatality
+138251332         Pichuun

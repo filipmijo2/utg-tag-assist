@@ -4417,8 +4417,56 @@ local SOUND_DEFAULTS = {
     { 138251332,       "Pichuun" },          -- 1.4 s
 }
 
+-- GETEILTE LISTE AUF GITHUB. Dort kann jeder mit Schreibrecht Links oder
+-- IDs eintragen — einmal ins Repo geschrieben, haben es alle. Wird bei
+-- jedem Start geholt; faellt GitHub aus, laeuft alles Uebrige weiter.
+local SOUND_URL =
+    "https://raw.githubusercontent.com/filipmijo2/utg-tag-assist/main/sounds.txt"
+
 local SND = { list = {}, folder = "utg_sounds", idFile = "utg_sounds.txt",
-              holder = nil, lastName = nil }
+              holder = nil, lastName = nil, webIds = nil, webAt = 0 }
+
+-- Aus einer Zeile die Asset-Nummer ziehen — egal ob nackte Zahl,
+-- rbxassetid://, roblox.com/library/... oder create.roblox.com/store/asset/...
+local function soundIdFromLine(line)
+    if line:match("^%s*#") or line:match("^%s*//") or line:match("^%s*%-%-") then
+        return nil
+    end
+    -- laengste Ziffernfolge nehmen: in Links steht die ID, danach kommt oft
+    -- noch ein Name mit Zahlen darin
+    local best
+    for num in line:gmatch("%d+") do
+        if #num >= 6 and (not best or #num > #best) then best = num end
+    end
+    return best
+end
+
+-- Liste von GitHub holen (gecacht, damit nicht jede Neuladung ins Netz geht)
+local function fetchWebSounds(force)
+    if SND.webIds and not force and tick() - SND.webAt < 300 then
+        return SND.webIds
+    end
+    local ok, body = pcall(function()
+        -- Zeitstempel gegen den CDN-Cache von GitHub
+        return game:HttpGet(SOUND_URL .. "?t=" .. tostring(os.time()), true)
+    end)
+    if not ok or type(body) ~= "string" or #body < 5 then
+        LOG("Geteilte Soundliste nicht erreichbar — nur lokale Quellen")
+        SND.webIds, SND.webAt = SND.webIds or {}, tick()
+        return SND.webIds
+    end
+    local ids = {}
+    for _, line in ipairs(string.split(body, "\n")) do
+        local id = soundIdFromLine(line)
+        if id then
+            local name = line:match("%d+%s+(.+)$")
+            ids[#ids + 1] = { id = id, name = name and name:sub(1, 24) or id }
+        end
+    end
+    SND.webIds, SND.webAt = ids, tick()
+    return ids
+end
+ENV.fetchWebSounds = fetchWebSounds
 
 local function sndHolder()
     if SND.holder and SND.holder.Parent then return SND.holder end
@@ -4495,7 +4543,14 @@ function ENV.reloadSounds()
         end
     end
 
-    -- Nichts Eigenes gefunden? Dann die mitgelieferten Spiel-Sounds.
+    -- 3) geteilte Liste von GitHub
+    local nWeb = 0
+    for _, e in ipairs(fetchWebSounds(false)) do
+        entries[#entries + 1] = { id = "rbxassetid://" .. e.id, name = e.name }
+        nWeb = nWeb + 1
+    end
+
+    -- Immer noch nichts? Dann die mitgelieferten Spiel-Sounds.
     local nDef = 0
     if #entries == 0 then
         for _, d in ipairs(SOUND_DEFAULTS) do
@@ -4517,7 +4572,7 @@ function ENV.reloadSounds()
         end)
         if not ok then nFile = nFile end
     end
-    return #SND.list, nFile, nId, nDef
+    return #SND.list, nFile, nId, nDef, nWeb
 end
 
 local function playJukeSound()
@@ -7009,11 +7064,13 @@ local _, rSnd = makeButton("Finten-Sound", function() return CFG.jukeSound end,
     function()
         CFG.jukeSound = not CFG.jukeSound
         if CFG.jukeSound then
-            local n, nf, ni, nd = ENV.reloadSounds()
+            fetchWebSounds(true)      -- beim Einschalten die Liste frisch holen
+            local n, nf, ni, nd, nw = ENV.reloadSounds()
             state.sndCount = n
             if n > 0 then
-                LOG(("Finten-Sound an: %d Sounds (%d eigene Dateien, %d eigene IDs, %d mitgeliefert)")
-                    :format(n, nf, ni, nd or 0))
+                LOG(("Finten-Sound an: %d Sounds (%d eigene Dateien, %d eigene IDs, "
+                     .. "%d von GitHub, %d mitgeliefert)")
+                    :format(n, nf, ni, nw or 0, nd or 0))
             else
                 LOG("Finten-Sound an, aber nichts ladbar — eigene mp3/ogg/wav in den "
                     .. "Ordner 'utg_sounds' legen oder Asset-IDs zeilenweise in "
