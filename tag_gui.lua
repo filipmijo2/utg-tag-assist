@@ -4393,6 +4393,28 @@ end
 --     Gewaehlt wird zufaellig; Nachladen ueber den Schalter in der GUI.
 ------------------------------------------------------------------
 local SoundService = game:GetService("SoundService")
+
+-- MITGELIEFERTE SOUNDS. Damit das Feature ohne eine einzige eigene Datei
+-- laeuft — und bei jedem anderen Spieler genauso, der das Skript per
+-- loadstring laedt. Es sind Assets, die DIESES SPIEL selbst benutzt: sie
+-- liegen bei jedem im Cache, laden sofort und koennen nicht verschwinden.
+-- Ausgesucht nach kurz und knackig (0.2 bis 2.1 s), passend zu einer
+-- gelungenen Finte.
+local SOUND_DEFAULTS = {
+    { 9113631914,      "NoTagBackBreak" },   -- 0.8 s, der Knochenbrecher
+    { 5148302439,      "bonk" },             -- 0.4 s
+    { 87343799036402,  "TrickBoom" },        -- 2.1 s
+    { 6161421479,      "Woohoo" },           -- 1.0 s
+    { 8255306220,      "crit" },             -- 1.4 s
+    { 3779096010,      "buda" },             -- 0.2 s
+    { 140481958643535, "YellowFlash" },      -- 0.4 s
+    { 6655708496,      "win2" },             -- 1.1 s
+    { 3779053277,      "zoom" },             -- 0.9 s
+    { 5077617448,      "waaoom" },           -- 1.6 s
+    { 7274429332,      "Fatality" },         -- 2.1 s
+    { 138251332,       "Pichuun" },          -- 1.4 s
+}
+
 local SND = { list = {}, folder = "utg_sounds", idFile = "utg_sounds.txt",
               holder = nil, lastName = nil }
 
@@ -4471,6 +4493,15 @@ function ENV.reloadSounds()
         end
     end
 
+    -- Nichts Eigenes gefunden? Dann die mitgelieferten Spiel-Sounds.
+    local nDef = 0
+    if #entries == 0 then
+        for _, d in ipairs(SOUND_DEFAULTS) do
+            entries[#entries + 1] = { id = "rbxassetid://" .. d[1], name = d[2] }
+            nDef = nDef + 1
+        end
+    end
+
     SND.fp = sndFingerprint()
     local holder = sndHolder()
     for _, e in ipairs(entries) do
@@ -4484,7 +4515,7 @@ function ENV.reloadSounds()
         end)
         if not ok then nFile = nFile end
     end
-    return #SND.list, nFile, nId
+    return #SND.list, nFile, nId, nDef
 end
 
 local function playJukeSound()
@@ -6957,15 +6988,15 @@ local _, rSnd = makeButton("Finten-Sound", function() return CFG.jukeSound end,
     function()
         CFG.jukeSound = not CFG.jukeSound
         if CFG.jukeSound then
-            local n, nf, ni = ENV.reloadSounds()
+            local n, nf, ni, nd = ENV.reloadSounds()
             state.sndCount = n
             if n > 0 then
-                LOG(("Finten-Sound an: %d Sounds (%d Dateien, %d IDs)"):format(n, nf, ni))
+                LOG(("Finten-Sound an: %d Sounds (%d eigene Dateien, %d eigene IDs, %d mitgeliefert)")
+                    :format(n, nf, ni, nd or 0))
             else
-                LOG("Finten-Sound an, aber KEINE Sounds gefunden — mp3/ogg/wav in den "
-                    .. "Executor-Ordner 'utg_sounds' legen oder Asset-IDs "
-                    .. "zeilenweise in 'utg_sounds.txt' schreiben, dann den "
-                    .. "Schalter aus- und wieder einschalten")
+                LOG("Finten-Sound an, aber nichts ladbar — eigene mp3/ogg/wav in den "
+                    .. "Ordner 'utg_sounds' legen oder Asset-IDs zeilenweise in "
+                    .. "'utg_sounds.txt' schreiben")
             end
         end
         if ENV.saveSettings then ENV.saveSettings() end
