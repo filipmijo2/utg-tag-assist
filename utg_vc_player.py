@@ -57,11 +57,24 @@ MAX_SECONDS = 2.0
 
 # Bevorzugte Geraete, in dieser Reihenfolge. Voicemeeter zuerst, weil es das
 # Mikrofon mitmischt -- damit bleibt Sprechen moeglich, waehrend Sounds laufen.
+# VAIO3 zuerst: dessen Gegenstueck heisst "Voicemeeter Out B3" und ist das
+# Aufnahmegeraet, das in Roblox als Mikrofon eingestellt wird. Was hier
+# hineingespielt wird, kommt dort heraus — unabhaengig davon, wohin der
+# Spielton sonst geht.
 PREFERRED = [
+    "Voicemeeter VAIO3 Input",
+    "Voicemeeter AUX Input",
     "Voicemeeter Input (VB-Audio Voicemeeter VAIO)",
-    "Voicemeeter In 1",
     "CABLE Input (VB-Audio Virtual Cable)",
 ]
+
+# Passendes Aufnahmegeraet zum Ausgabegeraet — nur fuer die Selbstpruefung.
+LOOPBACK = {
+    "vaio3": "Voicemeeter Out B3",
+    "aux": "Voicemeeter Out B2",
+    "voicemeeter input": "Voicemeeter Out B1",
+    "cable input": "CABLE Output",
+}
 
 
 def output_devices():
@@ -202,6 +215,44 @@ def check_voicemeeter():
         return None
 
 
+def verify_loopback(dev_name, device, volume):
+    """Spielt einen kurzen Ton und misst gleichzeitig am zugehoerigen
+    Aufnahmegeraet mit. Damit steht schwarz auf weiss, ob das, was Roblox
+    als Mikrofon benutzt, den Sound wirklich bekommt."""
+    low = dev_name.lower()
+    rec_name = None
+    for key, rec in LOOPBACK.items():
+        if key in low:
+            rec_name = rec
+            break
+    if not rec_name:
+        return None
+    rec_idx = None
+    for i, d in enumerate(sd.query_devices()):
+        if d["max_input_channels"] > 0 and rec_name.lower() in d["name"].lower():
+            rec_idx = i
+            break
+    if rec_idx is None:
+        return {"rec": rec_name, "found": False}
+
+    sr = 48000
+    t = np.linspace(0, 0.4, int(sr * 0.4), endpoint=False)
+    tone = (np.sin(2 * np.pi * 700 * t) * 0.5).astype("float32")
+    sig = np.stack([tone, tone], axis=1)
+    peak = {"v": 0.0}
+
+    def cb(indata, frames, time_info, status):
+        peak["v"] = max(peak["v"], float(np.abs(indata).max()))
+
+    try:
+        with sd.InputStream(device=rec_idx, channels=1, samplerate=sr, callback=cb):
+            sd.play(sig * float(volume), samplerate=sr, device=device, blocking=True)
+            time.sleep(0.25)
+    except Exception as exc:
+        return {"rec": rec_name, "found": True, "error": str(exc)}
+    return {"rec": rec_name, "found": True, "peak": peak["v"]}
+
+
 def read_trigger():
     try:
         with open(TRIGGER, "r", encoding="utf-8", errors="ignore") as fh:
@@ -245,6 +296,55 @@ def main():
         print("\n  KEINE DATEIEN. Lege .wav/.mp3/.ogg/.flac in den Ordner oben.")
         print("  Roblox-Asset-IDs helfen hier nicht — fuer den Voicechat")
         print("  braucht es echte Dateien auf der Platte.")
+    if "--auto" in args or cfg.get("device") in (None, "auto"):
+        print("Suche ein Geraet, das wirklich beim Mikrofon ankommt ...")
+        print("")
+        best = None
+        for pref in PREFERRED:
+            for i, name, _ in output_devices():
+                if pref.lower() not in name.lower():
+                    continue
+                r = verify_loopback(name, i, cfg.get("volume", 0.9))
+                if not r or not r.get("found"):
+                    print(f"  {name[:45]:45s} -> kein Gegenstueck gefunden")
+                    break
+                if r.get("error"):
+                    print(f"  {name[:45]:45s} -> {r['error'][:40]}")
+                    break
+                p = r.get("peak", 0.0)
+                ok = p > 0.01
+                print(f"  {name[:45]:45s} -> {r['rec']:22s} Pegel {p:.3f} "
+                      + ("OK" if ok else "nichts"))
+                if ok and best is None:
+                    best = (i, name, r["rec"])
+                break
+        if best:
+            cfg["device"] = best[1]
+            save_config(cfg)
+            print("")
+            print(f"Gewaehlt: {best[1]}")
+            print(f"In Roblox als Mikrofon einstellen: {best[2]}")
+        else:
+            print("")
+            print("Kein Geraet kam durch. Voicemeeter laeuft? VB-CABLE installiert?")
+        return
+
+    if "--check" in args:
+        r = verify_loopback(devname, dev, cfg.get("volume", 0.9))
+        print("")
+        if not r:
+            print("Kein bekanntes Gegenstueck zu diesem Geraet — bitte selbst pruefen.")
+        elif not r.get("found"):
+            print(f"Aufnahmegeraet '{r['rec']}' nicht gefunden.")
+        elif r.get("error"):
+            print(f"Pruefung fehlgeschlagen: {r['error']}")
+        else:
+            p = r["peak"]
+            print(f"Gegenprobe an '{r['rec']}': Pegel {p:.3f}  "
+                  + ("KOMMT AN — genau dieses Geraet in Roblox als Mikrofon waehlen"
+                     if p > 0.01 else "NICHTS ANGEKOMMEN"))
+        return
+
     if "--test" in args:
         if files:
             f = random.choice(files)
