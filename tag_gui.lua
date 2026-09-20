@@ -178,7 +178,35 @@ pcall(function() writefile(LOGFILE, "=== UTG Tag Assist gestartet " .. os.date("
 --     Datei bleibt auf die letzten 600 Zeilen begrenzt. Auswertung ueber
 --     ENV.diag() — die Zusammenfassung landet auch in der Datei.
 ------------------------------------------------------------------
-local DIAGFILE = "utg_diag.txt"
+------------------------------------------------------------------
+-- 2c) ERGEBNISMESSUNG — wie schwer bin ich zu fangen?
+--     Das ist das eigentliche Mass. Alles andere (Wegtreue,
+--     Trefferquoten) ist nur Mittel zum Zweck. Gemessen wird:
+--       * wie lange ich am Stueck ungefangen bleibe
+--       * wie oft ich gefangen werde, je Minute Fluchtzeit
+--       * wie nah die Verfolger im Schnitt kommen und wie lange sie
+--         in Greifweite bleiben (Gefahrzeit)
+--       * wie oft eine schon gewonnene Verfolgung wieder abgeschuettelt
+--         wird (Ausbruch) und wie oft nicht
+--       * welche Fortbewegungsarten dabei benutzt wurden — nur so laesst
+--         sich sagen, ob Vertikalitaet wirklich hilft
+------------------------------------------------------------------
+local SURV = {
+    on = true,
+    t0 = tick(),
+    fleeTime = 0, dangerTime = 0, sampleAt = 0,
+    dSum = 0, dN = 0, dMin = 1e9,
+    tags = 0, lastTag = tick(), bestStreak = 0,
+    close = nil,            -- laufende Nahverfolgung
+    escapes = 0, caught = 0,
+    used = {},              -- Kantenarten waehrend der Flucht
+    role = nil,
+}
+ENV.surv = SURV
+
+local DIAGFILE  = "utg_diag.txt"      -- menschenlesbarer Auszug (Ringpuffer)
+local STATSFILE = "utg_stats.json"    -- Summen, ueber Sitzungen hinweg
+local EVENTFILE = "utg_events.csv"    -- jedes Ereignis einzeln, zum Auswerten
 local DIAG = {
     on = true,
     ring = {},         -- letzte Zeilen, Ringpuffer
@@ -203,6 +231,108 @@ local function diagVal(kind, key, v)
     if not s[key .. "_max"] or v > s[key .. "_max"] then s[key .. "_max"] = v end
 end
 
+-- EREIGNISDATEI. Eine Zeile je Ereignis, mit Semikolon getrennt, damit
+-- sich grosse Mengen spaeter auswerten lassen. Gepuffert geschrieben — nie
+-- eine Datei je Ereignis, das bringt das Spiel zum Stocken.
+local evBuf, evAt, evCount = {}, 0, 0
+local function evMap()
+    local cm = workspace:FindFirstChild("CurrentMap")
+    local c = cm and cm:GetChildren()[1]
+    return c and c.Name or "?"
+end
+local function diagEvent(typ, a, b, c, text)
+    if not DIAG.on then return end
+    evCount = evCount + 1
+    -- ENV.ap statt AP: das lokale AP steht weiter unten in der Datei und
+    -- waere hier ein globaler nil-Wert.
+    local mode = (ENV.ap and ENV.ap.mode) or "-"
+    evBuf[#evBuf + 1] = table.concat({
+        os.date("%H:%M:%S"), evMap(), tostring(mode), tostring(typ),
+        tostring(a or ""), tostring(b or ""), tostring(c or ""),
+        -- Klammern noetig: gsub liefert zwei Werte, und der letzte Eintrag
+        -- eines Tabellenkonstruktors wuerde beide aufnehmen (haengte eine
+        -- ueberzaehlige Spalte an jede Zeile).
+        (tostring(text or ""):gsub(";", ",")),
+    }, ";")
+end
+ENV.diagEvent = diagEvent
+
+local function evFlush(force)
+    if #evBuf == 0 then return end
+    local now = tick()
+    if not force and now - evAt < 5 then return end
+    evAt = now
+    local chunk = table.concat(evBuf, string.char(10)) .. string.char(10)
+    evBuf = {}
+    -- Groesse im Griff behalten: ab acht Megabyte wird die Datei einmal
+    -- weggesichert und frisch begonnen, damit sie nicht endlos waechst.
+    pcall(function()
+        if type(isfile) == "function" and isfile(EVENTFILE) then
+            local sz = #readfile(EVENTFILE)
+            if sz > 8 * 1024 * 1024 then
+                if type(writefile) == "function" then
+                    writefile("utg_events_alt.csv", readfile(EVENTFILE))
+                    writefile(EVENTFILE, "zeit;map;modus;typ;a;b;c;text" .. string.char(10))
+                end
+            end
+        end
+    end)
+    pcall(function()
+        if type(appendfile) == "function" then
+            appendfile(EVENTFILE, chunk)
+        elseif type(writefile) == "function" then
+            local old = (type(isfile) == "function" and isfile(EVENTFILE))
+                        and readfile(EVENTFILE) or ""
+            writefile(EVENTFILE, old .. chunk)
+        end
+    end)
+end
+
+-- SUMMEN DAUERHAFT HALTEN. Ohne das faengt jede Neuinjektion bei null an,
+-- und ueber eine Spielsitzung kommt nie genug Material zusammen.
+function statsSave()
+    if type(writefile) ~= "function" then return end
+    local ok, txt = pcall(function()
+        return game:GetService("HttpService"):JSONEncode({
+            stat = DIAG.stat,
+            surv = { fleeTime = SURV.fleeTime, dangerTime = SURV.dangerTime,
+                     dSum = SURV.dSum, dN = SURV.dN, dMin = SURV.dMin,
+                     tags = SURV.tags, bestStreak = SURV.bestStreak,
+                     escapes = SURV.escapes, caught = SURV.caught,
+                     used = SURV.used },
+            events = evCount, saved = os.time(),
+        })
+    end)
+    if ok then pcall(writefile, STATSFILE, txt) end
+end
+
+function statsLoad()
+    if type(isfile) ~= "function" or not isfile(STATSFILE) then return end
+    pcall(function()
+        local d = game:GetService("HttpService"):JSONDecode(readfile(STATSFILE))
+        if type(d) ~= "table" then return end
+        if type(d.stat) == "table" then
+            for k, v in pairs(d.stat) do DIAG.stat[k] = v end
+        end
+        if type(d.surv) == "table" then
+            for k, v in pairs(d.surv) do SURV[k] = v end
+            SURV.dMin = SURV.dMin or 1e9
+            SURV.used = SURV.used or {}
+        end
+        evCount = tonumber(d.events) or 0
+    end)
+end
+
+-- beim Start: Summen der bisherigen Sitzungen uebernehmen und die
+-- Ereignisdatei anlegen, falls sie noch fehlt
+pcall(statsLoad)
+pcall(function()
+    if type(isfile) == "function" and not isfile(EVENTFILE)
+       and type(writefile) == "function" then
+        writefile(EVENTFILE, "zeit;map;modus;typ;a;b;c;text" .. string.char(10))
+    end
+end)
+
 local function diagLine(kind, fmt, ...)
     if not DIAG.on then return end
     diagStat(kind).n = diagStat(kind).n + 1
@@ -215,7 +345,16 @@ end
 
 -- Ganze Datei neu schreiben statt anzuhaengen: so bleibt sie klein und es
 -- gibt keinen Lesevorgang ueber eine wachsende Datei.
+local statsAt = 0
 local function diagFlush(force)
+    pcall(evFlush, force)
+    local nowF = tick()
+    -- Summen alle 20 Sekunden sichern, damit ein Neuladen oder ein Absturz
+    -- nicht die Ausbeute der ganzen Sitzung kostet
+    if force or nowF - statsAt > 20 then
+        statsAt = nowF
+        pcall(statsSave)
+    end
     if not DIAG.dirty or type(writefile) ~= "function" then return end
     local now = tick()
     if not force and now - DIAG.lastWrite < 3 then return end
@@ -2834,6 +2973,9 @@ local function diagCloseLadder()
     DIAG.lad = nil
     if not l or not DIAG.on then return end
     local kind = (l.climbing or (l.gain or 0) > 3) and "leiter_ok" or "leiter_daneben"
+    diagEvent("leiter", kind, ("%.1f"):format(l.min), ("%.0f"):format(l.spdMin or 0),
+              ("touch=%s hoehe=%.0f dauer=%.1f"):format(tostring(l.touched),
+                                                        l.gain or 0, tick() - l.t0))
     diagVal(kind, "min", l.min)
     diagVal(kind, "spd", l.spdMin or 0)
     diagLine(kind,
@@ -2880,6 +3022,8 @@ local function diagCloseWaypoint(why)
     -- Nur echtes Ueberschiessen melden: er war dicht dran (unter 4 Studs)
     -- und hat sich dann wieder entfernt. Ein Wegpunkt, der nie nah war, ist
     -- ein anderes Problem und wird getrennt gezaehlt.
+    diagEvent("wegpunkt", w.kind, ("%.1f"):format(w.min), ("%.0f"):format(w.spdMin or 0),
+              ("over=%.1f side=%.1f ende=%s"):format(w.over, w.side, tostring(why)))
     if w.over > 3 and w.min < 4 then
         diagLine("ueberschossen",
             "Art %s: %.1f Studs drueber (dichteste %.1f, seitlich %.1f, "
@@ -2904,6 +3048,8 @@ local function diagClosePath(why)
     diagVal("weg", "anteil", done * 100)
     diagVal("weg", "punkte", P.n)
     diagVal("weg", "dauer", tick() - P.t0)
+    diagEvent("weg", P.n, ("%.0f"):format(done * 100), tostring(P.src),
+              ("ende=%s dauer=%.1f"):format(tostring(why), tick() - P.t0))
     diagStat("wegende_" .. tostring(why)).n =
         diagStat("wegende_" .. tostring(why)).n + 1
     diagStat("wegquelle_" .. tostring(P.src)).n =
@@ -3058,6 +3204,9 @@ local function followPath(pos, mode)
         PATH.air, PATH.prog = nil, nil   -- Fortschrittsuhr nach der Landung neu
         local flat = toLand.Magnitude
         local dy = pos.Y - air.to.Y
+        diagEvent("sprung", air.kind, ("%.0f"):format(air.gap), ("%.0f"):format(air.spd),
+                  ("noetig=%.0f winkel=%.0f flach=%.0f hoch=%.0f"):format(
+                      air.need, air.ang, flat, dy))
         LOG(("Sprung %s: %.0f Studs Luecke, Absprung %.0f Studs/s (noetig %.0f), "
              .. "Winkel %.0f Grad -> %s (%.0f flach, %.0f hoch daneben)")
             :format(tostring(air.kind), air.gap, air.spd, air.need, air.ang,
@@ -6826,12 +6975,113 @@ end
 
 local function lerp(a, b, f) return a + (b - a) * math.min(f, 1) end
 
+-- Ergebnismessung fortschreiben. Laeuft jeden Frame mit, kostet nichts
+-- ausser ein paar Zahlen.
+local function survTick(dt, mode, threatD)
+    if not SURV.on then return end
+    local now = tick()
+    -- Rolle beobachten: ein Wechsel mitten in der Runde heisst gefangen
+    local r = myRole()
+    if SURV.role and r and r ~= SURV.role and inLiveRound() then
+        local streak = now - SURV.lastTag
+        if streak > SURV.bestStreak then SURV.bestStreak = streak end
+        SURV.tags = SURV.tags + 1
+        SURV.lastTag = now
+        if SURV.close then
+            SURV.caught = SURV.caught + 1
+            SURV.close = nil
+        end
+        diagEvent("gefangen", ("%.0f"):format(streak), SURV.tags, "",
+                  ("beste=%.0f"):format(SURV.bestStreak))
+        LOG(("GEFANGEN nach %.0f s (%d insgesamt, beste Serie %.0f s)")
+            :format(streak, SURV.tags, SURV.bestStreak))
+    end
+    SURV.role = r
+
+    if mode ~= "FLUCHT" or not threatD then
+        SURV.close = nil
+        return
+    end
+    SURV.fleeTime = SURV.fleeTime + dt
+    if threatD < 12 then SURV.dangerTime = SURV.dangerTime + dt end
+    if now - SURV.sampleAt > 0.25 then
+        SURV.sampleAt = now
+        SURV.dSum, SURV.dN = SURV.dSum + threatD, SURV.dN + 1
+        if threatD < SURV.dMin then SURV.dMin = threatD end
+    end
+    -- AUSBRUCH: kommt einer auf acht Studs heran und ist vier Sekunden
+    -- spaeter ueber 25 Studs weg, war es ein gewonnener Zweikampf.
+    if not SURV.close and threatD < 8 then
+        SURV.close = { at = now, d0 = threatD, used = {} }
+    elseif SURV.close then
+        if AP.usingPath and PATH.wps and PATH.wps[PATH.idx] then
+            local k = PATH.wps[PATH.idx].kind
+            if k then SURV.close.used[k] = true end
+        end
+        if threatD > 25 then
+            SURV.escapes = SURV.escapes + 1
+            local tags = {}
+            for k in pairs(SURV.close.used) do
+                tags[#tags + 1] = k
+                SURV.used[k] = (SURV.used[k] or 0) + 1
+            end
+            diagEvent("ausbruch", ("%.1f"):format(now - SURV.close.at),
+                      ("%.0f"):format(SURV.close.d0), ("%.0f"):format(threatD),
+                      "benutzt=" .. table.concat(tags, ","))
+            LOG(("ABGESCHUETTELT nach %.1f s (von %.0f auf %.0f Studs)%s")
+                :format(now - SURV.close.at, SURV.close.d0, threatD,
+                        #tags > 0 and ("  benutzt: " .. table.concat(tags, ",")) or ""))
+            SURV.close = nil
+        elseif now - SURV.close.at > 12 then
+            SURV.close = nil
+        end
+    end
+end
+
+function ENV.survival()
+    local now = tick()
+    local out = { "=== WIE SCHWER ZU FANGEN " .. os.date("%H:%M:%S") .. " ===" }
+    local fm = SURV.fleeTime / 60
+    out[#out + 1] = ("Fluchtzeit gesamt        %.1f min"):format(fm)
+    out[#out + 1] = ("Gefangen                 %dx  (%.2f je Minute Flucht)")
+        :format(SURV.tags, fm > 0.01 and SURV.tags / fm or 0)
+    out[#out + 1] = ("laufende Serie           %.0f s   (beste %.0f s)")
+        :format(now - SURV.lastTag, SURV.bestStreak)
+    out[#out + 1] = ("Gefahrzeit unter 12 Studs %.0f %% der Fluchtzeit")
+        :format(SURV.fleeTime > 0 and SURV.dangerTime * 100 / SURV.fleeTime or 0)
+    out[#out + 1] = ("Verfolgerabstand          Schnitt %.1f, engster %.1f Studs")
+        :format(SURV.dN > 0 and SURV.dSum / SURV.dN or 0,
+                SURV.dMin < 1e9 and SURV.dMin or 0)
+    out[#out + 1] = ("Zweikaempfe               %d abgeschuettelt, %d verloren (%d %% gewonnen)")
+        :format(SURV.escapes, SURV.caught,
+                (SURV.escapes + SURV.caught) > 0
+                    and math.floor(SURV.escapes * 100 / (SURV.escapes + SURV.caught)) or 0)
+    local u = {}
+    for k, v in pairs(SURV.used) do u[#u + 1] = ("%s=%d"):format(k, v) end
+    table.sort(u)
+    out[#out + 1] = "bei Ausbruechen benutzt   " .. (#u > 0 and table.concat(u, "  ") or "nur Gehen")
+    local txt = table.concat(out, string.char(10))
+    DIAG.ring[#DIAG.ring + 1] = txt
+    DIAG.dirty = true
+    diagFlush(true)
+    return txt
+end
+
+function ENV.survReset()
+    SURV.fleeTime, SURV.dangerTime = 0, 0
+    SURV.dSum, SURV.dN, SURV.dMin = 0, 0, 1e9
+    SURV.tags, SURV.lastTag, SURV.bestStreak = 0, tick(), 0
+    SURV.escapes, SURV.caught, SURV.used, SURV.close = 0, 0, {}, nil
+    return "Ergebnismessung zurueckgesetzt"
+end
+
 local function assistStep(dt)
     local S = RENV.shared
     local m = S.multipliers
     if not (m and S.boosts) then return end
 
     local threat, threatD, prey, preyD = scanField()
+    pcall(survTick, dt, AP.mode, threatD)
     state.threatD, state.preyD = threatD, preyD
     local p = P()
 
