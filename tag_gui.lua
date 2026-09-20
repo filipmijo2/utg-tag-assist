@@ -7171,6 +7171,40 @@ local _, rSnd = makeButton("Finten-Sound", function() return CFG.jukeSound end,
         if ENV.saveSettings then ENV.saveSettings() end
     end)
 
+-- Knopf zum Ausprobieren: spielt sofort einen Sound, genau so wie nach
+-- einer gelungenen Finte — also auch ueber den Voicechat, wenn das
+-- Begleitprogramm laeuft. Kein Schalter, sondern ein Ausloeser.
+local sndTestBtn = Instance.new("TextButton")
+sndTestBtn.Size = UDim2.new(1, -16, 0, 28)
+sndTestBtn.Position = UDim2.new(0, 8, 0, y)
+sndTestBtn.BackgroundColor3 = Color3.fromRGB(30, 46, 62)
+sndTestBtn.BorderSizePixel = 0
+sndTestBtn.Font = Enum.Font.Gotham
+sndTestBtn.TextSize = 12
+sndTestBtn.TextColor3 = Color3.fromRGB(170, 215, 245)
+sndTestBtn.Text = "Sound abspielen  (Probe)"
+sndTestBtn.Parent = main
+Instance.new("UICorner", sndTestBtn).CornerRadius = UDim.new(0, 6)
+y = y + 32
+sndTestBtn.Activated:Connect(function()
+    task.spawn(function()
+        if #SND.list == 0 then
+            local n = ENV.reloadSounds()
+            state.sndCount = n
+        end
+        if #SND.list == 0 then
+            sndTestBtn.Text = "Sound abspielen  —  keine Sounds gefunden"
+        else
+            playJukeSound()
+            sndTestBtn.Text = ("Sound abspielen  —  %s%s"):format(
+                tostring(SND.lastName),
+                (CFG.jukeSoundVC and ENV.vcAlive()) and "  (+VC)" or "")
+        end
+        task.wait(2)
+        sndTestBtn.Text = "Sound abspielen  (Probe)"
+    end)
+end)
+
 local _, rThird = makeButton("3rd Person  [RightAlt]", function() return CFG.thirdPerson end,
                       function() ENV.toggleThird() end)
 rFree = rThird

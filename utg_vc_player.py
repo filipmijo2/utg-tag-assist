@@ -140,6 +140,17 @@ def sound_files():
             if f.lower().endswith(EXTS)]
 
 
+def resample(data, src_rate, dst_rate):
+    """Lineare Neuabtastung. Fuer kurze Effekte voellig ausreichend."""
+    if src_rate == dst_rate:
+        return data
+    n = int(round(len(data) * dst_rate / src_rate))
+    idx = np.linspace(0, len(data) - 1, n)
+    base = np.arange(len(data))
+    return np.stack([np.interp(idx, base, data[:, c])
+                     for c in range(data.shape[1])], axis=1).astype("float32")
+
+
 def play(path, device, volume):
     """Datei auf dem gewaehlten Geraet ausgeben. Blockiert bis zum Ende."""
     data, rate = sf.read(path, dtype="float32", always_2d=True)
@@ -158,18 +169,20 @@ def play(path, device, volume):
         if fade > 0:
             data[-fade:] *= np.linspace(1.0, 0.0, fade)[:, None]
     data = np.clip(data * float(volume), -1.0, 1.0)
+    # AUF DIE ABTASTRATE DES GERAETS RECHNEN.
+    # Gemessen: das VB-CABLE laeuft mit 44100 Hz, die Dateien lagen mit
+    # 48000 Hz vor. Schiebt man 48k in ein 44,1k-Geraet, kommt der Ton
+    # verzerrt und in falscher Tonhoehe heraus — genau das war als
+    # "der Sound ist nicht richtig" hoerbar. Formtreue der Aufnahme
+    # gegenueber der Quelle lag bei 0.10 statt nahe 1.0.
     try:
-        sd.play(data, samplerate=rate, device=device, blocking=True)
+        dev_rate = int(sd.query_devices()[device]["default_samplerate"])
     except Exception:
-        # Manche virtuelle Geraete koennen die Abtastrate der Datei nicht;
-        # dann auf 48 kHz umrechnen (linear, reicht fuer kurze Sounds voellig)
-        target = 48000
-        if rate != target:
-            n = int(len(data) * target / rate)
-            idx = np.linspace(0, len(data) - 1, n)
-            data = np.stack([np.interp(idx, np.arange(len(data)), data[:, c])
-                             for c in range(data.shape[1])], axis=1).astype("float32")
-        sd.play(data, samplerate=target, device=device, blocking=True)
+        dev_rate = rate
+    if dev_rate and dev_rate != rate:
+        data = resample(data, rate, dev_rate)
+        rate = dev_rate
+    sd.play(data, samplerate=rate, device=device, blocking=True)
 
 
 def check_voicemeeter():
