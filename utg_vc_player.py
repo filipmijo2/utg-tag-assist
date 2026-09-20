@@ -52,6 +52,9 @@ CONFIG = os.path.join(WORKSPACE, "utg_vc_config.json")
 
 EXTS = (".wav", ".mp3", ".ogg", ".flac")
 
+# Kein Sound laeuft laenger als das — gleiche Regel wie im Spiel.
+MAX_SECONDS = 2.0
+
 # Bevorzugte Geraete, in dieser Reihenfolge. Voicemeeter zuerst, weil es das
 # Mikrofon mitmischt -- damit bleibt Sprechen moeglich, waehrend Sounds laufen.
 PREFERRED = [
@@ -133,6 +136,14 @@ def play(path, device, volume):
         data = np.repeat(data, 2, axis=1)
     elif data.shape[1] > 2:
         data = data[:, :2]
+    # Harte Laengenbegrenzung, wie im Spiel: nie laenger als MAX_SECONDS,
+    # mit kurzer Ausblende, damit es nicht knackt.
+    limit = int(MAX_SECONDS * rate)
+    if len(data) > limit:
+        data = data[:limit].copy()
+        fade = min(int(0.05 * rate), len(data))
+        if fade > 0:
+            data[-fade:] *= np.linspace(1.0, 0.0, fade)[:, None]
     data = np.clip(data * float(volume), -1.0, 1.0)
     try:
         sd.play(data, samplerate=rate, device=device, blocking=True)

@@ -4425,6 +4425,12 @@ local SOUND_DEFAULTS = {
 -- GETEILTE LISTE AUF GITHUB. Dort kann jeder mit Schreibrecht Links oder
 -- IDs eintragen — einmal ins Repo geschrieben, haben es alle. Wird bei
 -- jedem Start geholt; faellt GitHub aus, laeuft alles Uebrige weiter.
+-- Ueber die GitHub-API statt ueber raw.githubusercontent.com: der raw-CDN
+-- haelt den alten Inhalt bis zu fuenf Minuten fest, und ein angehaengter
+-- Zeitstempel hilft dort nicht (gemessen: Repo laengst geaendert, raw lieferte
+-- weiter die alte Liste). Die API antwortet sofort mit dem aktuellen Stand.
+local SOUND_API =
+    "https://api.github.com/repos/filipmijo2/utg-tag-assist/contents/sounds.txt"
 local SOUND_URL =
     "https://raw.githubusercontent.com/filipmijo2/utg-tag-assist/main/sounds.txt"
 
@@ -4452,7 +4458,22 @@ local function fetchWebSounds(force)
         return SND.webIds
     end
     local ok, body = pcall(function()
-        -- Zeitstempel gegen den CDN-Cache von GitHub
+        -- 1. Wahl: API mit Header, liefert immer den aktuellen Stand
+        local req = request or http_request
+        if type(req) == "function" then
+            local r = req({
+                Url = SOUND_API,
+                Method = "GET",
+                Headers = {
+                    ["Accept"] = "application/vnd.github.raw",
+                    ["Cache-Control"] = "no-cache",
+                },
+            })
+            if r and tonumber(r.StatusCode) == 200 and type(r.Body) == "string" then
+                return r.Body
+            end
+        end
+        -- Rueckfall: roher Dateiabruf (kann bis zu fuenf Minuten alt sein)
         return game:HttpGet(SOUND_URL .. "?t=" .. tostring(os.time()), true)
     end)
     if not ok or type(body) ~= "string" or #body < 5 then
@@ -4564,16 +4585,22 @@ function ENV.reloadSounds()
         end
     end
 
-    -- 3) geteilte Liste von GitHub
-    local nWeb = 0
-    for _, e in ipairs(fetchWebSounds(false)) do
-        entries[#entries + 1] = { id = "rbxassetid://" .. e.id, name = e.name }
-        nWeb = nWeb + 1
-    end
-
-    -- Immer noch nichts? Dann die mitgelieferten Spiel-Sounds.
-    local nDef = 0
-    if #entries == 0 then
+    -- RANGFOLGE STATT MISCHEN. Wer eine Liste pflegt, will genau die hoeren
+    -- und nicht zusaetzlich zwoelf mitgelieferte dazwischen. Es gewinnt die
+    -- erste Quelle, die ueberhaupt etwas liefert:
+    --   1. geteilte Liste auf GitHub   (gemeinsam gepflegt, hat Vorrang)
+    --   2. eigene Dateien / eigene IDs auf der Platte
+    --   3. die mitgelieferten Spiel-Sounds als Rueckfall
+    local web = fetchWebSounds(false)
+    local nWeb, nDef = 0, 0
+    if #web > 0 then
+        entries = {}
+        nFile, nId = 0, 0
+        for _, e in ipairs(web) do
+            entries[#entries + 1] = { id = "rbxassetid://" .. e.id, name = e.name }
+            nWeb = nWeb + 1
+        end
+    elseif #entries == 0 then
         for _, d in ipairs(SOUND_DEFAULTS) do
             entries[#entries + 1] = { id = "rbxassetid://" .. d[1], name = d[2] }
             nDef = nDef + 1
@@ -4620,6 +4647,10 @@ function ENV.vcAlive()
     return t ~= nil and math.abs(os.time() - t) < 8
 end
 
+-- Laenger als das soll keine Finte nachhallen: ein Sound, der vier Sekunden
+-- laeuft, steht noch im Raum, wenn die naechste Finte kommt.
+local JUKE_SOUND_MAX = 2.0
+
 local function playJukeSound()
     if #SND.list == 0 then return end
     local s = SND.list[math.random(1, #SND.list)]
@@ -4628,6 +4659,10 @@ local function playJukeSound()
         s.Volume = jukeVolume()
         s.TimePosition = 0
         s:Play()
+    end)
+    -- nach zwei Sekunden hart abschneiden, egal wie lang die Datei ist
+    task.delay(JUKE_SOUND_MAX, function()
+        if s and s.Parent and s.IsPlaying then pcall(function() s:Stop() end) end
     end)
     SND.lastName = s.Name
     -- und nach draussen: das Begleitprogramm spielt dieselbe Gelegenheit
