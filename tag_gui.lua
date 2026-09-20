@@ -51,6 +51,9 @@ local CFG = {
     feintDist   = 29,
     thirdPerson = false,   -- Taste T
     preset      = 3,       -- fest auf Maximum (kein Umschalten mehr)
+    -- Sound nach einer gelungenen Finte (rein lokal, siehe Abschnitt 5c)
+    jukeSound   = false,
+    jukeSoundVol = 0.8,
 }
 
 -- Die frueheren Einzelschalter haengen jetzt alle am Autopilot-Schalter.
@@ -75,17 +78,17 @@ end })
 local PRESETS = {
     { name = "Subtil",
       escBoost = 0.05, escRadius = 70, escJump = 1.02, escAccel = 1.08,
-      chsBoost = 0.10, chsRadius = 90,
+      chsBoost = 0.07, chsRadius = 90,
       reachMax = 8.1,  reachFrom = 12, spreadMax = 1.6,
       cdMul = 1.00, gravity = 1.00, fleeR = 44, chaseR = 45, panicR = 12 },
     { name = "Mittel",
       escBoost = 0.09, escRadius = 90, escJump = 1.05, escAccel = 1.15,
-      chsBoost = 0.18, chsRadius = 140,
+      chsBoost = 0.12, chsRadius = 140,
       reachMax = 10.5, reachFrom = 14, spreadMax = 2.2,
       cdMul = 0.92, gravity = 0.98, fleeR = 58, chaseR = 60, panicR = 16 },
     { name = "Stark",
       escBoost = 0.14, escRadius = 110, escJump = 1.10, escAccel = 1.28,
-      chsBoost = 0.30, chsRadius = 200,
+      chsBoost = 0.15, chsRadius = 200,
       reachMax = 15.4, reachFrom = 21, spreadMax = 3.2,
       cdMul = 0.80, gravity = 0.95, fleeR = 75, chaseR = 90, panicR = 20 },
 }
@@ -506,6 +509,19 @@ end
 -- dieses Wissen landete der Bot regelmaessig in Ecken und lief davor hin
 -- und her. Bewertet wird deshalb nach Hoehe (oben ist man schwerer zu
 -- fangen), Abstand zu den Verfolgern und Anzahl der Auswege.
+-- HOEHE IST DER BESTE ABSTAND.
+-- Zehn Studs horizontal sind bei 32 Studs/s in einer Drittelsekunde weg. Zehn
+-- Studs HOEHE muss ein Verfolger dagegen erst einmal ueberwinden: er braucht
+-- eine Leiter, ein Trampolin oder einen weiten Umweg, und auf dem Weg dorthin
+-- verliert er die Sichtlinie. Deshalb zaehlt der Hoehenunterschied im
+-- Fluchtabstand ein Vielfaches des horizontalen.
+local VERT_W = 3.5
+local function threatGap(a, b)
+    local dxz = ((a - b) * Vector3.new(1, 0, 1)).Magnitude
+    local dy = (a.Y - b.Y) * VERT_W
+    return math.sqrt(dxz * dxz + dy * dy)
+end
+
 local function pickEscapeGraph(pos, threats)
     local NG = getgenv().__UTG_NAV_GRAPH
     local G = NG and NG.graph
@@ -526,15 +542,24 @@ local function pickEscapeGraph(pos, threats)
                     -- Abstand zum naechsten Verfolger, und niemand darf
                     -- naeher am Ziel sein als wir
                     local nearestThreat, blockedBy = math.huge, false
+                    local overThreat = 0
                     for _, t in ipairs(threats or {}) do
-                        local dt = ((nd.p - t.pos) * Vector3.new(1, 0, 1)).Magnitude
-                        if dt < nearestThreat then nearestThreat = dt end
+                        -- Hoehe zaehlt im Abstand mit (siehe threatGap)
+                        local dt = threatGap(nd.p, t.pos)
+                        if dt < nearestThreat then
+                            nearestThreat = dt
+                            overThreat = nd.p.Y - t.pos.Y
+                        end
                         if dt < dist * 0.75 then blockedBy = true end
                     end
                     if not blockedBy then
                         local up = nd.p.Y - pos.Y
                         local score =
                               math.min(up, 60) * 2.2          -- Hoehe zaehlt stark
+                            -- und noch staerker: wie hoch liegt der Punkt
+                            -- UEBER dem naechsten Verfolger. Darauf kommt es
+                            -- an, nicht auf die eigene Ausgangshoehe.
+                            + math.clamp(overThreat, -40, 70) * 4.0
                             + math.min(nearestThreat, 200) * 0.9
                             + math.min(ways, 12) * 3.0        -- viele Auswege
                             - dist * 0.25                     -- nicht ans Kartenende
@@ -562,10 +587,13 @@ local function pickEscapeNode(pos, threats, preys)
         local dY = n.Y - pos.Y
         if dMe > 25 and dMe < 320 and dY > -60 and dY < 45 then
             -- Abstand zum naechsten Verfolger an diesem Punkt
-            local dThreat = 1e9
+            local dThreat, overThreat = 1e9, 0
             for _, t in ipairs(threats) do
-                local d = ((n - t.pos) * Vector3.new(1, 0, 1)).Magnitude
-                if d < dThreat then dThreat = d end
+                local d = threatGap(n, t.pos)      -- Hoehe zaehlt mit
+                if d < dThreat then
+                    dThreat = d
+                    overThreat = n.Y - t.pos.Y
+                end
             end
             -- laeuft der Weg dorthin an einem Verfolger vorbei? (grober Test)
             local pass = 0
@@ -596,6 +624,8 @@ local function pickEscapeNode(pos, threats, preys)
                         - tooClose * 3.0
                         + centrality * 2.2                      -- mittig bleiben
                         + height * 1.8                          -- hoch bleiben
+                        -- entscheidend: ueber dem Verfolger stehen
+                        + math.clamp(overThreat / 20, -2, 3.5) * 3.2
                         - math.clamp(dMe / 320, 0, 1) * 0.8     -- nicht unnoetig weit
                         - pass * 2.5                            -- nicht am Jaeger vorbei
                         + grab * 1.6                            -- Opfer im Vorbeigehen mitnehmen
@@ -1403,6 +1433,26 @@ do
     ------------------------------------------------------------------
     -- 5) A* ueber den Graphen. Kosten in Sekunden, Heuristik ebenso.
     ------------------------------------------------------------------
+    -- KOSTENGEWICHTE JE KANTENART, zur Laufzeit angewandt.
+    -- Bewusst NICHT beim Backen eingerechnet: so wirken Aenderungen sofort,
+    -- ohne dass jede Map neu gebacken werden muss, und die Werte bleiben an
+    -- einer Stelle sichtbar.
+    -- Vertikalitaet ist im Weglaufen mehr wert als die reine Zeit, die sie
+    -- kostet: oben ist man schwerer zu erreichen, und Trampolin wie Zipline
+    -- bringen Hoehe und Strecke, ohne dass ein Verfolger mitkommt.
+    NAV.KINDW = {
+        walk = 1.00, roll = 1.00, step = 1.00, drop = 0.95,
+        hop  = 0.65,        -- Stufe hoch
+        jump = 0.70,        -- Sprung ueber eine Luecke
+        climb = 0.40,       -- Leiter
+        wallrun = 0.45,
+        pad  = 0.22,        -- Trampolin
+        zip  = 0.20,        -- Zipline
+    }
+    -- Zusaetzlicher Abschlag auf JEDE Kante, die Hoehe gewinnt — auch auf
+    -- gewoehnliche Wege ueber Treppen und Rampen.
+    NAV.RISE_DISCOUNT = 0.75
+
     function NAV.findPath(startPos, goalPos)
         local G = NAV.graph
         if not G then return nil, "kein Graph" end
@@ -1448,6 +1498,10 @@ do
     
         push(s.id, h(s))
         local visited = 0
+        -- Gerechnet wird in einem eigenen Thread (requestPath), also darf
+        -- zwischendurch abgegeben werden. Ein Lauf kostet 12 bis 30 ms — am
+        -- Stueck ist das ein sichtbarer Ruckler, in Haeppchen nicht.
+        local yieldAt = 2500
         -- Deckel gegen den teuersten Fall: gibt es gar keinen Weg, durchsucht
         -- A* sonst den kompletten Graphen — auf einer grossen Map ueber 100 ms
         -- pro vergeblicher Anfrage.
@@ -1458,6 +1512,10 @@ do
             if not closed[cur] then
                 closed[cur] = true
                 visited = visited + 1
+                if visited >= yieldAt then
+                    yieldAt = yieldAt + 2500
+                    RunService.Heartbeat:Wait()
+                end
                 if cur == t.id then
                     local path, at = {}, cur
                     while at do
@@ -1474,7 +1532,12 @@ do
                 end
                 local n = nodes[cur]
                 for _, e in ipairs(n.e) do
-                    local ng = gScore[cur] + e.c
+                    local w = NAV.KINDW[e.k] or 1
+                    local tn = nodes[e.to]
+                    if tn and tn.p.Y - n.p.Y > 1 then
+                        w = w * NAV.RISE_DISCOUNT
+                    end
+                    local ng = gScore[cur] + e.c * w
                     if not gScore[e.to] or ng < gScore[e.to] then
                         gScore[e.to] = ng
                         came[e.to] = { from = cur, k = e.k, via = e.via }
@@ -1660,6 +1723,8 @@ local function saveSettings()
         writefile(SETTINGS_FILE, game:GetService("HttpService"):JSONEncode({
             autopilot = CFG.autopilot and true or false,
             ayip = CFG.ayip or 0,
+            jukeSound = CFG.jukeSound and true or false,
+            jukeSoundVol = CFG.jukeSoundVol or 0.8,
             -- 3rd Person wird BEWUSST nicht gesichert: der Modus haengt die
             -- Kamera hinter den Charakter, und wer ihn einmal versehentlich
             -- anhatte, bekam ihn bei jeder Injektion zurueck, ohne die
@@ -1676,6 +1741,10 @@ do
             if type(d) ~= "table" then return end
             if d.autopilot ~= nil then CFG.autopilot = d.autopilot end
             if type(d.ayip) == "number" then CFG.ayip = math.clamp(d.ayip, 0, 3) end
+            if d.jukeSound ~= nil then CFG.jukeSound = d.jukeSound end
+            if type(d.jukeSoundVol) == "number" then
+                CFG.jukeSoundVol = math.clamp(d.jukeSoundVol, 0, 2)
+            end
         end)
     end
 end
@@ -1749,7 +1818,12 @@ end
 -- Die Anzeige baut bei jedem neuen Weg Parts neu auf. Das war einmal ein
 -- Bildratenproblem, weil der Weg 50 mal in 30 s berechnet wurde; seit der
 -- Drosselung sind es 4, damit ist sie wieder tragbar.
-local PATHVIS = { folder = nil, on = true, dirPart = nil }
+-- Die Pfad-Anzeige legt je Wegpunkt ein Part an — bei 40 bis 60 Wegpunkten
+-- und einer Neuberechnung alle paar Sekunden sind das Dutzende
+-- Instanz-Erzeugungen in EINEM Frame, gut sichtbar als Ruckler beim
+-- Umschauen. Sie ist ein Diagnosemittel und darum standardmaessig aus;
+-- einschalten mit ENV.pathVis(true).
+local PATHVIS = { folder = nil, on = false, dirPart = nil }
 local KIND_COLOR = {
     walk    = Color3.fromRGB(235, 235, 235),
     hop     = Color3.fromRGB(255, 210,  60),
@@ -1801,6 +1875,14 @@ local function visDirection(pos, dir)
         end
         p.CFrame = CFrame.lookAt(pos + Vector3.new(0, -2.4, 0) + dir * 7, pos + dir * 14)
     end)
+end
+
+-- Pfad-Anzeige zuschalten, wenn man sehen will, was der Folger vorhat.
+function ENV.pathVis(on)
+    PATHVIS.on = on and true or false
+    if not PATHVIS.on then pcall(visClear) end
+    LOG("Pfad-Anzeige " .. (PATHVIS.on and "AN" or "AUS"))
+    return PATHVIS.on
 end
 
 local function visPath(wps)
@@ -2510,7 +2592,9 @@ local function followPath(pos, mode)
     if AP.pathLoose and not wp.takeoff and now - (PATH.syncAt or 0) > 0.25 then
         PATH.syncAt = now
         local jumpTo
-        for k = PATH.idx + 1, math.min(PATH.idx + 6, #wps) do
+        -- drei Kandidaten statt sechs: jede Pruefung kostet drei Strahlen,
+        -- und weiter vorn im Weg liegt ohnehin selten etwas Erreichbares
+        for k = PATH.idx + 1, math.min(PATH.idx + 3, #wps) do
             local w2 = wps[k]
             local d2 = ((w2.Position - pos) * Vector3.new(1, 0, 1)).Magnitude
             if d2 < flatNow - 1 and d2 < 14
@@ -3069,6 +3153,18 @@ local function pickDirection(pos, goalDir, curVel)
                 if mixed.Magnitude > 0.05 then goalDir = mixed.Unit end
             end
         end
+        AP.lastDir, AP.dirAt = goalDir, tick()
+        return goalDir
+    end
+
+    -- WAEHREND EINER FINTE GILT DIE CHOREOGRAFIE.
+    -- Darunter wuerde aus 24 Richtungen die offenste gewaehlt — das sind rund
+    -- 70 Raycasts je Aufruf. Waehrend eines Manoevers ist die Richtungshaltung
+    -- ausgeschaltet (holdFor = 0), der Scan lief dort also in JEDEM Frame und
+    -- war als Ruckeln beim Umschauen zu spueren. Gebraucht wird er dabei
+    -- ohnehin nicht: das Manoever gibt die Richtung vor und prueft sie selbst
+    -- gegen Waende und Kanten. Das Wandgleiten oben bleibt aktiv.
+    if AP.jukeName then
         AP.lastDir, AP.dirAt = goalDir, tick()
         return goalDir
     end
@@ -3657,12 +3753,12 @@ local JUKE_MOVES = {
     {   name = "circle", cd = 5, minLevel = 1, maxD = 29, minD = 7, arc = true, skipWall = true,
         init = function(ctx, m)
             m.s = (math.random() < 0.5) and 1 or -1
-            -- Die anderthalbfache Runde (450 Grad) ist raus: gemessen hat
-            -- der Kreis als einziges Manoever Abstand GEKOSTET, und je
-            -- laenger er dauert, desto mehr. 270 Grad bleiben, dafuer
-            -- zuegiger gedreht (165 -> 200 Grad/s, 1.6 -> 1.35 s).
-            m.total = 270
-            m.dur = m.total / 200
+            -- 270 Grad reicht meist, 450 ist die anderthalbfache Runde
+            m.total = (ctx.level >= 2 and math.random() < 0.4) and 450 or 270
+            -- so lang, dass es eine gefahrene Kurve wird und kein Drehen
+            -- auf der Stelle. 210 Grad pro Sekunde war noch zu hastig,
+            -- jetzt 165 - ein 270er dauert damit 1.6 s, ein 450er 2.7 s.
+            m.dur = m.total / 165
         end,
         run = function(ctx, m, t)
             if t < m.dur then
@@ -3768,6 +3864,108 @@ local function jukeGap(level)
 end
 
 -- Waehlt ein Manoever und fuehrt es aus. Rueckgabe: Richtung oder nil.
+------------------------------------------------------------------
+-- 5c) FINTEN-SOUNDS
+--     Spielt 0.25 s nach einer Finte einen Sound — aber nur, wenn sie
+--     aufgegangen ist, also niemand getaggt hat.
+--     Alles laeuft IM SPIEL und nur auf diesem Rechner: die Sounds
+--     haengen an SoundService, kein Mikrofon, kein Voicechat, keine
+--     Uebertragung an andere Spieler.
+--     Zwei Quellen, beide beliebig lang:
+--       * eigene Dateien im Executor-Ordner "utg_sounds"
+--         (mp3/ogg/wav/flac, eingebunden ueber getcustomasset)
+--       * Roblox-Asset-IDs, eine je Zeile in "utg_sounds.txt"
+--     Gewaehlt wird zufaellig; Nachladen ueber den Schalter in der GUI.
+------------------------------------------------------------------
+local SoundService = game:GetService("SoundService")
+local SND = { list = {}, folder = "utg_sounds", idFile = "utg_sounds.txt",
+              holder = nil, lastName = nil }
+
+local function sndHolder()
+    if SND.holder and SND.holder.Parent then return SND.holder end
+    local f = Instance.new("Folder")
+    f.Name = "UTG_JukeSounds"
+    f.Parent = SoundService
+    SND.holder = f
+    return f
+end
+
+-- Liest beide Quellen neu ein und legt je Eintrag eine Sound-Instanz an.
+-- Rueckgabe: Anzahl, Anzahl Dateien, Anzahl IDs.
+function ENV.reloadSounds()
+    if SND.holder then pcall(function() SND.holder:Destroy() end) end
+    SND.holder, SND.list = nil, {}
+    local entries, nFile, nId = {}, 0, 0
+
+    if type(listfiles) == "function" and type(isfolder) == "function" then
+        if not isfolder(SND.folder) and type(makefolder) == "function" then
+            pcall(makefolder, SND.folder)
+        end
+        if isfolder(SND.folder) then
+            local okL, files = pcall(listfiles, SND.folder)
+            if okL and type(files) == "table" then
+                for _, path in ipairs(files) do
+                    local low = tostring(path):lower()
+                    if low:sub(-4) == ".mp3" or low:sub(-4) == ".ogg"
+                       or low:sub(-4) == ".wav" or low:sub(-5) == ".flac" then
+                        local grab = getcustomasset or getsynasset
+                        local okA, id = pcall(grab, path)
+                        if okA and type(id) == "string" then
+                            entries[#entries+1] =
+                                { id = id, name = tostring(path):match("[^\\/]+$") or "Datei" }
+                            nFile = nFile + 1
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if type(isfile) == "function" and type(readfile) == "function"
+       and isfile(SND.idFile) then
+        local okR, txt = pcall(readfile, SND.idFile)
+        if okR and type(txt) == "string" then
+            for line in txt:gmatch("[^\r\n]+") do
+                if not line:match("^%s*//") and not line:match("^%s*%-%-") then
+                    local num = line:match("(%d+)")
+                    if num then
+                        entries[#entries+1] =
+                            { id = "rbxassetid://" .. num, name = num }
+                        nId = nId + 1
+                    end
+                end
+            end
+        end
+    end
+
+    local holder = sndHolder()
+    for _, e in ipairs(entries) do
+        local ok = pcall(function()
+            local s = Instance.new("Sound")
+            s.Name = e.name
+            s.SoundId = e.id
+            s.Volume = CFG.jukeSoundVol or 0.8
+            s.Parent = holder
+            SND.list[#SND.list+1] = s
+        end)
+        if not ok then nFile = nFile end
+    end
+    return #SND.list, nFile, nId
+end
+
+local function playJukeSound()
+    if #SND.list == 0 then return end
+    local s = SND.list[math.random(1, #SND.list)]
+    if not s or not s.Parent then return end
+    pcall(function()
+        s.Volume = CFG.jukeSoundVol or 0.8
+        s.TimePosition = 0
+        s:Play()
+    end)
+    SND.lastName = s.Name
+end
+ENV.playJukeSound = playJukeSound     -- zum Ausprobieren der Lautstaerke
+
 -- Ein Manoever beenden und zur Wirkungsmessung anmelden.
 local function endJuke(a, now, why)
     -- Ein Manoever, das an einer Wand abgebrochen ist, hat gar nicht
@@ -3787,6 +3985,23 @@ local function endJuke(a, now, why)
         JUKE.pending = { name = a.def.name, d0 = a.d0, at = now + 1.2,
                          cut = (why ~= nil) }
     end
+
+    -- SOUND NACH DER FINTE. Nur, wenn das Manoever wirklich gelaufen ist —
+    -- ein an der Wand abgebrochener Versuch ist keine Finte. Und nur, wenn
+    -- sie aufgegangen ist: wer getaggt wird, wechselt in diesem Spiel die
+    -- Rolle, und in den Modi mit Einfrieren steht er danach fest.
+    local ran = (why == nil) or (now - a.t0 >= 0.6)
+    if CFG.jukeSound and ran and #SND.list > 0 then
+        local roleAt, name = myRole(), a.def.name
+        task.delay(0.25, function()
+            if not CFG.jukeSound then return end
+            if myRole() ~= roleAt then return end      -- getaggt
+            if AP.immobile then return end             -- gefangen/eingefroren
+            playJukeSound()
+            LOG(("Finten-Sound nach %s: %s"):format(name, tostring(SND.lastName)))
+        end)
+    end
+
     JUKE.active, AP.jukeName = nil, nil
 end
 
@@ -3906,11 +4121,11 @@ local function jukeStep(pos, facing, toThreat, threatD, level)
     if not JUKE.lastDt or now - JUKE.lastDt > 0.08 then
         JUKE.lastD, JUKE.lastDt = threatD, now
     end
-    -- Unter 18 Studs wird immer gefintet, darueber nur gegen jemanden, der
-    -- wirklich aufholt. 14 war zu streng: ein Verfolger, der das Tempo nur
-    -- haelt, ist trotzdem eine Bedrohung, sobald man an ein Hindernis kommt.
-    local ttc = (closing > 0.5) and (threatD / closing) or math.huge
-    if ttc > 4.5 and threatD > 18 then return nil end
+    -- Ausgespart wird nur noch der eindeutige Fall: er faellt deutlich
+    -- zurueck UND ist weit weg. Alles andere ist eine Lage fuer eine Finte.
+    -- Eine schaerfere Regel (Zeit bis Kontakt ueber 4.5 s = keine Finte) hat
+    -- das Repertoire zu oft stillgelegt; die Manoever sollen vorkommen.
+    if closing < -3 and threatD > 22 then return nil end
 
     local pool = {}
     for _, def in ipairs(JUKE_MOVES) do
@@ -3939,24 +4154,29 @@ local function jukeStep(pos, facing, toThreat, threatD, level)
     end
     local total = 0
     for _, def in ipairs(pool) do
-        local w = def.mapMove and 3 or 1
+        local w = def.mapMove and 6 or 1
+        -- WICHTIG: die folgenden Faktoren duerfen ein Manoever nur
+        -- BEVORZUGEN, niemals praktisch abschalten. Mit den frueheren
+        -- Spannen (0.45 bis 1.55 nach Lage, 0.25 bis 2.2 nach Erfahrung)
+        -- kamen schwach gemessene Manoever kaum noch vor — das Repertoire
+        -- schrumpfte faktisch auf zwei, drei Bewegungen. Jede Finte soll
+        -- weiter regelmaessig vorkommen, die Gewichtung gibt nur den
+        -- Ausschlag bei sonst gleicher Lage.
         if def.turnBack then
-            -- Kehre: gut gegen jemanden im Ruecken, schlecht gegen jemanden,
-            -- der seitlich schneidet — dem laeuft man direkt in die Arme.
-            w = w * (0.45 + 1.1 * behind)
+            -- Kehre: passt besser gegen jemanden im Ruecken
+            w = w * (0.8 + 0.4 * behind)
         elseif def.arc then
-            -- Bogen: genau andersherum
-            w = w * (0.6 + 0.9 * (1 - behind))
+            -- Bogen: passt besser gegen jemanden, der seitlich schneidet
+            w = w * (0.8 + 0.4 * (1 - behind))
         end
         local s = JUKE.stat[def.name]
-        if s and s.n >= 1 then
-            -- Schrumpfung: ein einzelnes Ergebnis zaehlt nur zu einem
-            -- Drittel, erst mit mehreren Messungen zaehlt der volle Wert.
-            -- Sonst wirft ein Zufallstreffer das ganze Repertoire um.
+        if s and s.n >= 2 then
+            -- Schrumpfung gegen Zufallstreffer, und eine enge Spanne:
+            -- hoechstens ein Drittel mehr oder weniger
             local avg = (s.sum / s.n) * (s.n / (s.n + 2))
-            w = w * math.clamp(1 + avg / 6, 0.25, 2.2)
+            w = w * math.clamp(1 + avg / 24, 0.7, 1.35)
         end
-        def.__w = math.max(w, 0.12)
+        def.__w = math.max(w, 0.35)
         total = total + def.__w
     end
     -- Startrichtung pruefen — und bei einer Wand NICHT gleich aufgeben.
@@ -4496,7 +4716,10 @@ local function autopilotStep(threat, threatD, prey, preyD)
                 if part.Parent then
                     local v = (part.Position - pos) * Vector3.new(1, 0, 1)
                     local dh = v.Magnitude
-                    if dh > 2 and dh < 45 then
+                    -- Reichweite von 45 auf 70 Studs: Trampolin und Zipline
+                    -- sind die besten Fluchtmittel der Map, es lohnt sich,
+                    -- auch von weiter weg darauf zuzuhalten.
+                    if dh > 2 and dh < 70 then
                         local align = v.Unit:Dot(goal)
                         -- Jaeger darf nicht naeher dran sein als wir
                         local safe = true
@@ -4505,16 +4728,22 @@ local function autopilotStep(threat, threatD, prey, preyD)
                                 safe = false break
                             end
                         end
-                        if safe and align > -0.15 then
-                            local sc = h.w + align * 1.3 + (45 - dh) / 45 * 0.8
+                        -- Auch gegen die grobe Fluchtrichtung erlaubt, wenn es
+                        -- Hoehe bringt: ein Trampolin schraeg hinter einem ist
+                        -- mehr wert als geradeaus weiterlaufen.
+                        local lift = part.Position.Y - pos.Y
+                        local liftBonus = math.clamp(lift / 12, 0, 2.5)
+                        if safe and align > (liftBonus > 0.6 and -0.6 or -0.15) then
+                            local sc = h.w * 1.6 + align * 1.3
+                                     + (70 - dh) / 70 * 0.8 + liftBonus * 1.4
                             if not hScore or sc > hScore then hBest, hScore, hKind = v.Unit, sc, h.kind end
                         end
                     end
                 end
             end
             if hBest and movesTowardThreat(pos, hBest) then hBest = nil end
-            if hBest and hScore > 1.9 then
-                goal = goal + hBest * 1.6
+            if hBest and hScore > 1.4 then
+                goal = goal + hBest * 2.2
                 if goal.Magnitude > 0.05 then goal = goal.Unit end
                 AP.helper = hKind
             else
@@ -5253,7 +5482,17 @@ local function autopilotStep(threat, threatD, prey, preyD)
                 local d = ((t.pos - pos) * Vector3.new(1, 0, 1)).Magnitude
                 if d < td then tp, td = t.pos, d end
             end
-            if threat and threatD and threatD < td then tp, td = threat.pos, threatD end
+            -- ACHTUNG: "threat" ist ein SPIELER-Objekt, kein Eintrag aus
+            -- state.threats — ein Feld .pos gibt es daran nicht, der Zugriff
+            -- wirft. Das hat assistStep in jedem Frame mit Verfolger
+            -- abgebrochen, sobald AYIP eingeschaltet war (mit AYIP 0 lief der
+            -- Zweig nie, deshalb ist es nie aufgefallen). Weil dabei auch
+            -- RotateInMoveDirection nicht mehr gesetzt wurde, richtete sich
+            -- der Charakter wieder nach der Kamera aus statt in Laufrichtung.
+            if threat and threatD and threatD < td then
+                local thHrp = hrpOf(threat)
+                if thHrp then tp, td = thHrp.Position, threatD end
+            end
             local toThreat
             if tp then
                 local v = (tp - pos) * Vector3.new(1, 0, 1)
@@ -5486,10 +5725,24 @@ local function assistStep(dt)
         -- Im Chase wirkt der Boost auch auf Distanz (Grundanteil), damit weite
         -- Verfolgungen ueberhaupt aufholen; nah dran kommt der Rest dazu.
         local r = ramp(preyD, p.chsRadius)
-        local base = (AP.mode == "JAGD") and 0.7 or 0   -- auch auf Distanz Tempo
+        -- Grundanteil beim Jagen gesenkt (0.7 -> 0.5): zusammen mit dem
+        -- halbierten Jagd-Boost lag die Spitze sonst bei WalkSpeed 42 bis 47,
+        -- waehrend auf der Flucht bewusst bei 37 gedeckelt wird. Jagen soll
+        -- nicht auffaelliger sein als Weglaufen.
+        local base = (AP.mode == "JAGD") and 0.5 or 0   -- auch auf Distanz Tempo
         local f = math.min(base + (1 - base) * r, 1)
         local sp = 1 + p.chsBoost * f
         if sp > wantSpeed then wantSpeed, wantAccel = sp, lerp(1, p.escAccel, f) end
+    end
+
+    -- GEGENSEITIGE MODI (FFA Royal, Slasher, Team): dort ist man gleichzeitig
+    -- Jaeger und Gejagter, also greifen Flucht- und Jagdboost abwechselnd und
+    -- praktisch dauerhaft. Genau dort faellt Tempo am meisten auf, weil alle
+    -- dieselbe Rolle haben und direkt vergleichbar sind. Deshalb hier ein
+    -- harter Deckel von +6 % statt der sonst moeglichen +15 %.
+    if (state.nThreat or 0) > 0 and (state.nPrey or 0) > 0 then
+        wantSpeed = math.min(wantSpeed, 1.06)
+        wantAccel = math.min(wantAccel, 1.25)
     end
 
     -- Auf einem geplanten Weg zaehlt vor allem, die vorgegebene Richtung
@@ -5559,7 +5812,9 @@ local function assistStep(dt)
             -- knapp zwei Sekunden entscheidet sich, ob der Verfolger
             -- aufschliesst. Mehr Beschleunigung dazu, damit die neue Richtung
             -- schnell anliegt.
-            S.boosts.__utgjuke = { Speed = 1.25, Accel = 1.6, Jump = 1 }
+            local mut = (state.nThreat or 0) > 0 and (state.nPrey or 0) > 0
+            S.boosts.__utgjuke = { Speed = mut and 1.08 or 1.25,
+                                   Accel = mut and 1.3 or 1.6, Jump = 1 }
         else
             S.boosts.__utgjuke = nil
         end
@@ -5647,7 +5902,19 @@ local function assistStep(dt)
     -- in Kamerarichtung statt in Laufrichtung.
     AP.climbRotating = false
 
-    autopilotStep(threat, threatD, prey, preyD)
+    -- ABGESICHERT. Ein Fehler im Autopilotschritt darf nicht verhindern, dass
+    -- die Grundeinstellungen darunter gesetzt werden — die Drehung in
+    -- Laufrichtung steht drei Zeilen weiter. Genau daran hing die
+    -- "Kamerakopplung": ein einziger fehlerhafter Feldzugriff brach den
+    -- Schritt jeden Frame ab, RotateInMoveDirection blieb aus, und der
+    -- Charakter richtete sich wieder nach der Kamera aus.
+    local okAP, errAP = pcall(autopilotStep, threat, threatD, prey, preyD)
+    if not okAP then
+        AP.stepFails = (AP.stepFails or 0) + 1
+        if AP.stepFails % 120 == 1 then
+            LOG("FEHLER autopilotStep: " .. tostring(errAP))
+        end
+    end
     -- Seitwaerts-/Rueckwaerts-Sprint nur waehrend der Autopilot wirklich faehrt
     if not AP.mode then m.RunInAllDirections = false end
     -- Charakter schaut immer in die Laufrichtung, die Kamera bleibt frei drehbar
@@ -6090,6 +6357,26 @@ ayipBtn.Activated:Connect(function()
 end)
 refreshAyip()
 
+-- Sound nach gelungener Finte. Beim Einschalten wird der Ordner neu
+-- eingelesen, damit frisch hineingelegte Dateien sofort mitspielen.
+local _, rSnd = makeButton("Finten-Sound", function() return CFG.jukeSound end,
+    function()
+        CFG.jukeSound = not CFG.jukeSound
+        if CFG.jukeSound then
+            local n, nf, ni = ENV.reloadSounds()
+            state.sndCount = n
+            if n > 0 then
+                LOG(("Finten-Sound an: %d Sounds (%d Dateien, %d IDs)"):format(n, nf, ni))
+            else
+                LOG("Finten-Sound an, aber KEINE Sounds gefunden — mp3/ogg/wav in den "
+                    .. "Executor-Ordner 'utg_sounds' legen oder Asset-IDs "
+                    .. "zeilenweise in 'utg_sounds.txt' schreiben, dann den "
+                    .. "Schalter aus- und wieder einschalten")
+            end
+        end
+        if ENV.saveSettings then ENV.saveSettings() end
+    end)
+
 local _, rThird = makeButton("3rd Person  [RightAlt]", function() return CFG.thirdPerson end,
                       function() ENV.toggleThird() end)
 rFree = rThird
@@ -6201,6 +6488,16 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
     flushLog(false)
 end)
 
+-- War der Finten-Sound beim letzten Mal an, gleich die Sounds einlesen —
+-- sonst steht der Schalter auf AN und es kommt nichts.
+if CFG.jukeSound then
+    task.spawn(function()
+        local n = ENV.reloadSounds()
+        state.sndCount = n
+        LOG(("Finten-Sound aktiv: %d Sounds geladen"):format(n))
+    end)
+end
+
 watchCharacter(LP.Character)
 conns[#conns + 1] = Players.PlayerRemoving:Connect(function(pl)
     velTrack[pl] = nil
@@ -6238,8 +6535,9 @@ task.spawn(function()
             .. nl .. ("  Speed +%d%%   Reach %.1f   Tags %d/%d"):format(
                 math.floor((state.speedMul - 1) * 100 + 0.5), state.reach,
                 state.tagsOk or 0, state.tagsMiss or 0)
-            .. nl .. ("  %s   AYIP %s"):format(modeTxt,
-                (CFG.ayip or 0) == 0 and "aus" or tostring(CFG.ayip))
+            .. nl .. ("  %s   AYIP %s%s"):format(modeTxt,
+                (CFG.ayip or 0) == 0 and "aus" or tostring(CFG.ayip),
+                CFG.jukeSound and ("   Sounds " .. tostring(state.sndCount or 0)) or "")
     end
 end)
 
@@ -6285,6 +6583,9 @@ function ENV.cleanup()
     pcall(function() RunService:UnbindFromRenderStep(RENDER_NAME) end)
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
     pcall(visClear)     -- nur der eigene Ordner, sonst nichts in workspace
+    -- eigene Sound-Instanzen mitnehmen, sonst haengen sie nach einer
+    -- Neuinjektion doppelt im SoundService
+    if SND and SND.holder then pcall(function() SND.holder:Destroy() end) end
     AP.mode, AP.vec = nil, nil
     if CFG.thirdPerson then CFG.thirdPerson = false pcall(thirdStop) end
     -- Hooks zurueckbauen
