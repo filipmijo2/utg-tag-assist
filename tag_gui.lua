@@ -886,10 +886,48 @@ local function threatGap(a, b)
     return math.sqrt(dxz * dxz + dy * dy)
 end
 
+-- VORSPRUNGSFELD. Zwei Kostenfelder ueber denselben Graphen: eines von mir
+-- aus, eines vom naechsten Verfolger aus. Die Differenz je Knoten sagt, wie
+-- viele Sekunden Vorsprung ich dort haette. Genau das ist "unfangbar": nicht
+-- weit weg sein, sondern an einem Punkt stehen, den der andere nur ueber
+-- einen langen Umweg erreicht.
+-- Gerechnet wird im Hintergrund und hoechstens alle 2.5 Sekunden, ein Feld
+-- kostet rund 40 ms.
+local LEAD = { at = 0, mine = nil, theirs = nil, from = nil, busy = false }
+local function leadField(pos, threats)
+    local NG = getgenv().__UTG_NAV_GRAPH
+    if not NG or not NG.graph or not NG.costField then return nil end
+    local t = threats and threats[1]
+    if not t then return nil end
+    -- naechsten Verfolger nehmen
+    local best, bd = nil, 1e9
+    for _, x in ipairs(threats) do
+        local dd = (x.pos - pos).Magnitude
+        if dd < bd then best, bd = x, dd end
+    end
+    if not best then return nil end
+    local now = tick()
+    local stale = (now - LEAD.at > 2.5)
+        or (LEAD.from and (LEAD.from - best.pos).Magnitude > 40)
+    if not stale or LEAD.busy then return LEAD.mine and LEAD end
+    LEAD.busy = true
+    task.spawn(function()
+        local okA, mine = pcall(NG.costField, pos, 6000)
+        local okB, theirs = pcall(NG.costField, best.pos, 6000)
+        if okA and okB and mine and theirs then
+            LEAD.mine, LEAD.theirs, LEAD.from, LEAD.at = mine, theirs, best.pos, tick()
+        end
+        LEAD.busy = false
+    end)
+    return LEAD.mine and LEAD or nil
+end
+
 local function pickEscapeGraph(pos, threats)
     local NG = getgenv().__UTG_NAV_GRAPH
     local G = NG and NG.graph
     if not G or #G.nodes < 50 then return nil end
+    local lead = leadField(pos, threats)
+    local bestLead = 0
     local best, bestScore
     local n = #G.nodes
     -- Stichprobe statt aller Knoten: bei 28000 waere das jede Sekunde zu teuer
@@ -918,8 +956,23 @@ local function pickEscapeGraph(pos, threats)
                     end
                     if not blockedBy then
                         local up = nd.p.Y - pos.Y
+                        -- VORSPRUNG IN SEKUNDEN: was braucht er dorthin,
+                        -- was brauche ich? Das ist der staerkste Term im
+                        -- ganzen Urteil — ein Punkt mit zehn Sekunden
+                        -- Vorsprung schlaegt jeden, der nur hoch liegt.
+                        local leadSec = 0
+                        if lead and lead.mine and lead.theirs then
+                            local a, b = lead.mine[nd.id], lead.theirs[nd.id]
+                            if a and b then
+                                leadSec = b - a
+                            elseif a and not b then
+                                -- er kommt ueberhaupt nicht hin
+                                leadSec = 20
+                            end
+                        end
                         local score =
-                              math.min(up, 60) * 2.2          -- Hoehe zaehlt stark
+                              math.clamp(leadSec, -10, 25) * 6.0
+                            + math.min(up, 60) * 2.2          -- Hoehe zaehlt stark
                             -- und noch staerker: wie hoch liegt der Punkt
                             -- UEBER dem naechsten Verfolger. Darauf kommt es
                             -- an, nicht auf die eigene Ausgangshoehe.
@@ -928,12 +981,18 @@ local function pickEscapeGraph(pos, threats)
                             + math.min(ways, 12) * 3.0        -- viele Auswege
                             - dist * 0.25                     -- nicht ans Kartenende
                         if not bestScore or score > bestScore then
-                            best, bestScore = nd.p, score
+                            best, bestScore, bestLead = nd.p, score, leadSec
                         end
                     end
                 end
             end
         end
+    end
+    if best and ENV.diagEvent then
+        ENV.diagEvent("fluchtziel", ("%.1f"):format(bestLead),
+                      ("%.0f"):format(best.Y - pos.Y),
+                      ("%.0f"):format((best - pos).Magnitude),
+                      lead and "mit Vorsprungsfeld" or "ohne Feld")
     end
     return best
 end
@@ -1985,9 +2044,12 @@ do
     -- bringen Hoehe und Strecke, ohne dass ein Verfolger mitkommt.
     NAV.KINDW = {
         walk = 1.00, roll = 1.00, step = 1.00, drop = 0.95,
-        hop  = 0.65,        -- Stufe hoch
-        jump = 0.70,        -- Sprung ueber eine Luecke
-        climb = 0.40,       -- Leiter
+        -- Vertikalitaet noch einmal guenstiger: oben ist man schwerer zu
+        -- erreichen, und ein Verfolger, der klettern muss, verliert die
+        -- Sichtlinie. Das ist der Kern des Unfangbar-Modus.
+        hop  = 0.55,        -- Stufe hoch
+        jump = 0.60,        -- Sprung ueber eine Luecke
+        climb = 0.30,       -- Leiter
         -- Wallride bewusst TEUER: er braucht eigens markierte Waende, bricht
         -- oft ab und kostet dann das ganze Tempo. Nur wenn es sonst keinen
         -- Weg gibt.
@@ -1998,7 +2060,70 @@ do
     }
     -- Zusaetzlicher Abschlag auf JEDE Kante, die Hoehe gewinnt — auch auf
     -- gewoehnliche Wege ueber Treppen und Rampen.
-    NAV.RISE_DISCOUNT = 0.75
+    NAV.RISE_DISCOUNT = 0.62
+
+    -- KOSTENFELD: wie lange braucht jemand von einem Punkt aus zu jedem
+    -- Knoten? Ein Dijkstra ohne Ziel, mit Deckel. Damit laesst sich fuer
+    -- jeden Fluchtpunkt vergleichen, was ER braucht und was ICH brauche —
+    -- und genau diese Differenz ist das Mass fuer "schwer zu fangen".
+    -- Ein Punkt, den ich in drei und mein Verfolger erst in fuenfzehn
+    -- Sekunden erreicht, ist mehr wert als einer, der nur weit weg ist.
+    function NAV.costField(fromPos, budget)
+        local G = NAV.graph
+        if not G then return nil end
+        local s = nearest(G.grid, G.bb, G.cell, fromPos, 30, 14)
+        if not s then return nil end
+        local nodes = G.nodes
+        local dist, closed = { [s.id] = 0 }, {}
+        local heap, hn = {}, 0
+        local function push(id, f)
+            hn = hn + 1 ; heap[hn] = { id = id, f = f }
+            local i = hn
+            while i > 1 do
+                local pa = math.floor(i / 2)
+                if heap[pa].f <= heap[i].f then break end
+                heap[pa], heap[i] = heap[i], heap[pa] ; i = pa
+            end
+        end
+        local function pop()
+            if hn == 0 then return nil end
+            local top = heap[1]
+            heap[1] = heap[hn] ; heap[hn] = nil ; hn = hn - 1
+            local i = 1
+            while true do
+                local l, r, m = i*2, i*2+1, i
+                if l <= hn and heap[l].f < heap[m].f then m = l end
+                if r <= hn and heap[r].f < heap[m].f then m = r end
+                if m == i then break end
+                heap[m], heap[i] = heap[i], heap[m] ; i = m
+            end
+            return top.id
+        end
+        push(s.id, 0)
+        local seen = 0
+        budget = budget or 7000
+        while seen < budget do
+            local cur = pop()
+            if not cur then break end
+            if not closed[cur] then
+                closed[cur] = true
+                seen = seen + 1
+                if seen % 2000 == 0 then RunService.Heartbeat:Wait() end
+                local n = nodes[cur]
+                for _, e in ipairs(n.e) do
+                    local w = NAV.KINDW[e.k] or 1
+                    local tn = nodes[e.to]
+                    if tn and tn.p.Y - n.p.Y > 1 then w = w * NAV.RISE_DISCOUNT end
+                    local ng = dist[cur] + e.c * w
+                    if not dist[e.to] or ng < dist[e.to] then
+                        dist[e.to] = ng
+                        push(e.to, ng)
+                    end
+                end
+            end
+        end
+        return dist, seen
+    end
 
     function NAV.findPath(startPos, goalPos)
         local G = NAV.graph
@@ -7292,7 +7417,10 @@ local function assistStep(dt)
     -- D) PARKOUR: Mechaniken freischalten / leicht tunen
     ---------------------------------------------------------------
     if CFG.parkour then
-        m.EnableWallrunning    = true
+        -- WALLRIDE BLEIBT IM UNFANGBAR-MODUS AUS (Nutzer-Vorgabe).
+        -- Mit AYIP aus soll die Unfangbarkeit allein aus der Route kommen,
+        -- nicht aus einer Mechanik, die ohne den Schalter gar nicht ginge.
+        m.EnableWallrunning    = (CFG.ayip or 0) > 0
         m.EnableTictacs        = true
         m.DisableWallClimbs    = false
         m.DisableVaulting      = false
