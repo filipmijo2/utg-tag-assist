@@ -244,7 +244,9 @@ function ENV.diag()
     for _, k in ipairs(order) do row(k) end
     -- alles, was unten eigene Abschnitte hat, hier nicht noch einmal
     for k in pairs(DIAG.stat) do
-        if not (k:match("^art_") or k:match("^wegquelle_") or k:match("^wegende_")) then
+        if not (k:match("^art_") or k:match("^wegquelle_") or k:match("^wegende_")
+                or k:match("^graphgrund_") or k:match("^graph_")
+                or k == "wegstart") then
             row(k)
         end
     end
@@ -274,6 +276,35 @@ function ENV.diag()
                         diagAvgTxt("art_" .. kind, "min", ""),
                         diagAvgTxt("art_" .. kind, "spd", ""),
                         diagAvgTxt("art_" .. kind, "zeit", "s"))
+        end
+    end
+
+    local ws = DIAG.stat.wegstart
+    if ws and ws.n > 0 then
+        out[#out + 1] = "-- Wegbeginn --"
+        out[#out + 1] = "  Abstand zum ersten Punkt  " .. diagAvgTxt("wegstart", "abstand", " Studs")
+        out[#out + 1] = "  uebersprungene Punkte     " .. diagAvgTxt("wegstart", "uebersprungen", "")
+    end
+
+    -- GRAPH GEGEN PATHFINDINGSERVICE
+    local go, gf = DIAG.stat.graph_ok, DIAG.stat.graph_fehler
+    if (go and go.n or 0) + (gf and gf.n or 0) > 0 then
+        local nOk, nF = go and go.n or 0, gf and gf.n or 0
+        out[#out + 1] = "-- Graph-Abfragen --"
+        out[#out + 1] = ("  %d erfolgreich, %d gescheitert (%d%% Trefferquote)")
+            :format(nOk, nF, math.floor(nOk * 100 / math.max(nOk + nF, 1)))
+        out[#out + 1] = "  Abstand Bot->Knoten bei Erfolg   " .. diagAvgTxt("graph_ok", "start", " Studs")
+        out[#out + 1] = "  Abstand Ziel->Knoten bei Erfolg  " .. diagAvgTxt("graph_ok", "ziel", " Studs")
+        if nF > 0 then
+            out[#out + 1] = "  bei Fehlschlag Bot->Knoten       " .. diagAvgTxt("graph_fehler", "start", " Studs")
+            out[#out + 1] = "  bei Fehlschlag Ziel->Knoten      " .. diagAvgTxt("graph_fehler", "ziel", " Studs")
+            local gr = {}
+            for k, v in pairs(DIAG.stat) do
+                local r = k:match("^graphgrund_(.+)$")
+                if r then gr[#gr + 1] = ("%s=%d"):format(r, v.n) end
+            end
+            table.sort(gr)
+            if #gr > 0 then out[#out + 1] = "  Gruende: " .. table.concat(gr, "  ") end
         end
     end
 
@@ -1661,6 +1692,103 @@ do
         return zips, pads, rails
     end
     
+    -- 4g) INSELN VERBINDEN.
+    -- Gemessen auf UltimatePaintball: 23086 Knoten in 390 nicht verbundenen
+    -- Inseln, die groesste mit 70 Prozent der Knoten — 30 Prozent hingen voellig
+    -- ab. Von dort fand A* nie einen Weg ("kein Weg im Graphen" war mit Abstand
+    -- der haeufigste Fehlschlag). Die Ursachen sind Kanten, die knapp ausserhalb
+    -- der Reichweiten liegen: ein Absatz einen Tick zu hoch, eine Luecke einen
+    -- Tick zu weit, ein Dach, das man nur im Fallen erreicht.
+    -- Deshalb nach dem Kantenbau: Inseln bestimmen, und von jeder kleinen Insel
+    -- zur naechstgelegenen anderen eine Verbindung suchen — fallen, wenn es
+    -- abwaerts geht, springen, wenn der Bogen frei ist.
+    local function components(nodes)
+        local comp, count = {}, 0
+        for i = 1, #nodes do
+            if not comp[i] then
+                count = count + 1
+                local stack, seen = { i }, 0
+                comp[i] = count
+                while #stack > 0 do
+                    local id = table.remove(stack)
+                    seen = seen + 1
+                    for _, e in ipairs(nodes[id].e) do
+                        if not comp[e.to] then
+                            comp[e.to] = count
+                            stack[#stack + 1] = e.to
+                        end
+                    end
+                    if seen % 3000 == 0 then breathe() end
+                end
+            end
+        end
+        return comp, count
+    end
+
+    local function linkIslands(nodes, grid, bb, cell, prof)
+        local comp, nComp = components(nodes)
+        if nComp < 2 then return 0, nComp, nComp end
+        -- Groesse je Insel
+        local size = {}
+        for i = 1, #nodes do size[comp[i]] = (size[comp[i]] or 0) + 1 end
+        -- Knoten nach Insel sammeln
+        local byComp = {}
+        for i = 1, #nodes do
+            local c = comp[i]
+            local t = byComp[c] ; if not t then t = {} byComp[c] = t end
+            t[#t + 1] = i
+        end
+        local linked = 0
+        local span = math.ceil(28 / cell)
+        for c, ids in pairs(byComp) do
+            -- die groesste Insel selbst nicht behandeln
+            local isBiggest = true
+            for c2, s2 in pairs(size) do
+                if s2 > size[c] then isBiggest = false break end
+            end
+            if not isBiggest then
+                local made = 0
+                for _, id in ipairs(ids) do
+                    if made >= 3 then break end
+                    local a = nodes[id]
+                    for dx = -span, span do
+                        for dz = -span, span do
+                            local b = grid[(a.ix + dx) .. "," .. (a.iz + dz)]
+                            if b then
+                                for _, o in ipairs(b) do
+                                    if comp[o.id] ~= c and size[comp[o.id]] > size[c] then
+                                        local flat = ((o.p - a.p) * Vector3.new(1,0,1)).Magnitude
+                                        local dy = o.p.Y - a.p.Y
+                                        if flat < 28 then
+                                            if dy < -1 and dy > -70
+                                               and not cast(a.p + Vector3.new(0,1,0),
+                                                            (o.p - a.p) + Vector3.new(0,-1,0)) then
+                                                addEdge(a, o, "drop",
+                                                        math.sqrt(2*math.abs(dy)/prof.g) + flat/prof.speed)
+                                                linked = linked + 1 ; made = made + 1
+                                            elseif flat <= prof.reach * 0.9 and dy <= prof.rise
+                                                   and arcClear(a.p, o.p, prof) then
+                                                addEdge(a, o, "jump", flat/prof.speed + 0.25)
+                                                addEdge(o, a, "jump", flat/prof.speed + 0.25)
+                                                linked = linked + 1 ; made = made + 1
+                                            end
+                                        end
+                                    end
+                                    if made >= 3 then break end
+                                end
+                            end
+                            if made >= 3 then break end
+                        end
+                        if made >= 3 then break end
+                    end
+                end
+            end
+            breathe()
+        end
+        local _, after = components(nodes)
+        return linked, nComp, after
+    end
+
     ------------------------------------------------------------------
     -- 5) A* ueber den Graphen. Kosten in Sekunden, Heuristik ebenso.
     ------------------------------------------------------------------
@@ -1811,6 +1939,8 @@ do
         stats.jump, stats.drop, stats.rim = j, d, #rim
         stats.wallrun, stats.wallParts = 0, 0   -- siehe 4d: bewusst ausgeschlossen
         stats.zip, stats.pad, stats.rail = buildHelpers(nodes, grid, bb, cell, mapRoot, prof)
+        stats.linked, stats.islandsBefore, stats.islandsAfter =
+            linkIslands(nodes, grid, bb, cell, prof)
     
         NAV.graph = { nodes = nodes, grid = grid, cell = cell, bb = bb,
                       prof = prof, map = mapRoot.Name, stats = stats }
@@ -1848,7 +1978,7 @@ do
     
         local lines = string.split(blob, "\n")
         local head = string.split(lines[1] or "", "|")
-        if head[1] ~= "UTGNAV9" then return nil end
+        if head[1] ~= "UTGNAV10" then return nil end
         local cell = tonumber(head[3])
         local bbv = string.split(head[4] or "", ",")
         if not cell or #bbv < 6 then return nil end
@@ -1908,7 +2038,7 @@ do
         -- stueckweise zusammensetzen: ein einzelner String mit Millionen
         -- Verkettungen sprengt den Speicher
         local parts = {
-            ("UTGNAV9|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
+            ("UTGNAV10|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
                 r1(G.bb.min.X), r1(G.bb.min.Y), r1(G.bb.min.Z),
                 r1(G.bb.max.X), r1(G.bb.max.Y), r1(G.bb.max.Z))
         }
@@ -2022,10 +2152,12 @@ local function ensureGraph()
             LOG(("Navigationsgraph fuer %s gebaut: %d Knoten in %.1f s — %d gehen, "
                  .. "%d Stufe hoch, %d Stufe runter, %d springen, %d fallen, "
                  .. "%d klettern, %d zip, %d pad; %d Punkte wegen zu wenig "
-                 .. "Platz verworfen, %d von Waenden weggeschoben")
+                 .. "Platz verworfen, %d von Waenden weggeschoben; "
+                 .. "Inseln %d -> %d durch %d Verbindungen")
                 :format(g.map, s.nodes, s.secs, s.walk, s.hop or 0, s.step or 0,
                         s.jump, s.drop, s.climb, s.zip, s.pad, s.narrow or 0,
-                        s.offWall or 0))
+                        s.offWall or 0, s.islandsBefore or 0, s.islandsAfter or 0,
+                        s.linked or 0))
             -- pcall allein genuegt hier nicht: NAV.save kann sauber
             -- zurueckkehren und trotzdem false melden
             local okCall, saved, info = pcall(NAV.save)
@@ -2372,9 +2504,60 @@ local function lineFree(a, b)
 end
 
 local function computeGraph(fromPos, toPos)
-    if not NAV.graph then return nil end
-    local ok, path = pcall(NAV.findPath, fromPos, toPos)
-    if not ok or type(path) ~= "table" or #path < 2 then return nil end
+    if not NAV.graph then
+        diagStat("graph_kein_graph").n = diagStat("graph_kein_graph").n + 1
+        return nil
+    end
+    -- WIE WEIT LIEGT DER GRAPH VOM BOT UND VOM ZIEL WEG?
+    -- Gemessen stand der Bot schon 9 Studs neben und 9 Studs ueber dem
+    -- naechsten Knoten. Der Weg beginnt dann an einer Stelle, an der er gar
+    -- nicht ist — die ersten Wegpunkte sind unerreichbar und der ganze Weg
+    -- wird verworfen. Ohne diese Zahl im Log sieht man das nie.
+    local G = NAV.graph
+    local function nearestDist(p)
+        local bd, bn = 1e9, nil
+        local cell, bb = G.cell, G.bb
+        local ix = math.floor((p.X - bb.min.X) / cell + 0.5)
+        local iz = math.floor((p.Z - bb.min.Z) / cell + 0.5)
+        for dx = -3, 3 do
+            for dz = -3, 3 do
+                local b = G.grid[(ix + dx) .. "," .. (iz + dz)]
+                if b then
+                    for _, n in ipairs(b) do
+                        local d = (n.p - p).Magnitude
+                        if d < bd then bd, bn = d, n end
+                    end
+                end
+            end
+        end
+        return bd, bn
+    end
+    local dStart = nearestDist(fromPos)
+    local dGoal = nearestDist(toPos)
+
+    local ok, path, why = pcall(NAV.findPath, fromPos, toPos)
+    if not ok or type(path) ~= "table" or #path < 2 then
+        local reason = (not ok) and "Fehler" or tostring(why or "leer")
+        diagStat("graph_fehler").n = diagStat("graph_fehler").n + 1
+        diagStat("graphgrund_" .. reason:gsub("%s+", "_")).n =
+            diagStat("graphgrund_" .. reason:gsub("%s+", "_")).n + 1
+        diagVal("graph_fehler", "start", dStart)
+        diagVal("graph_fehler", "ziel", dGoal)
+        diagLine("graph_fehler",
+            "%s | Bot %.1f Studs vom naechsten Knoten, Ziel %.1f | -> PathfindingService",
+            reason, dStart, dGoal)
+        return nil
+    end
+    diagStat("graph_ok").n = diagStat("graph_ok").n + 1
+    diagVal("graph_ok", "start", dStart)
+    diagVal("graph_ok", "ziel", dGoal)
+    -- Ein Weg, der weit weg vom Bot beginnt, ist der haeufigste Grund fuer
+    -- abgebrochene Routen: die ersten Punkte liegen hinter ihm oder ueber ihm.
+    if dStart > 8 then
+        diagLine("start_weit_weg",
+            "Weg beginnt %.1f Studs neben dem Bot (Ziel %.1f Studs neben dem Knoten)",
+            dStart, dGoal)
+    end
 
     local raw = {}
     for i, step in ipairs(path) do
@@ -2521,11 +2704,32 @@ local function requestPath(fromPos, candidates)
             PATH.air, PATH.prog, PATH.syncAt = nil, nil, nil
             AP.pathLoose = false
             visPath(wps)
-            -- Normalerweise ist der erste Wegpunkt der eigene Standort und
-            -- wird uebersprungen. Traegt er aber schon die Sprungmarke
-            -- (erste Kante des Weges ist ein Sprung), darf er nicht
-            -- entfallen, sonst faellt genau dieser Absprung aus.
+            -- DA ANFANGEN, WO DER BOT WIRKLICH STEHT.
+            -- Der Graph haengt den Weg an den naechstgelegenen Knoten, und der
+            -- liegt gemessen im Schnitt 6.1 Studs neben dem Bot (bis zu 22).
+            -- Stur bei Punkt 2 zu beginnen heisst dann: die ersten Wegpunkte
+            -- liegen neben oder hinter ihm, er laeuft erst einmal zurueck,
+            -- und der halbe Weg ist verbraucht, bevor es vorwaerts geht.
+            -- Deshalb den Punkt suchen, der dem Bot am naechsten liegt, und
+            -- beim darauffolgenden einsteigen — aber nur unter den ersten
+            -- sechs, damit eine Schleife im Weg nicht abgekuerzt wird.
             local startIdx = (wps[1] and wps[1].takeoff) and 1 or 2
+            do
+                local bestI, bestD = startIdx, math.huge
+                for k = 1, math.min(6, #wps) do
+                    if wps[k].takeoff then break end   -- Abspruenge nie ueberspringen
+                    local d = ((wps[k].Position - fromPos) * Vector3.new(1, 0, 1)).Magnitude
+                    if d < bestD then bestI, bestD = k, d end
+                end
+                local cand = math.min(bestI + 1, #wps)
+                if cand > startIdx and not wps[cand - 1].takeoff then
+                    startIdx = cand
+                end
+                diagVal("wegstart", "abstand",
+                    ((wps[startIdx].Position - fromPos) * Vector3.new(1, 0, 1)).Magnitude)
+                diagVal("wegstart", "uebersprungen", startIdx - 2)
+                diagStat("wegstart").n = diagStat("wegstart").n + 1
+            end
             PATH.wps, PATH.idx, PATH.at, PATH.target, PATH.fails =
                 wps, startIdx, tick(), used, 0
             PATH.nextAllowed = nil
