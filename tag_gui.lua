@@ -291,8 +291,15 @@ function ENV.diag()
     if (go and go.n or 0) + (gf and gf.n or 0) > 0 then
         local nOk, nF = go and go.n or 0, gf and gf.n or 0
         out[#out + 1] = "-- Graph-Abfragen --"
-        out[#out + 1] = ("  %d erfolgreich, %d gescheitert (%d%% Trefferquote)")
-            :format(nOk, nF, math.floor(nOk * 100 / math.max(nOk + nF, 1)))
+        local nNear = (DIAG.stat.graph_zu_nah or {}).n or 0
+        out[#out + 1] = ("  %d erfolgreich, %d gescheitert (%d%% Trefferquote), "
+                         .. "%d mal Ziel schon im Startknoten")
+            :format(nOk, nF, math.floor(nOk * 100 / math.max(nOk + nF, 1)), nNear)
+        local noA = (DIAG.stat.graph_bot_ohne_knoten or {}).n or 0
+        local noB = (DIAG.stat.graph_ziel_ohne_knoten or {}).n or 0
+        if noA + noB > 0 then
+            out[#out + 1] = ("  ohne Knoten in Reichweite: Bot %dx, Ziel %dx"):format(noA, noB)
+        end
         out[#out + 1] = "  Abstand Bot->Knoten bei Erfolg   " .. diagAvgTxt("graph_ok", "start", " Studs")
         out[#out + 1] = "  Abstand Ziel->Knoten bei Erfolg  " .. diagAvgTxt("graph_ok", "ziel", " Studs")
         if nF > 0 then
@@ -2515,6 +2522,9 @@ local function computeGraph(fromPos, toPos)
     -- wird verworfen. Ohne diese Zahl im Log sieht man das nie.
     local G = NAV.graph
     local function nearestDist(p)
+        -- Rueckgabe nil statt einer Fantasiezahl, wenn nichts in Reichweite
+        -- liegt: ein Platzhalter von 1e9 hat die Mittelwerte im Bericht
+        -- unbrauchbar gemacht (421524666 Studs).
         local bd, bn = 1e9, nil
         local cell, bb = G.cell, G.bb
         local ix = math.floor((p.X - bb.min.X) / cell + 0.5)
@@ -2530,30 +2540,49 @@ local function computeGraph(fromPos, toPos)
                 end
             end
         end
+        if not bn then return nil end
         return bd, bn
     end
     local dStart = nearestDist(fromPos)
     local dGoal = nearestDist(toPos)
 
     local ok, path, why = pcall(NAV.findPath, fromPos, toPos)
+    -- ZIEL LIEGT IM SELBEN KNOTEN WIE DER START.
+    -- A* gibt dann einen Weg aus einem einzigen Punkt zurueck. Das galt
+    -- bisher als Fehlschlag, worauf PathfindingService einen langen Weg fuer
+    -- eine Strecke von wenigen Studs gerechnet hat — gemessen 221 von 446
+    -- "Fehlschlaegen" waren genau das. Richtig ist: einfach direkt hinlaufen.
+    if ok and type(path) == "table" and #path == 1 then
+        diagStat("graph_zu_nah").n = diagStat("graph_zu_nah").n + 1
+        return { { Position = path[1].node.p, Action = Enum.PathWaypointAction.Walk,
+                   kind = "walk" },
+                 { Position = toPos, Action = Enum.PathWaypointAction.Walk,
+                   kind = "walk" } }
+    end
     if not ok or type(path) ~= "table" or #path < 2 then
         local reason = (not ok) and "Fehler" or tostring(why or "leer")
-        diagStat("graph_fehler").n = diagStat("graph_fehler").n + 1
+        -- NICHT hochzaehlen: diagLine() unten erhoeht denselben Zaehler
+        -- bereits. Doppelt gezaehlt sah die Trefferquote halb so gut aus,
+        -- wie sie ist (130 statt 65 Fehlschlaege).
         diagStat("graphgrund_" .. reason:gsub("%s+", "_")).n =
             diagStat("graphgrund_" .. reason:gsub("%s+", "_")).n + 1
-        diagVal("graph_fehler", "start", dStart)
-        diagVal("graph_fehler", "ziel", dGoal)
+        if dStart then diagVal("graph_fehler", "start", dStart)
+        else diagStat("graph_bot_ohne_knoten").n = diagStat("graph_bot_ohne_knoten").n + 1 end
+        if dGoal then diagVal("graph_fehler", "ziel", dGoal)
+        else diagStat("graph_ziel_ohne_knoten").n = diagStat("graph_ziel_ohne_knoten").n + 1 end
         diagLine("graph_fehler",
-            "%s | Bot %.1f Studs vom naechsten Knoten, Ziel %.1f | -> PathfindingService",
-            reason, dStart, dGoal)
+            "%s | Bot %s vom naechsten Knoten, Ziel %s | -> PathfindingService",
+            reason,
+            dStart and ("%.1f"):format(dStart) or "KEIN Knoten in Reichweite",
+            dGoal and ("%.1f"):format(dGoal) or "KEIN Knoten in Reichweite")
         return nil
     end
     diagStat("graph_ok").n = diagStat("graph_ok").n + 1
-    diagVal("graph_ok", "start", dStart)
-    diagVal("graph_ok", "ziel", dGoal)
+    if dStart then diagVal("graph_ok", "start", dStart) end
+    if dGoal then diagVal("graph_ok", "ziel", dGoal) end
     -- Ein Weg, der weit weg vom Bot beginnt, ist der haeufigste Grund fuer
     -- abgebrochene Routen: die ersten Punkte liegen hinter ihm oder ueber ihm.
-    if dStart > 8 then
+    if dStart and dStart > 8 then
         diagLine("start_weit_weg",
             "Weg beginnt %.1f Studs neben dem Bot (Ziel %.1f Studs neben dem Knoten)",
             dStart, dGoal)
@@ -2582,6 +2611,15 @@ local function computeGraph(fromPos, toPos)
     -- sie dort erwarten.
     for i = 2, #raw do
         local k = raw[i].kind
+        -- SCHIENE: aufgesprungen wird am NAHEN Ende, nicht am fernen. Der
+        -- Wegpunkt der Art "rail" ist das Ziel der Fahrt — stur darauf
+        -- zuzuhalten heisst, am Boden daneben herzulaufen. Gemessen kam der
+        -- Bot solchen Punkten nie naeher als 18 Studs.
+        if k == "rail" then
+            local t = raw[i - 1]
+            t.railEntry = true
+            t.railTo = raw[i].Position
+        end
         if k == "jump" or k == "hop" then
             local t = raw[i - 1]
             t.Action = Enum.PathWaypointAction.Jump
@@ -2945,8 +2983,8 @@ local function wpsExact(wps, idx)
     local w = wps and wps[idx]
     if not w then return false end
     local k = w.kind
-    return w.takeoff or k == "climb" or k == "zip" or k == "pad" or k == "via"
-        or k == "rail"
+    return w.takeoff or w.railEntry
+        or k == "climb" or k == "zip" or k == "pad" or k == "via" or k == "rail"
 end
 
 -- liefert die Richtung zum naechsten Wegpunkt (oder nil, wenn kein Pfad taugt).
@@ -3433,17 +3471,34 @@ local function followPath(pos, mode)
         end
     end
 
-    -- RAIL (Grindschiene). Der Spielcode startet den Grind, wenn man auf der
-    -- Schiene LANDET — anlaufen allein reicht nicht. Also einmal aufspringen,
-    -- solange dieser Wegpunkt gilt, und dabei Tempo behalten (die Schiene
-    -- lebt vom Schwung, gebremst wird hier bewusst nicht).
-    if wp.kind == "rail" then
+    -- RAIL (Grindschiene), EINSTIEG. Der Spielcode startet den Grind, wenn
+    -- man auf der Schiene LANDET. Der Einstieg liegt am nahen Ende; von dort
+    -- geht es die Schiene entlang. Also: auf den Einstieg zuhalten, und beim
+    -- Erreichen einmal in Fahrtrichtung der Schiene aufspringen. Tempo bleibt
+    -- oben, der Grind lebt vom Schwung.
+    if wp.railEntry and wp.railTo then
+        local toEntry = (wp.Position - pos) * Vector3.new(1, 0, 1)
+        local along = (wp.railTo - wp.Position) * Vector3.new(1, 0, 1)
+        local d = toEntry.Magnitude
         local humR = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
         local grounded = humR and humR.FloorMaterial ~= Enum.Material.Air
-        if grounded and tick() - (AP.railJumpAt or 0) > 1.0 then
+        if d > 4 then
+            -- von hinten auf den Einstieg zu, damit er in Fahrtrichtung
+            -- ankommt und nicht quer
+            if along.Magnitude > 0.1 then
+                local aim = wp.Position - along.Unit * math.min(d * 0.5, 5)
+                local v = (aim - pos) * Vector3.new(1, 0, 1)
+                if v.Magnitude > 0.1 then return v.Unit end
+            end
+            if toEntry.Magnitude > 0.1 then return toEntry.Unit end
+        end
+        if grounded and tick() - (AP.railJumpAt or 0) > 0.8 then
             AP.railJumpAt = tick()
             tryJump(true)
+            diagLine("rail_einstieg", "Aufsprung bei %.1f Studs, Schiene %.0f Studs lang",
+                     d, along.Magnitude)
         end
+        if along.Magnitude > 0.1 then return along.Unit end
     end
 
     -- ROLLEN durch enge Stellen. Solche Luecken haben unter 5 Studs
