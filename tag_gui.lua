@@ -868,16 +868,34 @@ do
     ------------------------------------------------------------------
     -- 1) Bewegungsprofil — aus dem Spiel gelesen, nicht geraten
     ------------------------------------------------------------------
+    -- SPRUNGKRAFT HAENGT AN DER LAUFGESCHWINDIGKEIT.
+    -- Gemessen (260 Proben, 2026-09-18): JumpPower folgt der WalkSpeed mit
+    -- einem Verhaeltnis von 0.79 bis 0.91, im Mittel 0.86 —
+    --     WalkSpeed 31-36 -> JumpPower 28.8 bis 30.1
+    --     WalkSpeed 44    -> JumpPower 36.4
+    -- Weil die Flugzeit an vy haengt und die Weite an Tempo mal Flugzeit,
+    -- waechst die Sprungweite QUADRATISCH mit dem Tempo:
+    --     reach = speed * 2*vy/g = 1.72 * speed^2 / g
+    -- Bei 32 Studs/s sind das 25 Studs, bei 37 schon 33. Wird das Profil im
+    -- Stand gelesen (JumpPower ~28.5), faellt der Graph zu vorsichtig aus:
+    -- Sprungkanten, die der Bot im Lauf locker schafft, entstehen nie.
+    local JP_PER_WS = 0.86
+
     local function profile()
         local char = LP.Character
         local hum = char and char:FindFirstChildOfClass("Humanoid")
         local g = math.max(workspace.Gravity, 1)          -- gemessen 71.25
-        local vy = 28
-        if hum then
-            vy = hum.UseJumpPower and hum.JumpPower
-                 or math.sqrt(2 * g * math.max(hum.JumpHeight, 1))
+        -- Renntempo: was der Charakter wirklich laeuft, nicht die feste 32
+        local speed = 32
+        if hum and hum.WalkSpeed and hum.WalkSpeed > 8 then
+            speed = math.clamp(hum.WalkSpeed, 24, 44)
         end
-        local speed = 32                                   -- Renntempo des Bots
+        local vy = speed * JP_PER_WS
+        if hum and hum.UseJumpPower and hum.JumpPower then
+            vy = math.max(vy, hum.JumpPower)
+        elseif hum then
+            vy = math.max(vy, math.sqrt(2 * g * math.max(hum.JumpHeight, 1)))
+        end
         local air = 2 * vy / g
         return {
             g = g, vy = vy, speed = speed,
@@ -1558,7 +1576,10 @@ do
         hop  = 0.65,        -- Stufe hoch
         jump = 0.70,        -- Sprung ueber eine Luecke
         climb = 0.40,       -- Leiter
-        wallrun = 0.45,
+        -- Wallride bewusst TEUER: er braucht eigens markierte Waende, bricht
+        -- oft ab und kostet dann das ganze Tempo. Nur wenn es sonst keinen
+        -- Weg gibt.
+        wallrun = 1.60,
         pad  = 0.22,        -- Trampolin
         zip  = 0.20,        -- Zipline
     }
@@ -1725,7 +1746,7 @@ do
     
         local lines = string.split(blob, "\n")
         local head = string.split(lines[1] or "", "|")
-        if head[1] ~= "UTGNAV7" then return nil end
+        if head[1] ~= "UTGNAV8" then return nil end
         local cell = tonumber(head[3])
         local bbv = string.split(head[4] or "", ",")
         if not cell or #bbv < 6 then return nil end
@@ -1785,7 +1806,7 @@ do
         -- stueckweise zusammensetzen: ein einzelner String mit Millionen
         -- Verkettungen sprengt den Speicher
         local parts = {
-            ("UTGNAV7|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
+            ("UTGNAV8|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
                 r1(G.bb.min.X), r1(G.bb.min.Y), r1(G.bb.min.Z),
                 r1(G.bb.max.X), r1(G.bb.max.Y), r1(G.bb.max.Z))
         }
@@ -2416,6 +2437,12 @@ end
 -- Sprungwerte des Charakters, jedes Mal frisch gelesen: die Gravitation
 -- unterscheidet sich je Map deutlich (auf FactionAction 71.25 statt 196),
 -- und JumpPower aendert sich mit Boosts.
+-- JUMPPOWER HAENGT AN DER WALKSPEED (gemessen 2026-09-18, 260 Proben):
+--     WalkSpeed 31-36  ->  JumpPower 28.8 bis 30.1
+--     WalkSpeed 44     ->  JumpPower 36.4
+-- Schnell ankommen bringt also doppelt: mehr Weite UND mehr Sprunghoehe.
+-- Deshalb wird vor einem Absprung nie gebremst, und der Wert wird im Moment
+-- des Absprungs gelesen, nicht vorher.
 local function jumpProfile()
     local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
     local g = math.max(workspace.Gravity, 1)
@@ -2423,6 +2450,12 @@ local function jumpProfile()
     if hum then
         vy = hum.UseJumpPower and hum.JumpPower
              or math.sqrt(2 * g * math.max(hum.JumpHeight, 1))
+        -- Untergrenze aus der gemessenen Kopplung an die WalkSpeed: beim
+        -- Absprung aus vollem Lauf steht mehr Sprungkraft bereit, als ein
+        -- im Stand gelesener Wert vermuten laesst.
+        if hum.WalkSpeed and hum.WalkSpeed > 8 then
+            vy = math.max(vy, hum.WalkSpeed * 0.86)
+        end
     end
     return g, vy
 end
@@ -2946,6 +2979,20 @@ local function followPath(pos, mode)
         end
         if best then
             AP.ladder = best
+            -- NOTFALL: klebt er laenger als eine Sekunde davor, ohne dass das
+            -- Spiel den Truss erkennt, taugt der gewaehlte Anlaufpunkt nicht.
+            -- Dann den Anlaufpunkt ignorieren und stur auf die Leitermitte
+            -- zuhalten. Gemessen wurde genau dieser Fall: 6.6 Sekunden bei
+            -- 4.7 Studs Abstand, touchingTruss nie gesetzt.
+            if not RENV.shared.touchingTruss
+               and now - (PATH.idxAt or now) > 1.0 then
+                local straightIn = (best.Position - pos) * Vector3.new(1, 0, 1)
+                if straightIn.Magnitude > 0.1 then
+                    AP.ladderForce = true
+                    return straightIn.Unit
+                end
+            end
+            AP.ladderForce = false
             -- Eine Leiter hat vier Seiten, aber meist stehen ein bis drei
             -- davon an einer Wand. Haelt man auf die Mitte zu, landet man
             -- genau dort und rutscht seitlich daran herum, ohne zu greifen.
@@ -2966,10 +3013,15 @@ local function followPath(pos, mode)
                 local flatDir = (dir * Vector3.new(1, 0, 1))
                 if flatDir.Magnitude > 0.1 then
                     flatDir = flatDir.Unit
-                    local probe = best.Position + flatDir * (half + 3.5)
+                    -- 3.5 Studs Abstand zur Leitermitte waren zu weit:
+                    -- gemessen blieb der Bot bei 4.7 bis 5.4 Studs stehen und
+                    -- shared.touchingTruss wurde nie gesetzt. Der Spielcode
+                    -- prueft mit einem Strahl LookVector * 4 — aus fuenf
+                    -- Studs trifft der den Truss gar nicht mehr.
+                    local probe = best.Position + flatDir * (half + 2.2)
                     local blocked = workspace:Raycast(
                         best.Position + Vector3.new(0, 1, 0),
-                        flatDir * (half + 3.5), AP.rp)
+                        flatDir * (half + 2.2), AP.rp)
                     if not blocked then
                         -- an der geplanten Seite messen, nicht an der eigenen
                         local ref = approach or pos
@@ -2983,7 +3035,10 @@ local function followPath(pos, mode)
                 -- Enger ansteuern als bisher (3.0): aus drei Studs Abstand
                 -- zur richtigen Seite trifft der Blickstrahl des Spiels den
                 -- Truss oft noch nicht, und er rutscht seitlich daran vorbei.
-                if toAnchor.Magnitude > 1.5 then
+                -- Frueher umschwenken (1.5 -> 2.5): der Blick folgt der
+                -- Laufrichtung, also muss er schon auf dem letzten Stueck auf
+                -- den Truss zeigen, nicht erst unmittelbar davor.
+                if toAnchor.Magnitude > 2.5 then
                     return toAnchor.Unit
                 end
                 -- auf der richtigen Seite: jetzt exakt auf die Leitermitte
@@ -3083,7 +3138,10 @@ local function followPath(pos, mode)
             -- Radius eine Viertelsekunde auseinander.
             local last = PATH.jumped[PATH.idx] or 0
             local aligned = (not wide) or (spd < 4) or (along > 0.90)
-            if grounded and spd >= need * 0.9 and (aligned or d < 1.2)
+            -- 0.9 -> 0.85: wer schneller ankommt, springt auch hoeher
+            -- (JumpPower folgt der WalkSpeed), der Bogen faellt also besser
+            -- aus als die statische Rechnung annimmt.
+            if grounded and spd >= need * 0.85 and (aligned or d < 1.2)
                and now - last > 0.3 then
                 PATH.jumped[PATH.idx] = now
                 PATH.air = {
@@ -3103,7 +3161,7 @@ local function followPath(pos, mode)
             -- Zu langsam fuer die Luecke: nicht trotzdem drueberlaufen.
             -- Erst Zeit zum Beschleunigen geben, dann lieber den Weg
             -- verwerfen — ein Sturz kostet mehr als eine Neuplanung.
-            if grounded and d < 2.0 and spd < need * 0.9
+            if grounded and d < 2.0 and spd < need * 0.85
                and now - (PATH.idxAt or now) > 0.4 then
                 failNote("zu_langsam_fuer_sprung",
                     ("Luecke %.0f Studs braucht %.0f Studs/s, gefahren %.0f")
@@ -6072,6 +6130,13 @@ local function assistStep(dt)
                     wantSpeed = math.min(wantSpeed, math.clamp(d / 16, 0.36, 1))
                     wantAccel = math.min(wantAccel, 1.1)
                 end
+            elseif AP.ladder and AP.ladder.Parent
+                   and ((AP.ladder.Position - posS) * Vector3.new(1, 0, 1)).Magnitude < 12 then
+                -- Leiter angesteuert, ohne dass der Wegpunkt selbst vom Typ
+                -- climb ist: zwei der drei gemessenen Fehlversuche liefen
+                -- genau so, mit 27 bis 37 Studs/s ungebremst vorbei.
+                wantSpeed = math.min(wantSpeed, 0.42)
+                wantAccel = math.min(wantAccel, 1.1)
             elseif k == "zip" or k == "pad" or k == "via" then
                 local d = ((pw.Position - posS) * Vector3.new(1, 0, 1)).Magnitude
                 if d < 14 then
