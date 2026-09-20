@@ -371,7 +371,13 @@ def main():
             if cur and cur != last:
                 last = cur
                 if now - last_play >= cfg.get("cooldown", 0.4):
-                    files = sound_files() or files
+                    # Immer frisch einlesen und NICHT auf eine alte Liste
+                    # zurueckfallen: geloeschte Dateien fuehrten sonst bei
+                    # jedem Ausloeser zu einem Fehler beim Oeffnen.
+                    files = sound_files()
+                    if not files:
+                        print(time.strftime("%H:%M:%S "),
+                              "-> keine Audiodatei im Ordner, nichts zu senden")
                     if files:
                         f = random.choice(files)
                         last_play = now
