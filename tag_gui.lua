@@ -4407,6 +4407,24 @@ end
 
 -- Liest beide Quellen neu ein und legt je Eintrag eine Sound-Instanz an.
 -- Rueckgabe: Anzahl, Anzahl Dateien, Anzahl IDs.
+-- Billiger Fingerabdruck der beiden Quellen: Anzahl Dateien plus Laenge der
+-- ID-Datei. Aendert er sich, wird neu eingelesen — so genuegt es, eine Datei
+-- in den Ordner zu legen, ohne irgendetwas umzuschalten.
+local function sndFingerprint()
+    local n = 0
+    if type(isfolder) == "function" and type(listfiles) == "function"
+       and isfolder(SND.folder) then
+        local ok, files = pcall(listfiles, SND.folder)
+        if ok and type(files) == "table" then n = #files end
+    end
+    local idLen = 0
+    if type(isfile) == "function" and isfile(SND.idFile) then
+        local ok, txt = pcall(readfile, SND.idFile)
+        if ok and type(txt) == "string" then idLen = #txt end
+    end
+    return n .. ":" .. idLen
+end
+
 function ENV.reloadSounds()
     if SND.holder then pcall(function() SND.holder:Destroy() end) end
     SND.holder, SND.list = nil, {}
@@ -4453,6 +4471,7 @@ function ENV.reloadSounds()
         end
     end
 
+    SND.fp = sndFingerprint()
     local holder = sndHolder()
     for _, e in ipairs(entries) do
         local ok = pcall(function()
@@ -7084,9 +7103,21 @@ conns[#conns + 1] = LP.CharacterAdded:Connect(function(c)
 end)
 
 task.spawn(function()
+    local sndCheck = 0
     while ENV.alive ~= false do
         task.wait(0.15)
         if not sg.Parent then break end
+        -- Sound-Ordner im Blick behalten: alle fuenf Sekunden schauen, ob
+        -- Dateien dazugekommen sind. Dann reicht "Datei reinlegen".
+        sndCheck = sndCheck + 1
+        if CFG.jukeSound and sndCheck % 33 == 0 then
+            local fp = sndFingerprint()
+            if fp ~= SND.fp then
+                local n = ENV.reloadSounds()
+                state.sndCount = n
+                LOG(("Sound-Ordner geaendert — %d Sounds geladen"):format(n))
+            end
+        end
         local t = state.threatD and ("%.0f"):format(state.threatD) or "–"
         local pr = state.preyD and ("%.0f"):format(state.preyD) or "–"
         local nl = string.char(10)
