@@ -4722,7 +4722,10 @@ local function endJuke(a, now, why)
     local ran = (why == nil) or (now - a.t0 >= 0.6)
     if CFG.jukeSound and ran and #SND.list > 0 then
         local roleAt, name = myRole(), a.def.name
-        task.delay(0.25, function()
+        -- 0.1 s statt 0.25: der Sound soll auf dem Haken sitzen, nicht
+        -- hinterherhinken. Zum Pruefen, ob die Finte aufging, reicht das —
+        -- ein Tag schlaegt sofort auf die Rolle durch.
+        task.delay(0.1, function()
             if not CFG.jukeSound then return end
             if myRole() ~= roleAt then return end      -- getaggt
             if AP.immobile then return end             -- gefangen/eingefroren
