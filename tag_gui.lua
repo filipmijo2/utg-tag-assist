@@ -53,7 +53,9 @@ local CFG = {
     preset      = 3,       -- fest auf Maximum (kein Umschalten mehr)
     -- Sound nach einer gelungenen Finte (rein lokal, siehe Abschnitt 5c)
     jukeSound   = false,
-    jukeSoundVol = 0.8,
+    -- volle Lautstaerke: der Sound soll den Moment markieren, und er laeuft
+    -- ohnehin nur beim eigenen Spieler
+    jukeSoundVol = 1.0,
 }
 
 -- Die frueheren Einzelschalter haengen jetzt alle am Autopilot-Schalter.
@@ -1952,7 +1954,7 @@ local function saveSettings()
             autopilot = CFG.autopilot and true or false,
             ayip = CFG.ayip or 0,
             jukeSound = CFG.jukeSound and true or false,
-            jukeSoundVol = CFG.jukeSoundVol or 0.8,
+            jukeSoundVol = CFG.jukeSoundVol or 1.0,
             -- 3rd Person wird BEWUSST nicht gesichert: der Modus haengt die
             -- Kamera hinter den Charakter, und wer ihn einmal versehentlich
             -- anhatte, bekam ihn bei jeder Injektion zurueck, ohne die
@@ -4509,7 +4511,7 @@ function ENV.reloadSounds()
             local s = Instance.new("Sound")
             s.Name = e.name
             s.SoundId = e.id
-            s.Volume = CFG.jukeSoundVol or 0.8
+            s.Volume = CFG.jukeSoundVol or 1.0
             s.Parent = holder
             SND.list[#SND.list+1] = s
         end)
@@ -4523,13 +4525,32 @@ local function playJukeSound()
     local s = SND.list[math.random(1, #SND.list)]
     if not s or not s.Parent then return end
     pcall(function()
-        s.Volume = CFG.jukeSoundVol or 0.8
+        s.Volume = CFG.jukeSoundVol or 1.0
         s.TimePosition = 0
         s:Play()
     end)
     SND.lastName = s.Name
 end
 ENV.playJukeSound = playJukeSound     -- zum Ausprobieren der Lautstaerke
+
+-- Probe aufs Exempel: spielt einen Sound und misst, ob wirklich Ton
+-- herauskommt. Damit laesst sich "ich hoere nichts" von "es wurde gar nicht
+-- ausgeloest" unterscheiden.
+function ENV.testSound()
+    if #SND.list == 0 then ENV.reloadSounds() end
+    if #SND.list == 0 then return "keine Sounds geladen" end
+    playJukeSound()
+    local loud = 0
+    for i = 1, 24 do
+        task.wait(0.05)
+        for _, s in ipairs(SND.list) do
+            if s.PlaybackLoudness > loud then loud = s.PlaybackLoudness end
+        end
+    end
+    return ("%d Sounds geladen, gespielt: %s, lauteste Stelle %.0f — %s")
+        :format(#SND.list, tostring(SND.lastName), loud,
+                loud > 0 and "hoerbar" or "STUMM (Spiel-Lautstaerke pruefen)")
+end
 
 -- Ein Manoever beenden und zur Wirkungsmessung anmelden.
 local function endJuke(a, now, why)
