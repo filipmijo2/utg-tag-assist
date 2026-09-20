@@ -246,7 +246,7 @@ function ENV.diag()
     for k in pairs(DIAG.stat) do
         if not (k:match("^art_") or k:match("^wegquelle_") or k:match("^wegende_")
                 or k:match("^graphgrund_") or k:match("^graph_")
-                or k == "wegstart") then
+                or k:match("^neu_") or k == "wegstart") then
             row(k)
         end
     end
@@ -284,6 +284,23 @@ function ENV.diag()
         out[#out + 1] = "-- Wegbeginn --"
         out[#out + 1] = "  Abstand zum ersten Punkt  " .. diagAvgTxt("wegstart", "abstand", " Studs")
         out[#out + 1] = "  uebersprungene Punkte     " .. diagAvgTxt("wegstart", "uebersprungen", "")
+    end
+
+    -- WARUM WIRD NEU GERECHNET?
+    local nk = {}
+    for k, v in pairs(DIAG.stat) do
+        local t = k:match("^neu_([%w_]+)$")
+        if t then nk[#nk + 1] = { t, v.n } end
+    end
+    if #nk > 0 then
+        table.sort(nk, function(a, b) return a[2] > b[2] end)
+        local parts = {}
+        for _, e in ipairs(nk) do parts[#parts + 1] = ("%s=%d"):format(e[1], e[2]) end
+        out[#out + 1] = "-- Ausloeser der Neuberechnung --"
+        out[#out + 1] = "  " .. table.concat(parts, "  ")
+        if DIAG.stat.neu_ziel_bewegt then
+            out[#out + 1] = "  Zielsprung dabei  " .. diagAvgTxt("neu_ziel_bewegt", "studs", " Studs")
+        end
     end
 
     -- GRAPH GEGEN PATHFINDINGSERVICE
@@ -2397,6 +2414,7 @@ local function failTick(pos, hum, goalActive)
             -- Pfadfehler und wuerden den Schnitt unbrauchbar machen
             -- (gemessen einmal 2138 Studs).
             if dev > 100 then
+                PATH.endWhy = "versetzt"
                 PATH.wps = nil
             else
                 FAIL.seg.sum = FAIL.seg.sum + dev
@@ -3045,7 +3063,8 @@ local function followPath(pos, mode)
             :format(tostring(air.kind), air.gap, air.spd, air.need, air.ang,
                     (flat <= 7 and dy > -6) and "gelandet" or "DANEBEN", flat, dy))
         if flat > 7 or dy < -6 then
-            failNote("sprung_daneben",
+            PATH.endWhy = "sprung_daneben"
+                    failNote("sprung_daneben",
                 ("Luecke %.0f, Absprung %.0f Studs/s bei %.0f Grad, %.0f Studs daneben")
                     :format(air.gap, air.spd, air.ang, flat))
             -- sofort neu planen, nicht erst nach der Mindestpause: er steht
@@ -3115,7 +3134,8 @@ local function followPath(pos, mode)
                 behind = segT.Magnitude > 0.1 and segT.Unit:Dot(-flat) > 0
             end
             if behind or now - (PATH.idxAt or now) > 2 then
-                failNote("absprung_verpasst",
+                PATH.endWhy = "absprung_verpasst"
+                    failNote("absprung_verpasst",
                     ("%.0f Studs vom Absprung, kein Sprung ausgeloest")
                         :format(flat.Magnitude))
                 PATH.wps, PATH.at, PATH.prog = nil, 0, nil
@@ -3236,6 +3256,7 @@ local function followPath(pos, mode)
             if not reached and wp.kind ~= "via" and flat.Magnitude < 7.2
                and now - (PATH.idxAt or now) > 0.5 then
                 if up >= 2.5 then
+                    PATH.endWhy = "unter_dem_weg"
                     failNote("unter_dem_weg",
                         ("Wegpunkt %.1f Studs ueber dem Bot, neu geplant"):format(up))
                     PATH.wps, PATH.at = nil, 0
@@ -3591,7 +3612,7 @@ local function followPath(pos, mode)
             -- 0.9 -> 0.85: wer schneller ankommt, springt auch hoeher
             -- (JumpPower folgt der WalkSpeed), der Bogen faellt also besser
             -- aus als die statische Rechnung annimmt.
-            if grounded and spd >= need * 0.85 and (aligned or d < 1.2)
+            if grounded and spd >= need * 0.75 and (aligned or d < 1.2)
                and now - last > 0.3 then
                 PATH.jumped[PATH.idx] = now
                 PATH.air = {
@@ -3608,16 +3629,23 @@ local function followPath(pos, mode)
                 PATH.idxAt = now
                 return lineU
             end
-            -- Zu langsam fuer die Luecke: nicht trotzdem drueberlaufen.
-            -- Erst Zeit zum Beschleunigen geben, dann lieber den Weg
-            -- verwerfen — ein Sturz kostet mehr als eine Neuplanung.
-            if grounded and d < 2.0 and spd < need * 0.85
-               and now - (PATH.idxAt or now) > 0.4 then
-                failNote("zu_langsam_fuer_sprung",
-                    ("Luecke %.0f Studs braucht %.0f Studs/s, gefahren %.0f")
-                        :format(gap, need, spd))
-                PATH.wps, PATH.at, PATH.lastCalc = nil, 0, nil
-                return nil
+            -- ZU LANGSAM FUER DIE LUECKE: nicht gleich den ganzen Weg
+            -- wegwerfen. Gemessen endeten 20 von 110 Wegen genau hier — das
+            -- Veto war teurer als das Problem, das es verhindern sollte.
+            -- Der Bot holt jetzt erst Anlauf: ein Stueck auf der Sprunglinie
+            -- zurueck und mit Schwung wieder heran. Bleibt es dabei, greift
+            -- nach zwei Sekunden der Notausgang weiter oben und plant neu.
+            if grounded and d < 2.5 and spd < need * 0.75
+               and now - (PATH.idxAt or now) > 0.35 then
+                diagStat("sprung_anlauf_geholt").n =
+                    diagStat("sprung_anlauf_geholt").n + 1
+                if now - (AP.jumpRetreatAt or 0) > 1.5 then
+                    AP.jumpRetreatAt = now
+                    failNote("anlauf_holen",
+                        ("Luecke %.0f braucht %.0f Studs/s, gefahren %.0f — Anlauf holen")
+                            :format(gap, need, spd))
+                end
+                return -lineU          -- zurueck auf die Sprunglinie
             end
             return lineU
         end
@@ -6473,8 +6501,45 @@ local function autopilotStep(threat, threatD, prey, preyD)
         local wpsNow = PATH.wps
         local nearEnd = (not wpsNow) or #wpsNow < 2
             or (PATH.idx or 1) >= #wpsNow * 0.6
-        if (not PATH.wps and age > minAge) or moved > 18
-           or (runSince > 70 and nearEnd) or age > 8 then
+        -- WELCHE BEDINGUNG HAT DIE NEUBERECHNUNG AUSGELOEST?
+        -- Ohne das laesst sich die Rechnerei nicht abstellen: die Wege werden
+        -- gemessen nur zu 8 bis 14 Prozent abgefahren, und mehr als die
+        -- Haelfte endet mit "neuer Weg".
+        -- ZIELWECHSEL ENTPRELLEN.
+        -- Gemessen springt das Ziel im Schnitt 91.6 Studs (bis 258) und hat
+        -- damit 941 Neuberechnungen in drei Minuten ausgeloest — mit Abstand
+        -- der haeufigste Grund. Dahinter steckt meist ein kurzes Hin und Her
+        -- zwischen zwei Kandidaten (Fluchtpunkt gegen Verfolgungspunkt beim
+        -- Moduswechsel). Ein neues Ziel muss sich deshalb erst eine halbe
+        -- Sekunde halten, bevor darauf neu gerechnet wird; springt es
+        -- zurueck, bleibt der laufende Weg stehen.
+        local far = moved > 18
+        if far then
+            if not PATH.newTarget
+               or (PATH.newTarget - pathTarget).Magnitude > 12 then
+                PATH.newTarget, PATH.newTargetAt = pathTarget, tick()
+            end
+            if tick() - (PATH.newTargetAt or 0) < 0.5 then
+                far = false
+                diagStat("ziel_entprellt").n = diagStat("ziel_entprellt").n + 1
+            end
+        else
+            PATH.newTarget = nil
+        end
+
+        local trig
+        if not PATH.wps and age > minAge then trig = "kein_weg"
+        elseif far then trig = "ziel_bewegt"
+        elseif runSince > 70 and nearEnd then trig = "strecke_gelaufen"
+        elseif age > 8 then trig = "alter"
+        end
+        if trig then
+            diagStat("neu_" .. trig).n = diagStat("neu_" .. trig).n + 1
+            if trig == "ziel_bewegt" and moved < 1e6 then
+                diagVal("neu_ziel_bewegt", "studs", moved)
+            end
+        end
+        if trig then
             local v = pathTarget - pos
             local cands = { pathTarget }
             local down = workspace:Raycast(pathTarget + Vector3.new(0, 4, 0), Vector3.new(0, -80, 0), AP.rp)
@@ -6504,11 +6569,25 @@ local function autopilotStep(threat, threatD, prey, preyD)
             AP.usingPath = false
         end
     else
-        AP.usingPath = false
-        -- (Ein Versuch, einen gerade berechneten Weg eine Sekunde lang zu
-        --  halten, hat die Rechnerei NICHT verringert: 122 statt 60 Wege im
-        --  selben Zeitraum. Wieder raus.)
-        PATH.wps = nil
+        -- KEIN ZIEL GERADE? DANN DEN VORHANDENEN WEG WEITERFAHREN.
+        -- Gemessen: 660 Frames ohne Weg bei nur 85 gebauten Wegen, und der
+        -- haeufigste Ausloeser einer Neuberechnung war schlicht "es gibt
+        -- keinen Weg". Der Kreislauf war: Ziel faellt kurz weg -> Weg
+        -- wegwerfen -> naechster Frame hat keinen Weg -> neu rechnen. Ein
+        -- Weg ohne aktuelles Ziel fuehrt aber immer noch irgendwohin, und
+        -- das ist besser als planlos dazustehen. Weggeworfen wird er erst,
+        -- wenn er abgefahren oder wirklich alt ist.
+        local keep = PATH.wps and (tick() - (PATH.at or 0) < 6)
+        local pdir = keep and followPath(pos, mode) or nil
+        if pdir then
+            goal = goal or pdir
+            AP.usingPath = true
+            diagStat("weg_weitergefahren").n = diagStat("weg_weitergefahren").n + 1
+        else
+            AP.usingPath = false
+            if PATH.wps then PATH.endWhy = PATH.endWhy or "kein_ziel" end
+            PATH.wps = nil
+        end
     end
 
     -- AYIP: das Juke-Repertoire hat Vorrang vor der normalen Richtung,
