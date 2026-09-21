@@ -3274,7 +3274,10 @@ local function diagCloseWaypoint(why)
     diagVal(art, "min", w.min)
     diagVal(art, "spd", w.spdMin or 0)
     diagVal(art, "zeit", tick() - w.t0)
-    if w.min < 4 then
+    -- Ein Fall gilt als erledigt, wenn er UNTEN angekommen ist — die
+    -- genaue Stelle bestimmt die Physik. Sonst misst die Statistik einen
+    -- Fehler, wo keiner ist.
+    if w.min < 4 or why == "gefallen" then
         diagStat(art .. "_ok").n = diagStat(art .. "_ok").n + 1
     end
     diagStat("modus_" .. tostring(w.mode)).n =
@@ -3289,7 +3292,9 @@ local function diagCloseWaypoint(why)
     -- Nur echtes Ueberschiessen melden: er war dicht dran (unter 4 Studs)
     -- und hat sich dann wieder entfernt. Ein Wegpunkt, der nie nah war, ist
     -- ein anderes Problem und wird getrennt gezaehlt.
-    diagEvent("wegpunkt", w.kind, ("%.1f"):format(w.min), ("%.0f"):format(w.spdMin or 0),
+    diagEvent("wegpunkt", w.kind,
+              (why == "gefallen") and "0.0" or ("%.1f"):format(w.min),
+              ("%.0f"):format(w.spdMin or 0),
               ("over=%.1f side=%.1f ende=%s"):format(w.over, w.side, tostring(why)))
     if w.over > 3 and w.min < 4 then
         diagLine("ueberschossen",
@@ -3534,7 +3539,16 @@ local function followPath(pos, mode)
         local reached, reachedWhy
         -- Genaue Punkte bleiben eng, auch beim Weglaufen
         local exactHere = wpsExact(wps, PATH.idx)
-        local tightNow = exactHere and 3.0 or tightR
+        -- EIN FALL IST KEIN ZIEL. Wo man landet, bestimmt die Physik, nicht
+        -- die Steuerung: gemessen erreichte der Bot nur 19 Prozent der
+        -- Fallpunkte auf vier Studs genau, im Schnitt kam er auf 5.6. Ein
+        -- Fallpunkt gilt deshalb als erledigt, sobald man ungefaehr dort
+        -- unten angekommen ist.
+        local dropHere = (wps[PATH.idx].kind == "drop"
+                          or wps[PATH.idx].kind == "step")
+        local tightNow = exactHere and 3.0
+            or (dropHere and math.max(tightR, 7.0))
+            or tightR
         local passNow  = exactHere and 7.2 or passR
         if wp.takeoff then
             -- EIN ABSPRUNGPUNKT WIRD NUR DURCH DEN SPRUNG SELBST ERLEDIGT.
@@ -3619,6 +3633,13 @@ local function followPath(pos, mode)
                 end
             else
                 reached = flat.Magnitude < tightNow and heightOk
+                -- unten angekommen: bei einem Fall zaehlt die Hoehe mehr als
+                -- die genaue Stelle
+                if not reached and dropHere and flat.Magnitude < 12
+                   and pos.Y <= wp.Position.Y + 2 then
+                    reached = true
+                    reachedWhy = "gefallen"
+                end
             -- (Ein eigenes Ventil fuer Durchgaenge stand hier mit 0.6 s und
             --  war toter Code: der allgemeine Notausgang unten greift schon
             --  bei 0.5 s und deckt denselben Fall ab.)
