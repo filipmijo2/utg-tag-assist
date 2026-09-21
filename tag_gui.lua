@@ -1519,7 +1519,19 @@ do
     -- fuehrt. In Sekunden gerechnet entspricht das einem langen Umweg, also
     -- meidet A* sie zuverlaessig, ohne dass sie ganz unpassierbar werden.
     local DANGER_COST = 25.0   -- Wasser wird damit praktisch immer umgangen
+    local JUMP_EDGE_MAX = 10      -- flach; darueber landet er gemessen nicht
     local function addEdge(a, b, kind, cost, via)
+        -- HARTE SICHERUNG. Im fertigen Graphen standen Sprungkanten von bis
+        -- zu 204 Studs — irgendein Bauteil hat die Laengengrenze umgangen.
+        -- Statt jede Stelle einzeln zu pruefen, faengt es die eine Stelle
+        -- ab, durch die alle Kanten laufen: zu weit nach oben oder zur
+        -- Seite gibt es keinen Sprung, nach unten wird daraus ein Fall.
+        if kind == "jump" or kind == "hop" then
+            local flat = ((b.p - a.p) * Vector3.new(1, 0, 1)).Magnitude
+            if flat > JUMP_EDGE_MAX then
+                if b.p.Y < a.p.Y - 2 then kind = "drop" else return end
+            end
+        end
         if b.bad then cost = cost + DANGER_COST end
         -- Fuehrt die Kante in eine enge Stelle, muss dort gerollt werden
         if b.low and kind == "walk" then kind = "roll" ; cost = cost + 0.4 end
@@ -1621,7 +1633,8 @@ do
                         elseif math.abs(dy) <= CFG.stepUp then
                             addEdge(n, o, "walk", dist / prof.speed, via)
                             walk = walk + 1
-                        elseif dy > CFG.stepUp and dy <= prof.rise then
+                        elseif dy > CFG.stepUp and dy <= prof.rise
+                               and ((o.p - n.p) * Vector3.new(1,0,1)).Magnitude <= 9 then
                             -- Stufe hoch: braucht einen Sprung, ist aber kurz.
                             -- Ein Ueberhang ueber der Kante macht das unmoeglich:
                             -- der Bot stoesst sich am Vorsprung den Kopf und
@@ -2058,9 +2071,16 @@ do
         zip  = 0.20,        -- Zipline
         rail = 0.24,        -- Grindschiene
     }
-    -- Zusaetzlicher Abschlag auf JEDE Kante, die Hoehe gewinnt — auch auf
-    -- gewoehnliche Wege ueber Treppen und Rampen.
-    NAV.RISE_DISCOUNT = 0.62
+    -- HOEHE ZAEHLT DREIFACH (Nutzer-Vorgabe).
+    -- Einen Stud Hoehe zu gewinnen ist dreimal so wertvoll wie einen Stud
+    -- horizontal zurueckzulegen — egal ob geklettert oder gesprungen. Der
+    -- Abschlag waechst deshalb MIT dem Hoehengewinn, statt pauschal zu sein:
+    -- eine Kante, die sieben Studs hochfuehrt, kostet nur noch ein Drittel.
+    -- Gedeckelt, damit die Kosten nicht gegen null laufen und A* nicht
+    -- anfaengt, sinnlos auf und ab zu klettern.
+    NAV.RISE_PER_STUD = 0.10     -- je Stud Hoehe zehn Prozent billiger
+    NAV.RISE_FLOOR    = 0.30     -- hoechstens auf ein Drittel herunter
+    NAV.RISE_DISCOUNT = 0.62     -- Grundabschlag fuer jede steigende Kante
 
     -- KOSTENFELD: wie lange braucht jemand von einem Punkt aus zu jedem
     -- Knoten? Ein Dijkstra ohne Ziel, mit Deckel. Damit laesst sich fuer
@@ -2113,7 +2133,13 @@ do
                 for _, e in ipairs(n.e) do
                     local w = NAV.KINDW[e.k] or 1
                     local tn = nodes[e.to]
-                    if tn and tn.p.Y - n.p.Y > 1 then w = w * NAV.RISE_DISCOUNT end
+                    if tn then
+                        local dy = tn.p.Y - n.p.Y
+                        if dy > 1 then
+                            w = w * math.max(NAV.RISE_FLOOR,
+                                             NAV.RISE_DISCOUNT - NAV.RISE_PER_STUD * dy)
+                        end
+                    end
                     local ng = dist[cur] + e.c * w
                     if not dist[e.to] or ng < dist[e.to] then
                         dist[e.to] = ng
@@ -2206,8 +2232,12 @@ do
                 for _, e in ipairs(n.e) do
                     local w = NAV.KINDW[e.k] or 1
                     local tn = nodes[e.to]
-                    if tn and tn.p.Y - n.p.Y > 1 then
-                        w = w * NAV.RISE_DISCOUNT
+                    if tn then
+                        local dy = tn.p.Y - n.p.Y
+                        if dy > 1 then
+                            w = w * math.max(NAV.RISE_FLOOR,
+                                             NAV.RISE_DISCOUNT - NAV.RISE_PER_STUD * dy)
+                        end
                     end
                     local ng = gScore[cur] + e.c * w
                     if not gScore[e.to] or ng < gScore[e.to] then
@@ -2287,7 +2317,7 @@ do
     
         local lines = string.split(blob, "\n")
         local head = string.split(lines[1] or "", "|")
-        if head[1] ~= "UTGNAV12" then return nil end
+        if head[1] ~= "UTGNAV14" then return nil end
         local cell = tonumber(head[3])
         local bbv = string.split(head[4] or "", ",")
         if not cell or #bbv < 6 then return nil end
@@ -2347,7 +2377,7 @@ do
         -- stueckweise zusammensetzen: ein einzelner String mit Millionen
         -- Verkettungen sprengt den Speicher
         local parts = {
-            ("UTGNAV12|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
+            ("UTGNAV14|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
                 r1(G.bb.min.X), r1(G.bb.min.Y), r1(G.bb.min.Z),
                 r1(G.bb.max.X), r1(G.bb.max.Y), r1(G.bb.max.Z))
         }
@@ -2998,10 +3028,24 @@ computeEngine = function(fromPos, toPos, radius)
         -- wie beim Graphen.
         for i = 1, #out do
             if out[i].Action == Enum.PathWaypointAction.Jump and out[i + 1] then
-                out[i].takeoff = true
-                out[i].jumpTo = out[i + 1].Position
-                out[i].jumpKind = "jump"
-                out[i + 1].kind = "jump"
+                -- WEITE SPRUENGE AUCH HIER RAUS.
+                -- Der Graph ist auf 9 Studs gedeckelt, PathfindingService
+                -- kennt diese Grenze nicht. Gemessen kamen ueber die Engine
+                -- weiter Spruenge von 9 bis 14 Studs herein, die nur zu 38
+                -- Prozent ankamen. Ueber neun Studs wird der Punkt deshalb
+                -- als gewoehnlicher Gehpunkt behandelt — hinlaufen statt
+                -- hinspringen, und wenn dort eine Luecke ist, faellt der Weg
+                -- weg und es wird neu geplant.
+                local gap = ((out[i + 1].Position - out[i].Position)
+                             * Vector3.new(1, 0, 1)).Magnitude
+                if gap <= 9 then
+                    out[i].takeoff = true
+                    out[i].jumpTo = out[i + 1].Position
+                    out[i].jumpKind = "jump"
+                    out[i + 1].kind = "jump"
+                else
+                    out[i].Action = Enum.PathWaypointAction.Walk
+                end
             end
         end
         return out
@@ -3548,8 +3592,14 @@ local function followPath(pos, mode)
             -- Durchgaenge sind hier ausgenommen: sie muessen wirklich
             -- passiert werden, sonst springt er wieder am Rahmen vorbei.
             -- Kommt er dort nicht durch, plant die Wegneuberechnung neu.
+            -- Der Punkt ueber dem Bot bekommt mehr Zeit als frueher.
+            -- Seit Vertikalitaet im Graphen billiger ist, fuehren viel mehr
+            -- Wege nach oben, und "unter_dem_weg" ist dadurch zum
+            -- zweithaeufigsten Wegende geworden (51 von 600). Eine halbe
+            -- Sekunde reicht nicht, um eine Stufe zu nehmen oder an eine
+            -- Leiter zu kommen; anderthalb reichen.
             if not reached and wp.kind ~= "via" and flat.Magnitude < 7.2
-               and now - (PATH.idxAt or now) > 0.5 then
+               and now - (PATH.idxAt or now) > (up >= 2.5 and 1.5 or 0.5) then
                 if up >= 2.5 then
                     PATH.endWhy = "unter_dem_weg"
                     failNote("unter_dem_weg",
@@ -3936,13 +3986,14 @@ local function followPath(pos, mode)
             -- QUER ZUR SPRUNGLINIE: nicht springen, sondern einschwenken.
             -- Ein kurzer Bogen zurueck auf die Linie kostet eine halbe
             -- Sekunde, ein Sprung im falschen Winkel den ganzen Weg.
+            -- Quer zur Sprunglinie: einschwenken, aber nach VORNE. Der alte
+            -- Bogen nach hinten sah aus wie ein Haken.
             if wide and grounded and not aligned and d < 3 then
                 diagStat("sprung_eingeschwenkt").n =
                     diagStat("sprung_eingeschwenkt").n + 1
-                local back = wp.Position - lineU * 6
-                local v = (back - pos) * Vector3.new(1, 0, 1)
-                if v.Magnitude > 0.1 then return v.Unit end
-                return -lineU
+                local mix = (lineU * 2 + toWp.Unit)
+                if mix.Magnitude > 0.05 then return mix.Unit end
+                return lineU
             end
 
             -- ZU LANGSAM FUER DIE LUECKE: nicht gleich den ganzen Weg
@@ -3951,17 +4002,16 @@ local function followPath(pos, mode)
             -- Der Bot holt jetzt erst Anlauf: ein Stueck auf der Sprunglinie
             -- zurueck und mit Schwung wieder heran. Bleibt es dabei, greift
             -- nach zwei Sekunden der Notausgang weiter oben und plant neu.
-            if grounded and d < 2.5 and spd < need * 0.75
-               and now - (PATH.idxAt or now) > 0.35 then
-                diagStat("sprung_anlauf_geholt").n =
-                    diagStat("sprung_anlauf_geholt").n + 1
-                if now - (AP.jumpRetreatAt or 0) > 1.5 then
-                    AP.jumpRetreatAt = now
-                    failNote("anlauf_holen",
-                        ("Luecke %.0f braucht %.0f Studs/s, gefahren %.0f — Anlauf holen")
-                            :format(gap, need, spd))
-                end
-                return -lineU          -- zurueck auf die Sprunglinie
+            -- ZU LANGSAM: NICHT ZURUECKLAUFEN.
+            -- Das sah von aussen aus wie eine Finte — vor und zurueck auf
+            -- der Sprunglinie, mitten in der Flucht. Im Unfangbar-Modus
+            -- soll gar nichts nach Zappeln aussehen. Stattdessen einfach
+            -- weiter auf der Linie halten und beschleunigen; reicht es
+            -- nicht, greift nach drei Sekunden der Notausgang und plant neu.
+            if grounded and d < 2.5 and spd < need * 0.75 then
+                diagStat("sprung_zu_langsam").n =
+                    diagStat("sprung_zu_langsam").n + 1
+                return lineU
             end
             return lineU
         end
