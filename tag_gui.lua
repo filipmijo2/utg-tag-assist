@@ -2110,6 +2110,14 @@ do
     -- einer Kette, die in Fahrt bleibt.
     NAV.BOOST_AFTER = { vault = 0.55, pad = 0.6, zip = 0.65, rail = 0.6 }
 
+    -- KETTENVAULT: eigener Bonus, weil eine Kette mehr ist als zwei Vaults.
+    -- Wer schon in der Luft haengt und den naechsten Vorsprung greift,
+    -- verliert keine Zeit fuer Anlauf, Absprung und Landung — er steigt
+    -- durch. Drei Vaults hintereinander bringen so mehr Hoehe als jede
+    -- Leiter und lassen jeden Verfolger stehen, der den Weg nicht kennt.
+    -- Der Bonus kommt ZUSAETZLICH zum Schwung-Abschlag.
+    NAV.CHAIN_BONUS = 0.5
+
     NAV.RISE_PER_STUD = 0.10     -- je Stud Hoehe zehn Prozent billiger
     NAV.RISE_FLOOR    = 0.30     -- hoechstens auf ein Drittel herunter
     NAV.RISE_DISCOUNT = 0.62     -- Grundabschlag fuer jede steigende Kante
@@ -2162,9 +2170,13 @@ do
                 seen = seen + 1
                 if seen % 2000 == 0 then RunService.Heartbeat:Wait() end
                 local n = nodes[cur]
-                local boost = fromK[cur] and NAV.BOOST_AFTER[fromK[cur]] or 1
+                local inK = fromK[cur]
+                local boost = inK and NAV.BOOST_AFTER[inK] or 1
                 for _, e in ipairs(n.e) do
                     local w = NAV.KINDW[e.k] or 1
+                    if inK == "vault" and e.k == "vault" then
+                        w = w * NAV.CHAIN_BONUS
+                    end
                     local tn = nodes[e.to]
                     if tn then
                         local dy = tn.p.Y - n.p.Y
@@ -2268,6 +2280,10 @@ do
                 local boost = inK and NAV.BOOST_AFTER[inK] or 1
                 for _, e in ipairs(n.e) do
                     local w = NAV.KINDW[e.k] or 1
+                    -- Vault auf Vault: die Kette bekommt ihren eigenen Bonus
+                    if inK == "vault" and e.k == "vault" then
+                        w = w * NAV.CHAIN_BONUS
+                    end
                     local tn = nodes[e.to]
                     if tn then
                         local dy = tn.p.Y - n.p.Y
@@ -2317,6 +2333,28 @@ do
         stats.zip, stats.pad, stats.rail = buildHelpers(nodes, grid, bb, cell, mapRoot, prof)
         stats.linked, stats.islandsBefore, stats.islandsAfter =
             linkIslands(nodes, grid, bb, cell, prof)
+
+        -- KETTEN ZAEHLEN: Knoten, die per Vault erreicht werden und von denen
+        -- selbst wieder ein Vault weggeht. Das ist das Mass dafuer, wie viel
+        -- Steigvermoegen die Map ueberhaupt hergibt.
+        do
+            local reachedByVault, chains, deep = {}, 0, 0
+            for _, n in ipairs(nodes) do
+                for _, e in ipairs(n.e) do
+                    if e.k == "vault" then reachedByVault[e.to] = true end
+                end
+            end
+            for id in pairs(reachedByVault) do
+                for _, e in ipairs(nodes[id].e) do
+                    if e.k == "vault" then
+                        chains = chains + 1
+                        if reachedByVault[e.to] then deep = deep + 1 end
+                        break
+                    end
+                end
+            end
+            stats.chain2, stats.chain3 = chains, deep
+        end
     
         NAV.graph = { nodes = nodes, grid = grid, cell = cell, bb = bb,
                       prof = prof, map = mapRoot.Name, stats = stats }
@@ -2354,7 +2392,7 @@ do
     
         local lines = string.split(blob, "\n")
         local head = string.split(lines[1] or "", "|")
-        if head[1] ~= "UTGNAV15" then return nil end
+        if head[1] ~= "UTGNAV16" then return nil end
         local cell = tonumber(head[3])
         local bbv = string.split(head[4] or "", ",")
         if not cell or #bbv < 6 then return nil end
@@ -2414,7 +2452,7 @@ do
         -- stueckweise zusammensetzen: ein einzelner String mit Millionen
         -- Verkettungen sprengt den Speicher
         local parts = {
-            ("UTGNAV15|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
+            ("UTGNAV16|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
                 r1(G.bb.min.X), r1(G.bb.min.Y), r1(G.bb.min.Z),
                 r1(G.bb.max.X), r1(G.bb.max.Y), r1(G.bb.max.Z))
         }
@@ -2527,11 +2565,13 @@ local function ensureGraph()
             local s = g.stats
             LOG(("Navigationsgraph fuer %s gebaut: %d Knoten in %.1f s — %d gehen, "
                  .. "%d Stufe hoch, %d Stufe runter, %d springen, %d fallen, "
-                 .. "%d klettern, %d vault, %d zip, %d pad; %d Punkte wegen zu wenig "
+                 .. "%d klettern, %d vault (%d Ketten, %d dreifach), %d zip, %d pad; "
+                 .. "%d Punkte wegen zu wenig "
                  .. "Platz verworfen, %d von Waenden weggeschoben; "
                  .. "Inseln %d -> %d durch %d Verbindungen")
                 :format(g.map, s.nodes, s.secs, s.walk, s.hop or 0, s.step or 0,
-                        s.jump, s.drop, s.climb, s.vault or 0, s.zip, s.pad, s.narrow or 0,
+                        s.jump, s.drop, s.climb, s.vault or 0, s.chain2 or 0, s.chain3 or 0,
+                        s.zip, s.pad, s.narrow or 0,
                         s.offWall or 0, s.islandsBefore or 0, s.islandsAfter or 0,
                         s.linked or 0))
             -- pcall allein genuegt hier nicht: NAV.save kann sauber
@@ -3889,17 +3929,26 @@ local function followPath(pos, mode)
         local humV = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
         local airborne = humV and humV.FloorMaterial == Enum.Material.Air
         local up = wp.Position.Y - pos.Y
-        -- KETTEN SIND MOEGLICH: drei Vaults hintereinander ohne Bodenkontakt.
-        -- Deshalb wird der naechste Griff auch aus der Luft heraus
-        -- angenommen, nicht nur vom Boden aus.
-        if (not airborne or up > 3) and d < 6
-           and tick() - (AP.vaultAt or 0) > 0.45 then
+        -- KETTE NICHT ABREISSEN LASSEN.
+        -- Folgt auf diesen Vault gleich der naechste, darf der Bot nicht
+        -- erst landen: genau das Durchsteigen ohne Bodenkontakt macht die
+        -- Kette doppelt so gut wie zwei einzelne Vaults. Deshalb wird der
+        -- naechste Griff auch aus der Luft angenommen, die Sperre ist kurz,
+        -- und es wird dichter nachgefasst.
+        local nxtV = wps[PATH.idx + 1]
+        local chain = nxtV and nxtV.kind == "vault"
+        local gap = chain and 0.3 or 0.45
+        if (not airborne or up > 2) and d < 6
+           and tick() - (AP.vaultAt or 0) > gap then
             AP.vaultAt, AP.vaultY = tick(), pos.Y
+            AP.vaultChain = chain and ((AP.vaultChain or 0) + 1) or 0
             tryJump(true)
-            diagEvent("vault", ("%.1f"):format(d), ("%.0f"):format(up), "", "Absprung")
+            diagEvent("vault", ("%.1f"):format(d), ("%.0f"):format(up),
+                      tostring(AP.vaultChain or 0),
+                      chain and "Kettenglied" or "Absprung")
         elseif airborne and up > 1
-               and tick() - (AP.vaultAt or 0) > 0.2
-               and tick() - (AP.vaultGrab or 0) > 0.2 then
+               and tick() - (AP.vaultAt or 0) > 0.15
+               and tick() - (AP.vaultGrab or 0) > (chain and 0.12 or 0.2) then
             AP.vaultGrab = tick()
             tryJump(true)
         end
