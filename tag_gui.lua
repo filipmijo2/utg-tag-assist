@@ -2103,6 +2103,13 @@ do
     -- eine Kante, die sieben Studs hochfuehrt, kostet nur noch ein Drittel.
     -- Gedeckelt, damit die Kosten nicht gegen null laufen und A* nicht
     -- anfaengt, sinnlos auf und ab zu klettern.
+    -- SCHWUNG WIRKT NACH. Ein Vault gibt das 2.4-fache Momentum, Trampolin,
+    -- Zipline und Schiene ebenfalls Tempo. Die naechste Kante wird damit
+    -- schneller gefahren, als ihre Grundkosten sagen — also bekommt sie
+    -- einen Abschlag. Das ist der Unterschied zwischen "einmal hoch" und
+    -- einer Kette, die in Fahrt bleibt.
+    NAV.BOOST_AFTER = { vault = 0.55, pad = 0.6, zip = 0.65, rail = 0.6 }
+
     NAV.RISE_PER_STUD = 0.10     -- je Stud Hoehe zehn Prozent billiger
     NAV.RISE_FLOOR    = 0.30     -- hoechstens auf ein Drittel herunter
     NAV.RISE_DISCOUNT = 0.62     -- Grundabschlag fuer jede steigende Kante
@@ -2119,7 +2126,7 @@ do
         local s = nearest(G.grid, G.bb, G.cell, fromPos, 30, 14)
         if not s then return nil end
         local nodes = G.nodes
-        local dist, closed = { [s.id] = 0 }, {}
+        local dist, closed, fromK = { [s.id] = 0 }, {}, {}
         local heap, hn = {}, 0
         local function push(id, f)
             hn = hn + 1 ; heap[hn] = { id = id, f = f }
@@ -2155,6 +2162,7 @@ do
                 seen = seen + 1
                 if seen % 2000 == 0 then RunService.Heartbeat:Wait() end
                 local n = nodes[cur]
+                local boost = fromK[cur] and NAV.BOOST_AFTER[fromK[cur]] or 1
                 for _, e in ipairs(n.e) do
                     local w = NAV.KINDW[e.k] or 1
                     local tn = nodes[e.to]
@@ -2165,9 +2173,10 @@ do
                                              NAV.RISE_DISCOUNT - NAV.RISE_PER_STUD * dy)
                         end
                     end
-                    local ng = dist[cur] + e.c * w
+                    local ng = dist[cur] + e.c * w * boost
                     if not dist[e.to] or ng < dist[e.to] then
                         dist[e.to] = ng
+                        fromK[e.to] = e.k
                         push(e.to, ng)
                     end
                 end
@@ -2254,6 +2263,9 @@ do
                     return path, nil, visited
                 end
                 local n = nodes[cur]
+                -- mit welchem Schwung bin ich hier angekommen?
+                local inK = came[cur] and came[cur].k
+                local boost = inK and NAV.BOOST_AFTER[inK] or 1
                 for _, e in ipairs(n.e) do
                     local w = NAV.KINDW[e.k] or 1
                     local tn = nodes[e.to]
@@ -2264,7 +2276,7 @@ do
                                              NAV.RISE_DISCOUNT - NAV.RISE_PER_STUD * dy)
                         end
                     end
-                    local ng = gScore[cur] + e.c * w
+                    local ng = gScore[cur] + e.c * w * boost
                     if not gScore[e.to] or ng < gScore[e.to] then
                         gScore[e.to] = ng
                         came[e.to] = { from = cur, k = e.k, via = e.via }
