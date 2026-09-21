@@ -1526,7 +1526,7 @@ do
         -- Statt jede Stelle einzeln zu pruefen, faengt es die eine Stelle
         -- ab, durch die alle Kanten laufen: zu weit nach oben oder zur
         -- Seite gibt es keinen Sprung, nach unten wird daraus ein Fall.
-        if kind == "jump" or kind == "hop" then
+        if kind == "jump" or kind == "hop" or kind == "vault" then
             local flat = ((b.p - a.p) * Vector3.new(1, 0, 1)).Magnitude
             if flat > JUMP_EDGE_MAX then
                 if b.p.Y < a.p.Y - 2 then kind = "drop" else return end
@@ -1617,7 +1617,7 @@ do
     
     local function buildWalk(nodes, grid, prof)
         local dirs = { {1,0}, {0,1}, {1,1}, {1,-1}, {-1,1}, {-1,0}, {0,-1}, {-1,-1} }
-        local walk, hop, step = 0, 0, 0
+        local walk, hop, step, vault = 0, 0, 0, 0
         for i, n in ipairs(nodes) do
             for _, d in ipairs(dirs) do
                 local b = grid[(n.ix+d[1]) .. "," .. (n.iz+d[2])]
@@ -1633,6 +1633,25 @@ do
                         elseif math.abs(dy) <= CFG.stepUp then
                             addEdge(n, o, "walk", dist / prof.speed, via)
                             walk = walk + 1
+                        elseif dy > prof.rise and dy <= prof.rise + 9
+                               and ((o.p - n.p) * Vector3.new(1,0,1)).Magnitude <= 6 then
+                            -- VAULT. Das Spiel zieht einen ueber eine Kante,
+                            -- gegen die man im Sprung laeuft, und gibt dabei
+                            -- das 2.4-fache Momentum (VaultMomentumMultiplier).
+                            -- Damit sind Absaetze erreichbar, die fuer einen
+                            -- blossen Sprung zu hoch sind — genau die
+                            -- Vertikalitaet, die den Verfolger abhaengt.
+                            -- Bedingung: zwischen beiden Knoten steht eine
+                            -- Wand (sonst gibt es nichts zu greifen), und
+                            -- ueber dem Ziel ist Platz.
+                            local face = cast(n.p + Vector3.new(0, 2.2, 0),
+                                              ((o.p - n.p) * Vector3.new(1,0,1)))
+                            local headroom = not cast(o.p + Vector3.new(0, 0.5, 0),
+                                                      Vector3.new(0, CFG.agentHeight, 0))
+                            if face and headroom then
+                                addEdge(n, o, "vault", dist / prof.speed + 0.45, via)
+                                vault = vault + 1
+                            end
                         elseif dy > CFG.stepUp and dy <= prof.rise
                                and ((o.p - n.p) * Vector3.new(1,0,1)).Magnitude <= 9 then
                             -- Stufe hoch: braucht einen Sprung, ist aber kurz.
@@ -1665,7 +1684,7 @@ do
             end
             if i % 300 == 0 then breathe() end
         end
-        return walk, hop, step
+        return walk, hop, step, vault
     end
     
     -- 4b) KLETTERN an Leitern — das, was PathfindingService gar nicht kann
@@ -2061,6 +2080,12 @@ do
         -- erreichen, und ein Verfolger, der klettern muss, verliert die
         -- Sichtlinie. Das ist der Kern des Unfangbar-Modus.
         hop  = 0.55,        -- Stufe hoch
+        -- VAULT IST DIE STAERKSTE OPTION IM GANZEN REPERTOIRE.
+        -- Gemessen auf ToyArena: 620 Vault-Kanten, hoechster Absatz 12.0
+        -- Studs — bei einer blossen Sprunghoehe von 3.1. Dazu das 2.4-fache
+        -- Momentum, und Ketten aus mehreren Vaults gehen ohne Bodenkontakt.
+        -- Deshalb billiger als alles andere, auch als die Zipline.
+        vault = 0.15,       -- ueber eine Kante ziehen, auch aus der Luft
         jump = 0.60,        -- Sprung ueber eine Luecke
         climb = 0.30,       -- Leiter
         -- Wallride bewusst TEUER: er braucht eigens markierte Waende, bricht
@@ -2272,7 +2297,7 @@ do
         -- Knotenpositionen, addEdge liest nd.bad
         stats.nudged, stats.offWall = nudgeFromEdges(nodes)
         stats.hazard, stats.hazardParts = markHazards(nodes, mapRoot)
-        stats.walk, stats.hop, stats.step = buildWalk(nodes, grid, prof)
+        stats.walk, stats.hop, stats.step, stats.vault = buildWalk(nodes, grid, prof)
         stats.climb = buildClimb(nodes, grid, bb, cell, mapRoot, prof)
         local j, d, rim = buildJumpDrop(nodes, grid, cell, prof)
         stats.jump, stats.drop, stats.rim = j, d, #rim
@@ -2302,7 +2327,7 @@ do
     -- Kantenart — das ist rund ein Viertel so gross und laedt deutlich schneller.
     local KIND2CH = { walk="w", hop="h", step="s", jump="j", drop="d",
                       climb="c", zip="z", pad="p", wallrun="r", roll="o",
-                      rail="g" }
+                      rail="g", vault="v" }
     local CH2KIND = {}
     for k, v in pairs(KIND2CH) do CH2KIND[v] = k end
     
@@ -2317,7 +2342,7 @@ do
     
         local lines = string.split(blob, "\n")
         local head = string.split(lines[1] or "", "|")
-        if head[1] ~= "UTGNAV14" then return nil end
+        if head[1] ~= "UTGNAV15" then return nil end
         local cell = tonumber(head[3])
         local bbv = string.split(head[4] or "", ",")
         if not cell or #bbv < 6 then return nil end
@@ -2377,7 +2402,7 @@ do
         -- stueckweise zusammensetzen: ein einzelner String mit Millionen
         -- Verkettungen sprengt den Speicher
         local parts = {
-            ("UTGNAV14|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
+            ("UTGNAV15|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
                 r1(G.bb.min.X), r1(G.bb.min.Y), r1(G.bb.min.Z),
                 r1(G.bb.max.X), r1(G.bb.max.Y), r1(G.bb.max.Z))
         }
@@ -2490,11 +2515,11 @@ local function ensureGraph()
             local s = g.stats
             LOG(("Navigationsgraph fuer %s gebaut: %d Knoten in %.1f s — %d gehen, "
                  .. "%d Stufe hoch, %d Stufe runter, %d springen, %d fallen, "
-                 .. "%d klettern, %d zip, %d pad; %d Punkte wegen zu wenig "
+                 .. "%d klettern, %d vault, %d zip, %d pad; %d Punkte wegen zu wenig "
                  .. "Platz verworfen, %d von Waenden weggeschoben; "
                  .. "Inseln %d -> %d durch %d Verbindungen")
                 :format(g.map, s.nodes, s.secs, s.walk, s.hop or 0, s.step or 0,
-                        s.jump, s.drop, s.climb, s.zip, s.pad, s.narrow or 0,
+                        s.jump, s.drop, s.climb, s.vault or 0, s.zip, s.pad, s.narrow or 0,
                         s.offWall or 0, s.islandsBefore or 0, s.islandsAfter or 0,
                         s.linked or 0))
             -- pcall allein genuegt hier nicht: NAV.save kann sauber
@@ -3339,6 +3364,7 @@ local function wpsExact(wps, idx)
     local k = w.kind
     return w.takeoff or w.railEntry
         or k == "climb" or k == "zip" or k == "pad" or k == "via" or k == "rail"
+        or k == "vault"
 end
 
 -- liefert die Richtung zum naechsten Wegpunkt (oder nil, wenn kein Pfad taugt).
@@ -3835,6 +3861,37 @@ local function followPath(pos, mode)
             local v = (best.Position - pos) * Vector3.new(1, 0, 1)
             if v.Magnitude > 0.1 then return v.Unit end
         end
+    end
+
+    -- VAULT / MANTLE. Der entscheidende Punkt: der Griff geht AUS DER LUFT.
+    -- Man springt vor die Kante und zieht sich im Flug darueber — damit sind
+    -- Absaetze weit ueber der eigenen Sprunghoehe erreichbar, und das Spiel
+    -- gibt dabei das 2.4-fache Momentum (VaultMomentumMultiplier). Genau
+    -- diese Vertikalitaet haengt Verfolger ab, die den Weg nicht kennen.
+    -- Drei Dinge muessen zusammenkommen: frueh genug abspringen, im Flug
+    -- GEGEN die Kante halten (nur bei Beruehrung greift es), und in der Luft
+    -- nachfassen — ein einzelner Tap beim Absprung haelt den Griff nicht.
+    if wp.kind == "vault" then
+        local toWp = (wp.Position - pos) * Vector3.new(1, 0, 1)
+        local d = toWp.Magnitude
+        local humV = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+        local airborne = humV and humV.FloorMaterial == Enum.Material.Air
+        local up = wp.Position.Y - pos.Y
+        -- KETTEN SIND MOEGLICH: drei Vaults hintereinander ohne Bodenkontakt.
+        -- Deshalb wird der naechste Griff auch aus der Luft heraus
+        -- angenommen, nicht nur vom Boden aus.
+        if (not airborne or up > 3) and d < 6
+           and tick() - (AP.vaultAt or 0) > 0.45 then
+            AP.vaultAt, AP.vaultY = tick(), pos.Y
+            tryJump(true)
+            diagEvent("vault", ("%.1f"):format(d), ("%.0f"):format(up), "", "Absprung")
+        elseif airborne and up > 1
+               and tick() - (AP.vaultAt or 0) > 0.2
+               and tick() - (AP.vaultGrab or 0) > 0.2 then
+            AP.vaultGrab = tick()
+            tryJump(true)
+        end
+        if d > 0.1 then return toWp.Unit end
     end
 
     -- RAIL (Grindschiene), EINSTIEG. Der Spielcode startet den Grind, wenn
