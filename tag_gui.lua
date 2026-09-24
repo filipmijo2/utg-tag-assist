@@ -3950,6 +3950,14 @@ local function followPath(pos, mode)
         local humV = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
         local airborne = humV and humV.FloorMaterial == Enum.Material.Air
         local up = wp.Position.Y - pos.Y
+        -- SPRUNGBEFEHL DURCHGEHEND HALTEN.
+        -- shared.jumpMobileTap gilt nur 0.12 Sekunden. Alle 0.2 Sekunden
+        -- nachzufassen hinterlaesst also Luecken, in denen gar kein
+        -- Sprungbefehl anliegt — und genau in so eine Luecke faellt der
+        -- Griff, wenn der Koerper die Kante beruehrt. Deshalb wird der Tap
+        -- ab jetzt JEDEN FRAME erneuert, solange der Vault laeuft: vom
+        -- Anlauf bis zum Aufsetzen oben. Das entspricht dem Halten der
+        -- Leertaste statt einzelner Antipper.
         -- KETTE NICHT ABREISSEN LASSEN.
         -- Folgt auf diesen Vault gleich der naechste, darf der Bot nicht
         -- erst landen: genau das Durchsteigen ohne Bodenkontakt macht die
@@ -3967,11 +3975,24 @@ local function followPath(pos, mode)
             diagEvent("vault", ("%.1f"):format(d), ("%.0f"):format(up),
                       tostring(AP.vaultChain or 0),
                       chain and "Kettenglied" or "Absprung")
-        elseif airborne and up > 1
-               and tick() - (AP.vaultAt or 0) > 0.15
-               and tick() - (AP.vaultGrab or 0) > (chain and 0.12 or 0.2) then
+        elseif airborne and up > -1 then
+            -- jeden Frame, ohne Sperre: das Fenster darf nie zugehen
             AP.vaultGrab = tick()
             tryJump(true)
+        end
+        -- auch im Anlauf schon halten, sobald die Kante nah ist
+        if not airborne and d < 9 and up > 1 then tryJump(true) end
+        -- ERGEBNIS FESTHALTEN: hat der Griff gesessen? Gemessen wird die
+        -- Hoehe zum Zeitpunkt des Absprungs gegen die jetzige. Damit laesst
+        -- sich zaehlen, wie viele Vaults beim ersten Versuch sitzen.
+        if AP.vaultY and not airborne and tick() - (AP.vaultAt or 0) > 0.35 then
+            local gained = pos.Y - AP.vaultY
+            diagEvent("vault_ende", ("%.1f"):format(gained),
+                      ("%.0f"):format(up), ("%.1f"):format(tick() - AP.vaultAt),
+                      gained > 2 and "oben" or "nicht geschafft")
+            diagStat(gained > 2 and "vault_ok" or "vault_fehl").n =
+                diagStat(gained > 2 and "vault_ok" or "vault_fehl").n + 1
+            AP.vaultY = nil
         end
         if d > 0.1 then return toWp.Unit end
     end
@@ -7466,6 +7487,34 @@ local function assistStep(dt)
         if sp > wantSpeed then wantSpeed, wantAccel = sp, lerp(1, p.escAccel, f) end
     end
 
+    -- TEMPOVERLUST AUFFANGEN.
+    -- Das Spiel setzt das Momentum auf null, sobald die Seitgeschwindigkeit
+    -- unter 6.8 faellt — nach jeder Landung, jedem engen Bogen, jedem
+    -- Streifen an einer Wand steht der Bot also wieder bei fast null und
+    -- muss sich hocharbeiten. Auf der Flucht ist genau das teuer: die Route
+    -- taugt nichts, wenn das Tempo nicht anliegt.
+    -- Zwei Hebel, beide nur beim WIEDERANFAHREN, nicht fuer die Spitze:
+    -- die spieleigene Beschleunigung und der eigene Boost-Eintrag. Die
+    -- Hoechstgeschwindigkeit bleibt unberuehrt, es faellt also nichts auf.
+    do
+        local hrpA = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+        local humA = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+        local spdA = hrpA and (hrpA.AssemblyLinearVelocity * Vector3.new(1, 0, 1)).Magnitude or 0
+        local wsA = (humA and humA.WalkSpeed or 32)
+        local ratio = spdA / math.max(wsA, 1)
+        state.spdRatio = ratio
+        if ratio < 0.75 and (AP.mode == "FLUCHT" or AP.usingPath) then
+            -- unter drei Vierteln: mit Nachdruck wieder auf Tempo
+            wantAccel = math.max(wantAccel, 2.4)
+            m.AccelerationMultiplier = 1.6
+            m.MomentumSpeed = 1.25
+            state.accBoostAt = tick()
+        elseif tick() - (state.accBoostAt or 0) > 0.8 then
+            m.AccelerationMultiplier = 1.15
+            m.MomentumSpeed = 1.056
+        end
+    end
+
     -- OHNE AYIP UND OHNE NAHEN VERFOLGER: hoechstens +7 Prozent.
     -- Tempo faellt vor allem dann auf, wenn gar kein Grund dafuer zu sehen
     -- ist — laeuft niemand in der Naehe, wirkt ein schneller Laeufer sofort
@@ -7541,10 +7590,14 @@ local function assistStep(dt)
                 wantSpeed = math.min(wantSpeed, 0.42)
                 wantAccel = math.min(wantAccel, 1.1)
             elseif k == "zip" or k == "pad" or k == "via" then
+                -- Milder als frueher (Untergrenze 0.45 -> 0.7) und erst ab
+                -- zehn statt vierzehn Studs: jedes Abbremsen kostet das
+                -- Momentum, und das aufzubauen dauert laenger, als die
+                -- Genauigkeit wert ist. Leitern bleiben streng, die brauchen
+                -- es wirklich.
                 local d = ((pw.Position - posS) * Vector3.new(1, 0, 1)).Magnitude
-                if d < 14 then
-                    -- weich herunterregeln statt abrupt bremsen
-                    local f = math.clamp(d / 14, 0.45, 1)
+                if d < 10 then
+                    local f = math.clamp(d / 10, 0.7, 1)
                     wantSpeed = math.min(wantSpeed, f)
                 end
             end
