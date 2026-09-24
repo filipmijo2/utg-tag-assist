@@ -937,7 +937,15 @@ local function pickEscapeGraph(pos, threats)
         if not nd.bad then
             local flat = (nd.p - pos) * Vector3.new(1, 0, 1)
             local dist = flat.Magnitude
-            if dist > 25 and dist < 320 then
+            local rise = nd.p.Y - pos.Y
+            -- HOEHE IST DIE HAUPTRICHTUNG, WEITE NUR DIE ZUGABE.
+            -- Bisher musste ein Fluchtziel mindestens 25 Studs WEIT weg
+            -- liegen — ein Vorsprung zehn Studs neben einem, aber zwanzig
+            -- Studs ueber einem, fiel damit durch das Raster. Dabei ist
+            -- genau das der beste Fluchtpunkt: der Verfolger steht darunter
+            -- und muss den ganzen Weg herum. Ein Punkt qualifiziert sich
+            -- jetzt also ueber Hoehe ODER Weite.
+            if (dist > 25 or rise > 8) and dist < 320 then
                 -- Auswege zaehlen: ein Punkt mit zwei Kanten ist eine Ecke
                 local ways = #nd.e
                 if ways >= 4 then
@@ -970,16 +978,20 @@ local function pickEscapeGraph(pos, threats)
                                 leadSec = 20
                             end
                         end
+                        -- Die Gewichte spiegeln die Hauptrichtung wider:
+                        -- Hoehe und Vorsprung entscheiden, die Weite ist nur
+                        -- noch ein Nebenbeitrag. Ein Stud Hoehe ueber dem
+                        -- Verfolger wiegt so viel wie sechs Studs Abstand.
                         local score =
                               math.clamp(leadSec, -10, 25) * 6.0
-                            + math.min(up, 60) * 2.2          -- Hoehe zaehlt stark
+                            + math.min(up, 60) * 5.0          -- HAUPTRICHTUNG
                             -- und noch staerker: wie hoch liegt der Punkt
                             -- UEBER dem naechsten Verfolger. Darauf kommt es
                             -- an, nicht auf die eigene Ausgangshoehe.
-                            + math.clamp(overThreat, -40, 70) * 4.0
-                            + math.min(nearestThreat, 200) * 0.9
+                            + math.clamp(overThreat, -40, 70) * 6.0
+                            + math.min(nearestThreat, 200) * 0.5   -- Zugabe
                             + math.min(ways, 12) * 3.0        -- viele Auswege
-                            - dist * 0.25                     -- nicht ans Kartenende
+                            - dist * 0.12                     -- nicht ans Kartenende
                         if not bestScore or score > bestScore then
                             best, bestScore, bestLead = nd.p, score, leadSec
                         end
@@ -1046,9 +1058,9 @@ local function pickEscapeNode(pos, threats, preys)
             local score = math.min(dThreat, 220) / 220 * 4.5   -- Abstand zu Jaegern
                         - tooClose * 3.0
                         + centrality * 2.2                      -- mittig bleiben
-                        + height * 1.8                          -- hoch bleiben
+                        + height * 4.0                          -- HAUPTRICHTUNG
                         -- entscheidend: ueber dem Verfolger stehen
-                        + math.clamp(overThreat / 20, -2, 3.5) * 3.2
+                        + math.clamp(overThreat / 20, -2, 3.5) * 5.0
                         - math.clamp(dMe / 320, 0, 1) * 0.8     -- nicht unnoetig weit
                         - pass * 2.5                            -- nicht am Jaeger vorbei
                         + grab * 1.6                            -- Opfer im Vorbeigehen mitnehmen
