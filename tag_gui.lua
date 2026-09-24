@@ -1540,6 +1540,8 @@ do
         -- Seite gibt es keinen Sprung, nach unten wird daraus ein Fall.
         if kind == "jump" or kind == "hop" or kind == "vault" then
             local flat = ((b.p - a.p) * Vector3.new(1, 0, 1)).Magnitude
+            -- senkrecht uebereinander ist erlaubt: das sind Treppen und
+            -- Zwischengeschosse, keine weiten Spruenge
             if flat > JUMP_EDGE_MAX then
                 if b.p.Y < a.p.Y - 2 then kind = "drop" else return end
             end
@@ -1690,6 +1692,41 @@ do
                             addEdge(n, o, "step",
                                     dist / prof.speed + math.sqrt(2 * math.abs(dy) / prof.g), via)
                             step = step + 1
+                        end
+                    end
+                end
+            end
+            -- ÜBEREINANDER IN DERSELBEN ZELLE VERBINDEN.
+            -- Der Nachbarschaftsdurchlauf oben kennt nur die acht
+            -- Nachbarzellen. Eine Wendeltreppe steigt aber INNERHALB einer
+            -- Saeule, genauso eine Leiterplattform, ein Zwischengeschoss
+            -- oder eine enge Feuertreppe. Gemessen auf Bloxburg: 4844 Zellen
+            -- haben mehrere Ebenen uebereinander, Stapel bis vierzehn hoch —
+            -- aber nur 853 von 186011 Kanten verbanden sie. Fuer die
+            -- Wegfindung existierten diese Aufstiege damit nicht.
+            local stack = grid[n.ix .. "," .. n.iz]
+            if stack and #stack > 1 then
+                for _, o in ipairs(stack) do
+                    if o.id ~= n.id then
+                        local dy = o.p.Y - n.p.Y
+                        if dy > CFG.stepUp and dy <= prof.rise + 9 then
+                            -- Ist der Raum dazwischen frei? Von Kopfhoehe des
+                            -- unteren bis knapp unter den oberen Knoten.
+                            local from = n.p + Vector3.new(0, 1.0, 0)
+                            local to = o.p + Vector3.new(0, 0.4, 0)
+                            if not cast(from, to - from) then
+                                if dy <= prof.rise then
+                                    addEdge(n, o, "hop", dy / prof.speed + 0.2)
+                                    hop = hop + 1
+                                else
+                                    addEdge(n, o, "vault", dy / prof.speed + 0.45)
+                                    vault = vault + 1
+                                end
+                                -- abwaerts geht es immer
+                                addEdge(o, n, "step",
+                                        math.sqrt(2 * dy / prof.g) + 0.1)
+                                step = step + 1
+                            end
                         end
                     end
                 end
@@ -2404,7 +2441,7 @@ do
     
         local lines = string.split(blob, "\n")
         local head = string.split(lines[1] or "", "|")
-        if head[1] ~= "UTGNAV16" then return nil end
+        if head[1] ~= "UTGNAV17" then return nil end
         local cell = tonumber(head[3])
         local bbv = string.split(head[4] or "", ",")
         if not cell or #bbv < 6 then return nil end
@@ -2464,7 +2501,7 @@ do
         -- stueckweise zusammensetzen: ein einzelner String mit Millionen
         -- Verkettungen sprengt den Speicher
         local parts = {
-            ("UTGNAV16|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
+            ("UTGNAV17|%s|%s|%s,%s,%s,%s,%s,%s"):format(tostring(G.map), tostring(G.cell),
                 r1(G.bb.min.X), r1(G.bb.min.Y), r1(G.bb.min.Z),
                 r1(G.bb.max.X), r1(G.bb.max.Y), r1(G.bb.max.Z))
         }
@@ -4476,6 +4513,46 @@ local function pickDirection(pos, goalDir, curVel)
     -- Haengt er fest (AP.pathLoose), faellt er bewusst in die freie
     -- Richtungswahl darunter — dort wird der Weg nur noch gewichtet.
     if onPath then
+        -- MOMENTUM IST ALLES. Wer einmal gegen eine Wand laeuft, steht bei
+        -- null — das Spiel setzt das Momentum zurueck, sobald die
+        -- Seitgeschwindigkeit unter 6.8 faellt, und sich davon zu erholen
+        -- dauert laenger als jeder Umweg. Auf einem geplanten Weg war das
+        -- Wandgleiten bisher ganz abgeschaltet (es hatte die Wegrichtung
+        -- verbogen); die Folge war, dass der Bot stur auf seinen Wegpunkt
+        -- zeigte und frontal in Waende lief.
+        -- Jetzt wird VORAUSSCHAUEND geglitten: es wird so weit vorausgesehen,
+        -- wie der Bot in einer Drittelsekunde faehrt, und bei drohendem
+        -- Kontakt die Richtung an der Wandflaeche entlang gelegt statt
+        -- dagegen. Die Abweichung ist gedeckelt, damit der Weg nicht
+        -- verloren geht.
+        do
+            local hrpW = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+            local spdW = hrpW and (hrpW.AssemblyLinearVelocity * Vector3.new(1, 0, 1)).Magnitude or 0
+            local look = math.clamp(spdW * 0.35, 4, 12)
+            local hitW = workspace:Raycast(pos + Vector3.new(0, 2.4, 0), goalDir * look, AP.rp)
+                      or workspace:Raycast(pos + Vector3.new(0, 0.7, 0), goalDir * look, AP.rp)
+            if hitW then
+                local nW = hitW.Normal * Vector3.new(1, 0, 1)
+                if nW.Magnitude > 0.05 then
+                    nW = nW.Unit
+                    local into = -goalDir:Dot(nW)       -- 1 = frontal
+                    if into > 0.25 then
+                        local slide = goalDir - nW * goalDir:Dot(nW)
+                        if slide.Magnitude > 0.08 then
+                            slide = slide.Unit
+                            -- nicht weiter als 65 Grad vom Weg abweichen
+                            if slide:Dot(goalDir) > 0.42 then
+                                goalDir = slide
+                            else
+                                goalDir = (slide + goalDir).Unit
+                            end
+                            diagStat("wand_abgeglitten").n =
+                                diagStat("wand_abgeglitten").n + 1
+                        end
+                    end
+                end
+            end
+        end
         -- Kleine Hindernisse kennt der Graph nicht: sein Raster ist 4 bis 9
         -- Studs weit, Moebel und Deko in Innenraeumen fallen komplett durch.
         -- Die Richtung bleibt daher unveraendert, aber es wird gesprungen
@@ -7515,6 +7592,19 @@ local function assistStep(dt)
         local wsA = (humA and humA.WalkSpeed or 32)
         local ratio = spdA / math.max(wsA, 1)
         state.spdRatio = ratio
+        -- TEMPOEINBRUCH FESTHALTEN. Ein einziger Wandkontakt kostet die
+        -- ganze Flucht — also wird jeder Einbruch protokolliert, mit dem,
+        -- was der Bot gerade tat. Nur so laesst sich zeigen, ob die
+        -- Gegenmassnahmen greifen.
+        if ratio < 0.45 and (state.spdWas or 1) >= 0.75 and spdA >= 0 then
+            local pw2 = PATH.wps and PATH.wps[PATH.idx]
+            diagEvent("tempoeinbruch", ("%.0f"):format(spdA), ("%.0f"):format(wsA),
+                      tostring(pw2 and pw2.kind or "-"),
+                      ("modus=%s aufWeg=%s"):format(tostring(AP.mode),
+                                                    tostring(AP.usingPath)))
+            diagStat("tempoeinbruch").n = diagStat("tempoeinbruch").n + 1
+        end
+        state.spdWas = ratio
         if ratio < 0.75 and (AP.mode == "FLUCHT" or AP.usingPath) then
             -- unter drei Vierteln: mit Nachdruck wieder auf Tempo
             wantAccel = math.max(wantAccel, 2.4)
