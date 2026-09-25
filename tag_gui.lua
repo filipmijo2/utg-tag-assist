@@ -4513,32 +4513,51 @@ end
 -- daneben, wo es am meisten zaehlt. Gemessen: 57 von 83 Haengern auf der
 -- Flucht ohne Weg an Waenden, mit 0-2 Hopsern; geplante Vaults oft leer.
 -- Liefert eine Zonenart oder nil.
+-- AP.zoneWhy: warum gerade KEINE Zone (fuer die Auswertung des Flackerns)
 local function vaultSpamZone(hrp, hum, pos)
     local wps, idx = PATH.wps, PATH.idx
     local wp = AP.usingPath and wps and idx and wps[idx]
     if wp and wp.kind == "vault" then
-        local d = ((wp.Position - pos) * Vector3.new(1, 0, 1)).Magnitude
-        if d < 8 then return "plan" end
+        local to = (wp.Position - pos) * Vector3.new(1, 0, 1)
+        local d = to.Magnitude
+        if d < 8 then
+            -- Wandflaeche Richtung Wegpunkt suchen: frontal anlaufen
+            local face = d > 0.1 and to.Unit or nil
+            if face then
+                local wh = workspace:Raycast(pos + Vector3.new(0, -0.3, 0), face * (d + 2), AP.rp)
+                if wh and wh.Normal.Y < 0.3 then
+                    local n = (-wh.Normal) * Vector3.new(1, 0, 1)
+                    if n.Magnitude > 0.1 then face = n.Unit end
+                end
+            end
+            return "plan", face
+        end
     end
     local dir = AP.vecWorld
-    if not dir or dir.Magnitude < 0.1 then return nil end
+    if not dir or dir.Magnitude < 0.1 then AP.zoneWhy = "keine_richtung" return nil end
     dir = (dir * Vector3.new(1, 0, 1)).Unit
     local hit = workspace:Raycast(pos + Vector3.new(0, -0.3, 0), dir * 2.8, AP.rp)
-    if not (hit and hit.Normal.Y < 0.3 and -hit.Normal:Dot(dir) > 0.4) then return nil end
+    if not (hit and hit.Normal.Y < 0.3 and -hit.Normal:Dot(dir) > 0.4) then
+        AP.zoneWhy = hit and "schraeg" or "keine_wand"
+        return nil
+    end
     local g = math.max(workspace.Gravity, 1)
     local jp = math.max(hum.JumpPower, 1)
     local maxRel = 2.75 + jp * jp / (2 * g)
     local inside = hit.Position - hit.Normal * 1.0
     local top = workspace:Raycast(Vector3.new(inside.X, pos.Y + maxRel + 0.5, inside.Z),
                                   Vector3.new(0, -(maxRel + 3), 0), AP.rp)
-    if not (top and top.Normal.Y > 0.7) then return nil end
+    if not (top and top.Normal.Y > 0.7) then AP.zoneWhy = "keine_oberkante" return nil end
     local rel = top.Position.Y - pos.Y
-    if rel < -0.6 or rel > maxRel then return nil end
+    if rel < -0.6 then AP.zoneWhy = "schon_drueber" return nil end
+    if rel > maxRel then AP.zoneWhy = "zu_hoch" return nil end
     if top.Instance:GetAttribute("NoClimb") then return nil end
     if not vaultHeadroom(pos, dir, top.Position, vaultNeed(top.Position.Y, hum, top.Position), AP.rp) then
+        AP.zoneWhy = "decke"
         return nil
     end
-    return "wand"
+    local n = (-hit.Normal) * Vector3.new(1, 0, 1)
+    return "wand", n.Magnitude > 0.1 and n.Unit or dir
 end
 
 local function vaultReflex(hrp, hum, wantDown)
@@ -4574,15 +4593,33 @@ local function vaultReflex(hrp, hum, wantDown)
     end
     -- SPAM-MODUS
     if not wantDown then
-        local zone = vaultSpamZone(hrp, hum, pos)
+        AP.zoneWhy = nil
+        local zone, face = vaultSpamZone(hrp, hum, pos)
+        -- nicht stur gegen eine Wand: 1.2 s Spam ohne Griff -> 1.5 s Pause
+        if zone == "wand" and AP.spamBlockUntil and now < AP.spamBlockUntil then
+            zone, face, AP.zoneWhy = nil, nil, "pause"
+        end
+        if zone == "wand" and AP.spamZone == "wand" and not AP.spamHit
+           and AP.spamStart and now - AP.spamStart > 1.2 then
+            AP.spamBlockUntil = now + 1.5
+            zone, face, AP.zoneWhy = nil, nil, "aufgegeben"
+        end
+        -- FRONTAL ZUR WAND: die Spielpruefung schaut nur entlang der
+        -- Blickrichtung. Schraeges Entlanggleiten liess 88 von 120
+        -- Spam-Phasen leer laufen. Die Lenkung haelt senkrecht auf die Wand.
+        if zone and face then
+            AP.vaultCommitDir, AP.vaultCommitUntil = face, now + 0.12
+        end
         if zone ~= AP.spamZone then
             if AP.spamZone then
                 diagEvent("spam_ende", AP.spamZone, AP.spamHit and "echt" or "nichts",
-                          tostring(AP.spamTaps or 0), tostring(AP.mode or "-"))
+                          tostring(AP.spamTaps or 0), tostring(AP.mode or "-")
+                          .. " grund=" .. tostring(zone or AP.zoneWhy or "?")
+                          .. (" dauer=%.2f"):format(now - (AP.spamStart or now)))
                 local st = diagStat("spam_" .. AP.spamZone .. "_" .. (AP.spamHit and "echt" or "nichts"))
                 st.n = st.n + 1
             end
-            AP.spamZone, AP.spamHit, AP.spamTaps = zone, false, 0
+            AP.spamZone, AP.spamHit, AP.spamTaps, AP.spamStart = zone, false, 0, now
         end
         if zone then
             if hum:GetAttribute("HasJumped") then
