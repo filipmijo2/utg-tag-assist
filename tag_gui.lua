@@ -7886,6 +7886,20 @@ local function survTick(dt, mode, threatD)
     local now = tick()
     -- Rolle beobachten: ein Wechsel mitten in der Runde heisst gefangen
     local r = myRole()
+    -- GEFANGEN NUR BEIM WECHSEL IN EINE FANGENDE ROLLE. Bisher zaehlte
+    -- jeder Rollenwechsel — im Tag-Duell also auch jeder EIGENE Treffer
+    -- (Faenger -> Laeufer). Die Haelfte der "Faenge" waren eigene Tags.
+    local gdR = RENV.shared.gamemodeData
+    local function canTag(role)
+        return gdR and gdR.Roles and gdR.Roles[role]
+            and gdR.Roles[role].TagTables ~= nil or false
+    end
+    if SURV.role and r and r ~= SURV.role and inLiveRound()
+       and not (canTag(r) and not canTag(SURV.role)) then
+        -- selbst getaggt (oder sonstiger Wechsel): kein Fang, Serie laeuft
+        diagEvent("getaggt", SURV.role, r, "", "")
+        SURV.role = r
+    end
     if SURV.role and r and r ~= SURV.role and inLiveRound() then
         local streak = now - SURV.lastTag
         if streak > SURV.bestStreak then SURV.bestStreak = streak end
