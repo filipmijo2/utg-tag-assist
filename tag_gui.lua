@@ -928,14 +928,33 @@ local function pickEscapeGraph(pos, threats)
     local G = NG and NG.graph
     if not G or #G.nodes < 50 then return nil end
     local lead = leadField(pos, threats)
-    local bestLead = 0
+    local bestLead, bestT = 0, nil
     local best, bestScore
     local n = #G.nodes
-    -- Stichprobe statt aller Knoten: bei 28000 waere das jede Sekunde zu teuer
-    local tries = math.min(260, n)
+    -- NUR ERREICHBARE KANDIDATEN. Das Kostenfeld deckt nur die ~6000
+    -- naechsten Knoten ab, gewuerfelt wurde aber aus allen. Gemessen auf
+    -- TeapotTemple: 36 von 36 Zielen mit Vorsprung 0, im Schnitt 188 Studs
+    -- hoch und 210 weit — unerreichbar, nur ueber die Hoehe gewaehlt. Folge:
+    -- kein Weg, Nahsteuerung drueckt gegen Waende, Rumhuepfen in Ecken.
+    -- Jetzt wird nur aus Knoten gezogen, die ICH im Kostenfeld erreiche.
+    local ids
+    if lead and lead.mine then
+        if LEAD.idsFor ~= lead.mine then
+            local list = {}
+            for id in pairs(lead.mine) do list[#list + 1] = id end
+            LEAD.ids, LEAD.idsFor = list, lead.mine
+        end
+        ids = LEAD.ids
+        if ids and #ids < 30 then ids = nil end
+    end
+    local tries = math.min(ids and 320 or 260, n)
     for _ = 1, tries do
-        local nd = G.nodes[math.random(1, n)]
-        if not nd.bad then
+        local nd = ids and G.nodes[ids[math.random(1, #ids)]] or G.nodes[math.random(1, n)]
+        local myT = ids and nd and lead.mine[nd.id]
+        -- ohne Feld: nur nahe, realistisch erreichbare Punkte
+        local plausible = ids ~= nil
+            or (nd and (nd.p - pos).Magnitude < 120 and nd.p.Y - pos.Y < 40)
+        if nd and plausible and not nd.bad then
             local flat = (nd.p - pos) * Vector3.new(1, 0, 1)
             local dist = flat.Magnitude
             local rise = nd.p.Y - pos.Y
@@ -985,7 +1004,7 @@ local function pickEscapeGraph(pos, threats)
                         -- Verfolger wiegt so viel wie sechs Studs Abstand.
                         local score =
                               math.clamp(leadSec, -10, 25) * 6.0
-                            + math.min(up, 60) * 5.0          -- HAUPTRICHTUNG
+                            + math.min(up, 40) * 5.0          -- HAUPTRICHTUNG
                             -- und noch staerker: wie hoch liegt der Punkt
                             -- UEBER dem naechsten Verfolger. Darauf kommt es
                             -- an, nicht auf die eigene Ausgangshoehe.
@@ -993,8 +1012,11 @@ local function pickEscapeGraph(pos, threats)
                             + math.min(nearestThreat, 200) * 0.5   -- Zugabe
                             + math.min(ways, 12) * 3.0        -- viele Auswege
                             - dist * 0.12                     -- nicht ans Kartenende
+                            -- Anreisezeit: was ich in 4 s erreiche, schlaegt
+                            -- dasselbe in 15 s (er holt mich unterwegs ein)
+                            - (myT or 0) * 2.0
                         if not bestScore or score > bestScore then
-                            best, bestScore, bestLead = nd.p, score, leadSec
+                            best, bestScore, bestLead, bestT = nd.p, score, leadSec, myT
                         end
                     end
                 end
@@ -1005,7 +1027,8 @@ local function pickEscapeGraph(pos, threats)
         ENV.diagEvent("fluchtziel", ("%.1f"):format(bestLead),
                       ("%.0f"):format(best.Y - pos.Y),
                       ("%.0f"):format((best - pos).Magnitude),
-                      lead and "mit Vorsprungsfeld" or "ohne Feld")
+                      (ids and "erreichbar" or (lead and "Feld zu klein" or "ohne Feld"))
+                      .. (" anreise=%.1f"):format(bestT or -1))
     end
     return best
 end
