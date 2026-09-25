@@ -2876,15 +2876,38 @@ local function failTick(pos, hum, goalActive)
     local wps, idx = PATH.wps, PATH.idx
 
     -- 1) STECKENGEBLIEBEN: will laufen, kommt aber nicht vom Fleck
-    if WATCH.pos then
-        local moved = ((pos - WATCH.pos) * Vector3.new(1, 0, 1)).Magnitude
-        if moved > 1.0 then WATCH.movedAt = now end
-        if goalActive and now - WATCH.movedAt > 1.5 then
-            failNote("steckt", ("%.1f s ohne Fortschritt"):format(now - WATCH.movedAt))
-            WATCH.movedAt = now
+    -- Bezugspunkt bleibt stehen, bis er 2 Studs hinter sich liegt. Frueher
+    -- wurde gegen die Position des LETZTEN FRAMES verglichen (> 1 Stud) —
+    -- bei 32 Studs/s sind das 0.5 Studs je Frame, die Meldung "steckt" kam
+    -- also alle 1.5 s auch bei voller Fahrt und war wertlos.
+    if not WATCH.anchor or ((pos - WATCH.anchor) * Vector3.new(1, 0, 1)).Magnitude > 2.0 then
+        WATCH.anchor, WATCH.movedAt, WATCH.hops = pos, now, 0
+    end
+    if hum and hum.FloorMaterial == Enum.Material.Air and not WATCH.wasAir then
+        WATCH.hops = (WATCH.hops or 0) + 1
+    end
+    WATCH.wasAir = hum and hum.FloorMaterial == Enum.Material.Air
+    if goalActive and now - WATCH.movedAt > 1.5 then
+        local wp = wps and idx and wps[idx]
+        local ap = ENV.ap
+        local look = (ap and ap.vecWorld) or Vector3.new(0, 0, 0)
+        local wall = "-"
+        if look.Magnitude > 0.1 then
+            local h1 = workspace:Raycast(pos, look.Unit * 3, ap and ap.rp)
+            local h2 = workspace:Raycast(pos + Vector3.new(0, 2.5, 0), look.Unit * 3, ap and ap.rp)
+            wall = (h1 and h2) and "wand" or (h1 and "kante" or "frei")
         end
-    else
-        WATCH.movedAt = now
+        local dy = wp and (wp.Position.Y - (pos.Y - 2.5)) or 0
+        local detail = ("%.1f s, Art %s, dy %.1f, %s, %d Spruenge, %s"):format(
+            now - WATCH.movedAt, tostring(wp and wp.kind or "-"), dy, wall,
+            WATCH.hops or 0, tostring(ap and ap.mode or "-"))
+        failNote("steckt", detail)
+        if ENV.diagEvent then
+            ENV.diagEvent("steckt", tostring(wp and wp.kind or "-"), ("%.1f"):format(dy),
+                          wall, ("spruenge=%d helfer=%s weg=%s"):format(WATCH.hops or 0,
+                          tostring(ap and ap.helper or "-"), tostring(ap and ap.usingPath or false)))
+        end
+        WATCH.movedAt, WATCH.hops = now, 0
     end
 
     -- 2) ABWEICHUNG vom Sollweg: wie weit laeuft er neben dem Pfad her?
