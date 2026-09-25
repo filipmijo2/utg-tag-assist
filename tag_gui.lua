@@ -4450,6 +4450,63 @@ local function vaultProbe(hrp)
     return hit
 end
 
+-- DECKE / UEBERSTAND UEBER DER KANTE.
+-- Die Spielpruefung greift auch unter einer Decke: der Bot schoss dann mit
+-- bis zu 55 Studs/s gegen die Decke. Wie viel Platz noetig ist, haengt davon
+-- ab, was danach kommt: geht der Weg oben geradeaus weiter, reicht
+-- Koerperhoehe mit Luft. Will der Weg danach WEITER HOCH (hoeherer
+-- Wegpunkt, Sprung, naechster Vault), muss ueber der Kante Platz fuer den
+-- ganzen Aufstieg sein — sonst ist der Vault eine Sackgasse.
+local BODY_H = 5.5
+local function vaultNeed(topY, hum, topPos)
+    local need = BODY_H
+    local g = math.max(workspace.Gravity, 1)
+    local jp = hum and math.max(hum.JumpPower, 1) or 28
+    local jumpH = jp * jp / (2 * g)
+    local wps, idx = PATH.wps, PATH.idx
+    if ENV.ap and ENV.ap.usingPath and wps and idx then
+        for k = idx, math.min(idx + 4, #wps) do
+            local w = wps[k]
+            -- nur Wegpunkte UEBER dieser Kante zaehlen: eine Leiter zehn
+            -- Studs weiter braucht hier keinen senkrechten Platz (gemessen
+            -- wurden sonst 40-83 Studs Bedarf)
+            local near = w and (not topPos
+                or ((w.Position - topPos) * Vector3.new(1, 0, 1)).Magnitude < 4)
+            if w and near then
+                local up = w.Position.Y - topY
+                if up > 1 then need = math.max(need, up + BODY_H) end
+                if k > idx and (w.kind == "vault" or w.kind == "jump"
+                                or w.kind == "hop" or w.kind == "climb") then
+                    need = math.max(need, jumpH + BODY_H)
+                end
+            end
+        end
+    end
+    -- mehr als Sprunghoehe + Koerper ueber dieser Kante braucht es nie
+    return math.min(need, jumpH + BODY_H)
+end
+-- frei = kleinster gemessener Freiraum ueber Koerper, Kante und Landestelle
+local function vaultHeadroom(pos, look, topPos, need, rp)
+    local targetY = topPos.Y + need
+    local free, why = math.huge, nil
+    local starts = {
+        pos + Vector3.new(0, 2.6, 0),                 -- ueber dem Kopf (Aufstieg)
+        topPos + Vector3.new(0, 0.1, 0),              -- ueber der Kante
+        topPos + look * 1.5 + Vector3.new(0, 0.1, 0), -- Landestelle
+    }
+    for _, o in ipairs(starts) do
+        local len = targetY - o.Y
+        if len > 0.2 then
+            local h = workspace:Raycast(o, Vector3.new(0, len, 0), rp)
+            if h and h.Position.Y - topPos.Y < free then
+                free = h.Position.Y - topPos.Y
+                why = ({ "kopf", "kante", "landung" })[_] .. ":" .. h.Instance.Name
+            end
+        end
+    end
+    return free >= need, free, why
+end
+
 -- wantDown: der Weg will gerade bewusst nach unten -> nicht hochziehen
 local function vaultReflex(hrp, hum, wantDown)
     local S = RENV.shared
@@ -4486,6 +4543,21 @@ local function vaultReflex(hrp, hum, wantDown)
     if (AP.vrLeer or 0) >= 2 and now - (AP.vrFired or 0) < 0.6 then return end
     local hit = vaultProbe(hrp)
     if not hit then return end
+    do
+        local lk = hrp.CFrame.LookVector * Vector3.new(1, 0, 1)
+        lk = lk.Magnitude > 0.1 and lk.Unit or Vector3.new(0, 0, 0)
+        local need = vaultNeed(hit.Position.Y, hum, hit.Position)
+        local ok, free, why = vaultHeadroom(pos, lk, hit.Position, need, AP.rp)
+        if not ok then
+            if now - (AP.decAt or 0) > 1 then
+                AP.decAt = now
+                diagEvent("vault_decke", ("%.1f"):format(free), ("%.1f"):format(need),
+                          tostring(AP.mode or "-"), tostring(why or ""))
+                diagStat("vault_decke").n = diagStat("vault_decke").n + 1
+            end
+            return
+        end
+    end
     if hum:GetAttribute("HasJumped") then
         -- Taste liegt noch an: einen Frame loslassen, naechster Frame drueckt
         S.jumpMobileTap = 0
@@ -4541,8 +4613,9 @@ local function vaultMagnetScan(hrp, dir, angs, threatPos, maxRel)
                 Vector3.new(inside.X, pos.Y + 9, inside.Z), Vector3.new(0, -12, 0), AP.rp)
             if top and top.Normal.Y > 0.7 then
                 local rel = top.Position.Y - pos.Y
-                if rel > -0.4 and rel < maxRel and not workspace:Raycast(
-                        top.Position + Vector3.new(0, 0.1, 0), Vector3.new(0, 5, 0), AP.rp) then
+                if rel > -0.4 and rel < maxRel and vaultHeadroom(
+                        pos, d, top.Position, vaultNeed(top.Position.Y, hrp.Parent
+                            and hrp.Parent:FindFirstChildOfClass("Humanoid"), top.Position), AP.rp) then
                     local dist = ((hit.Position - pos) * Vector3.new(1, 0, 1)).Magnitude
                     local okThreat = not threatPos
                         or (hit.Position - threatPos).Magnitude > dThreat - 2
