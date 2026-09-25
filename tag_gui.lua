@@ -256,6 +256,7 @@ local function diagEvent(typ, a, b, c, text)
     }, ";")
 end
 ENV.diagEvent = diagEvent
+ENV.diagVal = diagVal
 
 local function evFlush(force)
     if #evBuf == 0 then return end
@@ -1553,7 +1554,22 @@ do
     end
     
     -- naechster Knoten zu einer Position, ueber das Raster
-    local function nearest(grid, bb, cell, pos, maxDist, maxDy)
+    -- BODEN STATT HUEFTE. Die Knoten liegen auf Bodenhoehe +0.5, gefragt
+    -- wurde aber mit der Hueftposition (Boden +3) und reinem 3D-Abstand.
+    -- Neben einer 2.5 bis 3.5 Studs hohen Erhoehung lag deren Knoten damit
+    -- auf Hueftniveau und "naeher" als der Bodenknoten unter dem Bot: der
+    -- Weg begann OBEN, der Bot stand UNTEN und lief gegen die Kante.
+    -- Jetzt: Position per Strahl nach unten auf den echten Boden setzen und
+    -- Hoehenabweichung bei der Knotenwahl dreifach gewichten.
+    local function footOf(pos)
+        local ap = ENV.ap
+        local hit = workspace:Raycast(pos + Vector3.new(0, 1, 0), Vector3.new(0, -9, 0),
+                                      ap and ap.rp or nil)
+        if hit then return hit.Position + Vector3.new(0, 0.5, 0) end
+        return pos - Vector3.new(0, 2.5, 0)
+    end
+    local function nearest(grid, bb, cell, pos, maxDist, maxDy, wy)
+        wy = wy or 1
         local ix = math.floor((pos.X - bb.min.X) / cell + 0.5)
         local iz = math.floor((pos.Z - bb.min.Z) / cell + 0.5)
         local span = math.ceil(maxDist / cell)
@@ -1563,9 +1579,12 @@ do
                 local b = grid[(ix+dx) .. "," .. (iz+dz)]
                 if b then
                     for _, n in ipairs(b) do
-                        local d = (n.p - pos).Magnitude
-                        if d <= maxDist and (not maxDy or math.abs(n.p.Y - pos.Y) <= maxDy) then
-                            if not bd or d < bd then best, bd = n, d end
+                        local dv = n.p - pos
+                        local d = dv.Magnitude
+                        if d <= maxDist and (not maxDy or math.abs(dv.Y) <= maxDy) then
+                            local dw = (wy == 1) and d
+                                or math.sqrt(dv.X * dv.X + dv.Z * dv.Z + (wy * dv.Y) ^ 2)
+                            if not bd or dw < bd then best, bd = n, dw end
                         end
                     end
                 end
@@ -2180,7 +2199,7 @@ do
     function NAV.costField(fromPos, budget)
         local G = NAV.graph
         if not G then return nil end
-        local s = nearest(G.grid, G.bb, G.cell, fromPos, 30, 14)
+        local s = nearest(G.grid, G.bb, G.cell, footOf(fromPos), 30, 14, 3)
         if not s then return nil end
         local nodes = G.nodes
         local dist, closed, fromK = { [s.id] = 0 }, {}, {}
@@ -2249,8 +2268,12 @@ do
     function NAV.findPath(startPos, goalPos)
         local G = NAV.graph
         if not G then return nil, "kein Graph" end
-        local s = nearest(G.grid, G.bb, G.cell, startPos, 30, 14)
-        local t = nearest(G.grid, G.bb, G.cell, goalPos, 30, 18)
+        local s = nearest(G.grid, G.bb, G.cell, footOf(startPos), 30, 14, 3)
+        local t = nearest(G.grid, G.bb, G.cell, footOf(goalPos), 30, 18, 3)
+        -- Messung: wie weit liegt der Startknoten in der Hoehe daneben?
+        if s and ENV.diagVal then
+            ENV.diagVal("startknoten", "dy", math.abs(s.p.Y - footOf(startPos).Y))
+        end
         if not s then return nil, "Start nicht im Graph" end
         if not t then return nil, "Ziel nicht im Graph" end
         if s.id == t.id then return { s }, nil end
@@ -3229,8 +3252,12 @@ local function requestPath(fromPos, candidates)
                 local bestI, bestD = startIdx, math.huge
                 for k = 1, math.min(6, #wps) do
                     if wps[k].takeoff then break end   -- Abspruenge nie ueberspringen
+                    -- Hoehe zaehlt mit: ein Punkt OBEN auf einer Erhoehung
+                    -- neben dem Bot ist kein Einstieg (die Kante hoch wuerde
+                    -- uebersprungen; er rannte unten gegen die Wand).
+                    local dyk = wps[k].Position.Y - (fromPos.Y - 2.5)
                     local d = ((wps[k].Position - fromPos) * Vector3.new(1, 0, 1)).Magnitude
-                    if d < bestD then bestI, bestD = k, d end
+                    if math.abs(dyk) < 2 and d < bestD then bestI, bestD = k, d end
                 end
                 local cand = math.min(bestI + 1, #wps)
                 if cand > startIdx and not wps[cand - 1].takeoff then
