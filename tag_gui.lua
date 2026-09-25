@@ -4745,6 +4745,7 @@ ENV.vaultProbe = vaultProbe
 ------------------------------------------------------------------
 local VM_ANG_FLEE = { 0, -10, 10, -20, 20, -30, 30 }
 local VM_ANG_HUNT = { 0, -10, 10 }
+local VM_ANG_CLOSE = { 0, -10, 10, -20, 20 }
 
 local function vaultMagnetScan(hrp, dir, angs, threatPos, maxRel)
     local pos = hrp.Position
@@ -4798,15 +4799,27 @@ local function vaultMagnet(hrp, hum, dir, mode, threatPos)
     local jp = math.max(hum.JumpPower, 1)
     local apexT = jp / g
     local maxRel = 2.75 + 0.75 * jp * jp / (2 * g)
-    if not AP.vmScanAt or now - AP.vmScanAt > 0.1 then
+    -- VERFOLGER NAH: kein Zickzack. Im Duell-Trace sprang das Kantenziel
+    -- zwischen -30 und +30 Grad hin und her, jeder Wechsel kostet Abstand.
+    -- Unter 15 Studs wird ein gewaehltes Ziel 0.8 s gehalten und nur im
+    -- engeren Faecher (+-20) gesucht.
+    local close = mode == "FLUCHT" and threatPos
+        and (threatPos - pos).Magnitude < 15
+    local hold = close and AP.vm and AP.vm.t0 and now - AP.vm.t0 < 0.8
+    if not hold and (not AP.vmScanAt or now - AP.vmScanAt > 0.1) then
         AP.vmScanAt = now
-        local angs = (mode == "FLUCHT") and VM_ANG_FLEE or VM_ANG_HUNT
+        local angs = close and VM_ANG_CLOSE
+            or ((mode == "FLUCHT") and VM_ANG_FLEE or VM_ANG_HUNT)
         local b = vaultMagnetScan(hrp, dir, angs, threatPos, maxRel)
         if b then
             if not AP.vm or (AP.vm.p - b.p).Magnitude > 3 then
                 diagEvent("magnet", ("%.1f"):format(b.rel), tostring(b.a),
                           ("%.0f"):format(b.dist), mode)
                 diagStat("magnet").n = diagStat("magnet").n + 1
+                b.t0 = now
+                if SURV and SURV.close then SURV.close.switches = (SURV.close.switches or 0) + 1 end
+            else
+                b.t0 = AP.vm.t0
             end
             b.t = now
             AP.vm = b
@@ -8055,6 +8068,13 @@ local function survTick(dt, mode, threatD)
         SURV.lastTag = now
         if SURV.close then
             SURV.caught = SURV.caught + 1
+            -- VERLORENER ZWEIKAMPF: was lief in den Sekunden davor?
+            local used = {}
+            for k in pairs(SURV.close.used or {}) do used[#used + 1] = k end
+            diagEvent("zweikampf_verloren", ("%.1f"):format(now - SURV.close.at),
+                      ("%.1f"):format(SURV.close.d0 or 0),
+                      tostring(SURV.close.switches or 0),
+                      "benutzt=" .. table.concat(used, ","))
             SURV.close = nil
         end
         diagEvent("gefangen", ("%.0f"):format(streak), SURV.tags, "",
