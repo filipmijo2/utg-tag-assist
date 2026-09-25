@@ -3700,7 +3700,19 @@ local function followPath(pos, mode)
             end
             break
         end
-        if wp.kind == "climb" then
+        if wp.kind == "vault" then
+            -- EIN VAULT IST ERST ERLEDIGT, WENN DIE FUESSE OBEN SIND.
+            -- Die allgemeine Hoehenpruefung vergleicht den Punkt (Boden
+            -- +0.5) mit der HUEFTE (Boden +3): vor einer 5-Studs-Wand lag
+            -- der Vault-Punkt nur 2.5 ueber der Huefte, die Toleranz auf der
+            -- Flucht ist 4 — er galt als erreicht, waehrend der Bot unten
+            -- stand. Gemessen endeten geplante Vaults nach 0.0 bis 0.2 s als
+            -- "leer". Wie bei Leitern keine Ausnahmen (vorbei/Notausgang);
+            -- kommt er nicht hoch, uebernimmt der Fortschrittswaechter.
+            local feetUp = wp.Position.Y - (pos.Y - 3)
+            reached = flat.Magnitude < 4.5 and feetUp < 1.5
+            if reached then reachedWhy = "oben" end
+        elseif wp.kind == "climb" then
             -- Der Kopf einer Leiter liegt bis zu 45 Studs ueber dem Fuss.
             -- Hier darf der Notausgang nicht greifen, sonst gilt der Punkt
             -- als erledigt, bevor ueberhaupt geklettert wurde. Und eng
@@ -8027,13 +8039,11 @@ local function survTick(dt, mode, threatD)
     -- GEFANGEN NUR BEIM WECHSEL IN EINE FANGENDE ROLLE. Bisher zaehlte
     -- jeder Rollenwechsel — im Tag-Duell also auch jeder EIGENE Treffer
     -- (Faenger -> Laeufer). Die Haelfte der "Faenge" waren eigene Tags.
-    local gdR = RENV.shared.gamemodeData
-    local function canTag(role)
-        return gdR and gdR.Roles and gdR.Roles[role]
-            and gdR.Roles[role].TagTables ~= nil or false
-    end
+    -- Gefangen = meine NEUE Rolle darf meine ALTE taggen (Classic:
+    -- Runner -> Tagger; Crown: Krone -> Peasant). Die fruehere Pruefung
+    -- "TagTables ~= nil" hielt die Krone (leere Tabelle) fuer fangberechtigt.
     if SURV.role and r and r ~= SURV.role and inLiveRound()
-       and not (canTag(r) and not canTag(SURV.role)) then
+       and not canTag(r, SURV.role) then
         -- selbst getaggt (oder sonstiger Wechsel): kein Fang, Serie laeuft
         diagEvent("getaggt", SURV.role, r, "", "")
         SURV.role = r
@@ -9143,7 +9153,7 @@ task.spawn(function()
         -- sonst sucht man den Fehler im Tool, obwohl das Spiel es verbietet.
         local gdS = RENV.shared.gamemodeData
         local roleCanTag = gdS and gdS.Roles and state.role
-            and gdS.Roles[state.role] and gdS.Roles[state.role].TagTables ~= nil
+            and gdS.Roles[state.role] and next(gdS.Roles[state.role].TagTables or {}) ~= nil
         local roleNote = (state.role and not roleCanTag) and "  (darf nicht taggen)" or ""
         status.Text = ("  Rolle: %s%s   [%d jagen mich | %d jagbar]"):format(
                 tostring(state.role or "-"), roleNote, state.nThreat or 0, state.nPrey or 0)
