@@ -4595,6 +4595,23 @@ local function vaultReflex(hrp, hum, wantDown)
     if not wantDown then
         AP.zoneWhy = nil
         local zone, face = vaultSpamZone(hrp, hum, pos)
+        -- ZONE HAELT UEBER DEN ABSPRUNG. Gemessen endeten 54 von 81 leeren
+        -- Spam-Phasen mit "keine_wand": nach dem ersten Tap steigt der Koerper,
+        -- der Suchstrahl auf Hueftehoehe geht ueber die Wand hinweg — und der
+        -- Spam hoerte genau im Aufstieg auf, wo der Griff greifen wuerde.
+        -- Jetzt bleibt die gemerkte Wand bis zur Landung / ueber die Kante.
+        if zone == "wand" then
+            AP.spamStick = { face = face, tEnd = now + 0.8 }
+        elseif not zone and AP.spamStick and now < AP.spamStick.tEnd
+               and AP.zoneWhy ~= "decke" and AP.zoneWhy ~= "pause" then
+            local air = hum.FloorMaterial == Enum.Material.Air
+            if air or now < AP.spamStick.tEnd - 0.5 then
+                zone, face = "wand", AP.spamStick.face
+                AP.zoneWhy = "haelt"
+            end
+        end
+        if not zone and AP.spamStick and now >= AP.spamStick.tEnd then AP.spamStick = nil end
+        if AP.spamHit then AP.spamStick = nil end
         -- nicht stur gegen eine Wand: 1.2 s Spam ohne Griff -> 1.5 s Pause
         if zone == "wand" and AP.spamBlockUntil and now < AP.spamBlockUntil then
             zone, face, AP.zoneWhy = nil, nil, "pause"
