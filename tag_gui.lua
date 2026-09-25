@@ -4508,10 +4508,93 @@ local function vaultHeadroom(pos, look, topPos, need, rp)
 end
 
 -- wantDown: der Weg will gerade bewusst nach unten -> nicht hochziehen
+-- SPAM-ZONE: wo ein Mensch die Leertaste spammen wuerde. Das Spiel prueft
+-- bei JEDEM Druck selbst (bis zu 10x/s) — unsere Nachrechnung liegt dort
+-- daneben, wo es am meisten zaehlt. Gemessen: 57 von 83 Haengern auf der
+-- Flucht ohne Weg an Waenden, mit 0-2 Hopsern; geplante Vaults oft leer.
+-- Liefert eine Zonenart oder nil.
+local function vaultSpamZone(hrp, hum, pos)
+    local wps, idx = PATH.wps, PATH.idx
+    local wp = AP.usingPath and wps and idx and wps[idx]
+    if wp and wp.kind == "vault" then
+        local d = ((wp.Position - pos) * Vector3.new(1, 0, 1)).Magnitude
+        if d < 8 then return "plan" end
+    end
+    local dir = AP.vecWorld
+    if not dir or dir.Magnitude < 0.1 then return nil end
+    dir = (dir * Vector3.new(1, 0, 1)).Unit
+    local hit = workspace:Raycast(pos + Vector3.new(0, -0.3, 0), dir * 2.8, AP.rp)
+    if not (hit and hit.Normal.Y < 0.3 and -hit.Normal:Dot(dir) > 0.4) then return nil end
+    local g = math.max(workspace.Gravity, 1)
+    local jp = math.max(hum.JumpPower, 1)
+    local maxRel = 2.75 + jp * jp / (2 * g)
+    local inside = hit.Position - hit.Normal * 1.0
+    local top = workspace:Raycast(Vector3.new(inside.X, pos.Y + maxRel + 0.5, inside.Z),
+                                  Vector3.new(0, -(maxRel + 3), 0), AP.rp)
+    if not (top and top.Normal.Y > 0.7) then return nil end
+    local rel = top.Position.Y - pos.Y
+    if rel < -0.6 or rel > maxRel then return nil end
+    if top.Instance:GetAttribute("NoClimb") then return nil end
+    if not vaultHeadroom(pos, dir, top.Position, vaultNeed(top.Position.Y, hum, top.Position), AP.rp) then
+        return nil
+    end
+    return "wand"
+end
+
 local function vaultReflex(hrp, hum, wantDown)
     local S = RENV.shared
     local now = time()
     local pos = hrp.Position
+    -- WAHRHEIT FUER JEDEN VAULT (egal wer gedrueckt hat): VaultDebounce
+    -- aendert sich nur in Vault.Activate.
+    local deb = AP.pk and rawget(AP.pk, "VaultDebounce")
+    local vaultedNow = deb and AP.lastDeb and deb ~= AP.lastDeb
+    AP.lastDeb = deb
+    if vaultedNow then
+        local st = diagStat("vault_echt_" .. tostring(AP.mode or "-"))
+        st.n = st.n + 1
+        if AP.vp then AP.vp.echt = true end
+        if AP.spamZone then AP.spamHit = true end
+    end
+    -- GEPLANTE VAULTS VERFOLGEN: jeder Vault-Wegpunkt bekommt ein Ergebnis
+    do
+        local wps, idx = PATH.wps, PATH.idx
+        local wp = AP.usingPath and wps and idx and wps[idx]
+        local cur = (wp and wp.kind == "vault") and wp or nil
+        if AP.vp and AP.vp.wp ~= cur then
+            local r = AP.vp.echt and "echt" or (AP.vp.taps > 0 and "leer" or "kein_tap")
+            diagEvent("vault_plan", r, tostring(AP.vp.taps),
+                      ("%.1f"):format(now - AP.vp.t), tostring(AP.mode or "-"),
+                      tostring(PATH.endWhy or "weiter"))
+            local st = diagStat("vault_plan_" .. r)
+            st.n = st.n + 1
+            AP.vp = nil
+        end
+        if cur and not AP.vp then AP.vp = { wp = cur, taps = 0, t = now } end
+    end
+    -- SPAM-MODUS
+    if not wantDown then
+        local zone = vaultSpamZone(hrp, hum, pos)
+        if zone ~= AP.spamZone then
+            if AP.spamZone then
+                diagEvent("spam_ende", AP.spamZone, AP.spamHit and "echt" or "nichts",
+                          tostring(AP.spamTaps or 0), tostring(AP.mode or "-"))
+                local st = diagStat("spam_" .. AP.spamZone .. "_" .. (AP.spamHit and "echt" or "nichts"))
+                st.n = st.n + 1
+            end
+            AP.spamZone, AP.spamHit, AP.spamTaps = zone, false, 0
+        end
+        if zone then
+            if hum:GetAttribute("HasJumped") then
+                S.jumpMobileTap = 0                 -- loslassen
+            else
+                S.jumpMobileTap = now + 0.12        -- druecken
+                AP.spamTaps = (AP.spamTaps or 0) + 1
+                if AP.vp then AP.vp.taps = AP.vp.taps + 1 end
+            end
+            return
+        end
+    end
     -- Ergebnis des letzten Reflex-Griffs festhalten
     if AP.vrY and now - AP.vrFired > 0.5 then
         local gained = pos.Y - AP.vrY
@@ -4564,6 +4647,7 @@ local function vaultReflex(hrp, hum, wantDown)
         return
     end
     S.jumpMobileTap = now + 0.12
+    if AP.vp then AP.vp.taps = AP.vp.taps + 1 end
     if AP.pk then AP.vrTapAt, AP.vrDeb0 = now, rawget(AP.pk, "VaultDebounce") end
     -- NACH DEM GRIFF GERADEAUS: gemessen fielen fast alle Momentum-Resets
     -- in die Luftphase direkt nach dem Vault (Momentum 7.7 -> 0, Seitspeed
