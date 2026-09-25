@@ -4024,13 +4024,10 @@ local function followPath(pos, mode)
             diagEvent("vault", ("%.1f"):format(d), ("%.0f"):format(up),
                       tostring(AP.vaultChain or 0),
                       chain and "Kettenglied" or "Absprung")
-        elseif airborne and up > -1 then
-            -- jeden Frame, ohne Sperre: das Fenster darf nie zugehen
-            AP.vaultGrab = tick()
-            tryJump(true)
         end
-        -- auch im Anlauf schon halten, sobald die Kante nah ist
-        if not airborne and d < 9 and up > 1 then tryJump(true) end
+        -- In der Luft wird NICHT gehalten: Halten verhindert den Griff (das
+        -- Spiel prueft nur beim Druecken). Den Griff setzt der Vault-Reflex
+        -- im passenden Frame mit einem frischen Tap.
         -- ERGEBNIS FESTHALTEN: hat der Griff gesessen? Gemessen wird die
         -- Hoehe zum Zeitpunkt des Absprungs gegen die jetzige. Damit laesst
         -- sich zaehlen, wie viele Vaults beim ersten Versuch sitzen.
@@ -4330,6 +4327,85 @@ local function refreshRaycastFilter()
     end
     AP.rp.FilterDescendantsInstances = ignore
 end
+
+------------------------------------------------------------------
+-- VAULT-REFLEX
+-- Gemessen: von 109 geplanten Vaults sassen 3. Der Spielcode (Parkour ->
+-- Vault.Probe) erklaert warum:
+--  * Der Griff wird NUR beim DRUECKEN der Sprungtaste geprueft (Flanke:
+--    Attribut HasJumped false -> true). Wer die Taste haelt, bekommt in der
+--    Luft nie einen zweiten Griff. Genau das tat der Bot: Dauer-Halten.
+--  * Die Kante muss zwischen Huefte -0.6 und +2.75 liegen, 0.5 bis 2 Studs
+--    vor der Blickrichtung, und auf Brusthoehe (+1.25) muss frei sein.
+-- Der Reflex rechnet diese Pruefung jeden Frame 1:1 nach und loest genau im
+-- passenden Frame einen FRISCHEN Tap aus (notfalls erst einen Frame
+-- loslassen). Das gilt ueberall, nicht nur auf geplanten Vault-Kanten:
+-- jede greifbare Kante bringt Hoehe UND Momentum (+3 x VaultMomentumMult).
+------------------------------------------------------------------
+local VR_BOX_OFF  = CFrame.new(0, 1.125, -1.25)
+local VR_BOX_SIZE = Vector3.new(1, 3.5, 1.7)
+local vrOverlap = OverlapParams.new()
+vrOverlap.MaxParts = 1
+pcall(function() vrOverlap.CollisionGroup = "Player" end)
+
+local function vaultProbe(hrp)
+    local cf = hrp.CFrame
+    local pos, look, upv = cf.Position, cf.LookVector, cf.UpVector
+    vrOverlap.FilterDescendantsInstances = AP.rp.FilterDescendantsInstances
+    if #workspace:GetPartBoundsInBox(cf * VR_BOX_OFF, VR_BOX_SIZE, vrOverlap) == 0 then
+        return nil
+    end
+    local hit
+    for i = 0.5, 2, 0.25 do
+        hit = workspace:Raycast(pos + look * i + upv * 2.75, -upv * 3.25, AP.rp)
+        if hit then break end
+    end
+    if not hit then return nil end
+    if workspace:Raycast(pos + Vector3.new(0, 1.25, 0) - look * 2.5, look * 3, AP.rp) then
+        return nil
+    end
+    if hit.Instance:GetAttribute("NoClimb") then return nil end
+    local mm = RENV.shared.multipliers
+    if mm and mm.FixVaultLadders
+       and workspace:Raycast(pos + Vector3.new(0, 2.5, 0) - look * 1.25, look * 4, AP.rp) then
+        return nil
+    end
+    return hit
+end
+
+-- wantDown: der Weg will gerade bewusst nach unten -> nicht hochziehen
+local function vaultReflex(hrp, hum, wantDown)
+    local S = RENV.shared
+    local now = time()
+    local pos = hrp.Position
+    -- Ergebnis des letzten Reflex-Griffs festhalten
+    if AP.vrY and now - AP.vrFired > 0.5 then
+        local gained = pos.Y - AP.vrY
+        local ok = gained > 1.5
+        diagEvent("vreflex_ende", ("%.1f"):format(gained), ("%.1f"):format(AP.vrH or 0),
+                  ok and "oben" or "nichts", AP.vrAir and "luft" or "boden")
+        local st = diagStat(ok and "vreflex_ok" or "vreflex_fehl")
+        st.n = st.n + 1
+        AP.vrY = nil
+    end
+    if wantDown then return end
+    if now - (AP.vrFired or 0) < 0.15 then return end   -- Spiel-Sperre 0.1 s
+    local hit = vaultProbe(hrp)
+    if not hit then return end
+    if hum:GetAttribute("HasJumped") then
+        -- Taste liegt noch an: einen Frame loslassen, naechster Frame drueckt
+        S.jumpMobileTap = 0
+        return
+    end
+    S.jumpMobileTap = now + 0.12
+    AP.vrFired, AP.vrY = now, pos.Y
+    AP.vrH = hit.Position.Y - pos.Y
+    AP.vrAir = hum.FloorMaterial == Enum.Material.Air
+    AP.vaultAt = tick()
+    diagEvent("vreflex", ("%.1f"):format(AP.vrH), AP.vrAir and "luft" or "boden",
+              tostring(AP.mode or "-"), "")
+end
+ENV.vaultProbe = vaultProbe
 
 -- Strahl auf einer Hoehe: 0 = sofort Wand, 1 = freie Bahn
 local PROBE = 11
@@ -6697,6 +6773,13 @@ local function autopilotStep(threat, threatD, prey, preyD)
     if mode == "JAGD" and prey then
         local pr = hrpOf(prey)
         targetPos = pr and pr.Position
+    elseif mode == "FLUCHT" and AP.escNode and AP.escNode.Y - pos.Y > 6 then
+        -- BEIM WEGLAUFEN IST HOEHE DIE HAUPTRICHTUNG. Liegt das Fluchtziel
+        -- deutlich hoeher, bekommt der Kletter-Assistent (Leiter, Vault,
+        -- Wandanlauf) es als Ziel. Bisher war er nur fuer die Jagd aktiv —
+        -- auf der Flucht lief der Bot deshalb nie eine Leiter oder Kante an,
+        -- sondern immer nur ebenerdig vom Faenger weg.
+        targetPos = AP.escNode
     end
     local wantUp = targetPos and (targetPos.Y - pos.Y > 6)
                    or (mode == "FLUCHT" and (AP.stuckRun or 0) >= 1)
@@ -6963,10 +7046,17 @@ local function autopilotStep(threat, threatD, prey, preyD)
         local onRoute = PATH.wps and PATH.target and AP.escNode
             and (PATH.target - AP.escNode).Magnitude < 5
             and (PATH.idx or 1) < #PATH.wps * 0.7
+        -- "Erreicht" heisst dort OBEN angekommen, nicht darunter: ein Dach
+        -- direkt ueber dem Bot galt bisher sofort als erledigt, weil nur der
+        -- waagerechte Abstand zaehlte, und wurde im selben Frame verworfen.
+        local reachedEsc = AP.escNode
+            and ((AP.escNode - pos) * Vector3.new(1, 0, 1)).Magnitude < 18
+            and math.abs(AP.escNode.Y - pos.Y) < 5
         local needNew = not AP.escNode
             or (held > 6.0 and not onRoute)
-            or ((AP.escNode - pos) * Vector3.new(1, 0, 1)).Magnitude < 18
-        if needNew and not closeDanger and not preyTarget then
+            or reachedEsc
+        -- auch bei nahem Faenger: gerade dann ist ein hoher Punkt die Rettung
+        if needNew and not preyTarget then
             -- Zuerst den Graphen fragen: er kennt Hoehe und Auswege und
             -- schickt den Bot nach oben statt in die naechste Ecke.
             local node = pickEscapeGraph(pos, state.threats or {})
@@ -6988,10 +7078,14 @@ local function autopilotStep(threat, threatD, prey, preyD)
         -- Ziel nur aufgeben, wenn ein Jaeger DEUTLICH besser steht, und
         -- auch dann erst nach einer kurzen Mindestlaufzeit. Sonst entsteht
         -- genau das Flattern, das den Bot hin und her laufen laesst.
+        -- Mit Hoehe gerechnet (threatGap): ein Faenger, der UNTER dem Dach
+        -- steht, ist dem Ziel waagerecht nah, braucht aber den ganzen Umweg
+        -- nach oben. Bisher galt genau das als "Ziel verloren".
         if AP.escNode and held > 1.2 then
-            local dMe = ((AP.escNode - pos) * Vector3.new(1, 0, 1)).Magnitude
+            local dMe = threatGap(AP.escNode, pos)
             for _, t in ipairs(state.threats or {}) do
-                if ((AP.escNode - t.pos) * Vector3.new(1, 0, 1)).Magnitude < dMe * 0.55 then
+                if AP.escNode.Y - t.pos.Y < 6
+                   and threatGap(AP.escNode, t.pos) < dMe * 0.55 then
                     AP.escNode, AP.escAt = nil, nil
                     break
                 end
@@ -6999,9 +7093,13 @@ local function autopilotStep(threat, threatD, prey, preyD)
         end
         if preyTarget and not closeDanger then
             -- schon oben gesetzt
-        elseif AP.escNode and not closeDanger then
+        elseif AP.escNode and (not closeDanger
+               or AP.escNode.Y - pos.Y > 6) then
+            -- Bei nahem Faenger galt bisher nur noch "weg von ihm",
+            -- waagerecht. Liegt das Ziel aber hoeher, ist genau der Weg
+            -- nach oben die beste Flucht — er kann nicht einfach folgen.
             wantPath, pathTarget = true, AP.escNode
-            AP.routeTo = "Kartenpunkt"
+            AP.routeTo = (AP.escNode.Y - pos.Y > 6) and "nach oben" or "Kartenpunkt"
         elseif (AP.stuckRun or 0) >= 1 then
             local c = select(1, mapCenterRadius())
             local esc = goal
@@ -7825,6 +7923,21 @@ local function assistStep(dt)
     -- Schritt jeden Frame ab, RotateInMoveDirection blieb aus, und der
     -- Charakter richtete sich wieder nach der Kamera aus.
     local okAP, errAP = pcall(autopilotStep, threat, threatD, prey, preyD)
+    -- Vault-Reflex NACH dem Autopiloten: sein Loslassen/Druecken hat in
+    -- diesem Frame das letzte Wort ueber die Sprungtaste.
+    if CFG.autopilot then
+        local chV = LP.Character
+        local hrpV = chV and chV:FindFirstChild("HumanoidRootPart")
+        local humV = chV and chV:FindFirstChildOfClass("Humanoid")
+        if hrpV and humV then
+            local wpsV = PATH and PATH.wps
+            local nxV = wpsV and PATH.idx and wpsV[PATH.idx]
+            local wantDown = AP.usingPath and nxV
+                and nxV.Position.Y < hrpV.Position.Y - 4
+            local okV, errV = pcall(vaultReflex, hrpV, humV, wantDown)
+            if not okV then LOG("FEHLER vaultReflex: " .. tostring(errV)) end
+        end
+    end
     if not okAP then
         AP.stepFails = (AP.stepFails or 0) + 1
         if AP.stepFails % 120 == 1 then
