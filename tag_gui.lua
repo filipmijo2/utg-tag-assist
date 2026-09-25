@@ -4349,6 +4349,10 @@ vrOverlap.MaxParts = 1
 pcall(function() vrOverlap.CollisionGroup = "Player" end)
 
 local function vaultProbe(hrp)
+    -- exakt die RaycastParams des Spiels (Parkour-Zustand .Params), sonst
+    -- weicht unser Nachrechnen ab: gemessen 466 Taps, kaum Momentum
+    local rp = (AP.pk and typeof(rawget(AP.pk, "Params")) == "RaycastParams")
+        and AP.pk.Params or AP.rp
     local cf = hrp.CFrame
     local pos, look, upv = cf.Position, cf.LookVector, cf.UpVector
     vrOverlap.FilterDescendantsInstances = AP.rp.FilterDescendantsInstances
@@ -4357,17 +4361,17 @@ local function vaultProbe(hrp)
     end
     local hit
     for i = 0.5, 2, 0.25 do
-        hit = workspace:Raycast(pos + look * i + upv * 2.75, -upv * 3.25, AP.rp)
+        hit = workspace:Raycast(pos + look * i + upv * 2.75, -upv * 3.25, rp)
         if hit then break end
     end
     if not hit then return nil end
-    if workspace:Raycast(pos + Vector3.new(0, 1.25, 0) - look * 2.5, look * 3, AP.rp) then
+    if workspace:Raycast(pos + Vector3.new(0, 1.25, 0) - look * 2.5, look * 3, rp) then
         return nil
     end
     if hit.Instance:GetAttribute("NoClimb") then return nil end
     local mm = RENV.shared.multipliers
     if mm and mm.FixVaultLadders
-       and workspace:Raycast(pos + Vector3.new(0, 2.5, 0) - look * 1.25, look * 4, AP.rp) then
+       and workspace:Raycast(pos + Vector3.new(0, 2.5, 0) - look * 1.25, look * 4, rp) then
         return nil
     end
     return hit
@@ -4388,8 +4392,25 @@ local function vaultReflex(hrp, hum, wantDown)
         st.n = st.n + 1
         AP.vrY = nil
     end
+    -- WAHRHEIT: hat das Spiel wirklich gevaultet? Vault.Activate setzt
+    -- VaultDebounce neu. Aendert es sich nach dem Tap, war es ein echter Griff.
+    if AP.vrTapAt and AP.pk then
+        local deb = rawget(AP.pk, "VaultDebounce")
+        if deb ~= AP.vrDeb0 then
+            diagStat("vtap_echt").n = diagStat("vtap_echt").n + 1
+            diagEvent("vtap", "echt", ("%.1f"):format(AP.vrH or 0), AP.vrAir and "luft" or "boden", "")
+            AP.vrTapAt, AP.vrLeer = nil, 0
+        elseif now - AP.vrTapAt > 0.2 then
+            diagStat("vtap_leer").n = diagStat("vtap_leer").n + 1
+            diagEvent("vtap", "leer", ("%.1f"):format(AP.vrH or 0), AP.vrAir and "luft" or "boden", "")
+            AP.vrTapAt = nil
+            AP.vrLeer = (AP.vrLeer or 0) + 1
+        end
+    end
     if wantDown then return end
     if now - (AP.vrFired or 0) < 0.15 then return end   -- Spiel-Sperre 0.1 s
+    -- zwei leere Taps hintereinander: kurz Ruhe, nicht dauernd nachtippen
+    if (AP.vrLeer or 0) >= 2 and now - (AP.vrFired or 0) < 0.6 then return end
     local hit = vaultProbe(hrp)
     if not hit then return end
     if hum:GetAttribute("HasJumped") then
@@ -4398,6 +4419,16 @@ local function vaultReflex(hrp, hum, wantDown)
         return
     end
     S.jumpMobileTap = now + 0.12
+    if AP.pk then AP.vrTapAt, AP.vrDeb0 = now, rawget(AP.pk, "VaultDebounce") end
+    -- NACH DEM GRIFF GERADEAUS: gemessen fielen fast alle Momentum-Resets
+    -- in die Luftphase direkt nach dem Vault (Momentum 7.7 -> 0, Seitspeed
+    -- 1-5). Die Lenkung drehte weg bzw. hing an der Kante, das Spiel nullt
+    -- dann den ganzen Bonus (Seitspeed < 6.8). Also 0.35 s stur ueber die
+    -- Kante druecken, in Blickrichtung zum Zeitpunkt des Griffs.
+    local lk = hrp.CFrame.LookVector * Vector3.new(1, 0, 1)
+    if lk.Magnitude > 0.1 then
+        AP.vaultCommitDir, AP.vaultCommitUntil = lk.Unit, now + 0.35
+    end
     AP.vrFired, AP.vrY = now, pos.Y
     AP.vrH = hit.Position.Y - pos.Y
     AP.vrAir = hum.FloorMaterial == Enum.Material.Air
@@ -4406,6 +4437,131 @@ local function vaultReflex(hrp, hum, wantDown)
               tostring(AP.mode or "-"), "")
 end
 ENV.vaultProbe = vaultProbe
+
+------------------------------------------------------------------
+-- MOMENTUM-MOTOR (Vault-Magnet)
+-- Spielcode: Tempo = WalkSpeed + Momentum x MomentumSpeed. Ein Vault gibt
+-- +3 x 2.4 x MomentumMult = ~7.8 Momentum, Ketten ohne Abzug, Deckel ~35,
+-- Verfall nur ~2.5/s. Ein Vault alle drei Sekunden haelt also dauerhaft +8
+-- Tempo, mehrere gestapelt fast das doppelte. Normale Spruenge KOSTEN 0.66.
+-- Deshalb sucht der Bot auf der Flucht aktiv greifbare Kanten im
+-- Vorwaertsfaecher und haelt darauf zu; der Vault-Reflex greift dann.
+-- Hoehe zaehlt dreifach: hohe Kanten bringen zusaetzlich Abstand nach oben.
+------------------------------------------------------------------
+local VM_ANG_FLEE = { 0, -10, 10, -20, 20, -30, 30 }
+local VM_ANG_HUNT = { 0, -10, 10 }
+
+local function vaultMagnetScan(hrp, dir, angs, threatPos, maxRel)
+    local pos = hrp.Position
+    local vel = hrp.AssemblyLinearVelocity * Vector3.new(1, 0, 1)
+    local spd = vel.Magnitude
+    local L = math.clamp(spd * 0.7, 8, 22)
+    local best, bestScore
+    local dThreat = threatPos and (pos - threatPos).Magnitude
+    for _, a in ipairs(angs) do
+        local d = CFrame.Angles(0, math.rad(a), 0) * dir
+        local hit = workspace:Raycast(pos + Vector3.new(0, -0.3, 0), d * L, AP.rp)
+        if hit and hit.Normal.Y < 0.3 and -hit.Normal:Dot(d) > 0.5
+           and not hit.Instance:GetAttribute("NoClimb") then
+            local inside = hit.Position - hit.Normal * 1.0
+            local top = workspace:Raycast(
+                Vector3.new(inside.X, pos.Y + 9, inside.Z), Vector3.new(0, -12, 0), AP.rp)
+            if top and top.Normal.Y > 0.7 then
+                local rel = top.Position.Y - pos.Y
+                if rel > -0.4 and rel < maxRel and not workspace:Raycast(
+                        top.Position + Vector3.new(0, 0.1, 0), Vector3.new(0, 5, 0), AP.rp) then
+                    local dist = ((hit.Position - pos) * Vector3.new(1, 0, 1)).Magnitude
+                    local okThreat = not threatPos
+                        or (hit.Position - threatPos).Magnitude > dThreat - 2
+                    local key = math.floor(hit.Position.X / 3) .. "," .. math.floor(hit.Position.Y / 3)
+                        .. "," .. math.floor(hit.Position.Z / 3)
+                    if AP.vmBad and AP.vmBad[key] and time() < AP.vmBad[key] then okThreat = false end
+                    if okThreat then
+                        local sc = rel * 3 - math.abs(a) * 0.15 - dist * 0.2
+                        if not bestScore or sc > bestScore then
+                            bestScore = sc
+                            best = { p = hit.Position, rel = rel, a = a, dist = dist, key = key }
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- liefert eine neue Laufrichtung (oder nil) und loest bei hohen Kanten den
+-- Absprung aus
+local function vaultMagnet(hrp, hum, dir, mode, threatPos)
+    local now = time()
+    local pos = hrp.Position
+    -- MEHR TEMPO = MEHR JUMPPOWER (~0.86 x WalkSpeed). Sprunghoehe und
+    -- Scheitelzeit also live: Hoehe = JP^2 / 2g, Scheitel nach JP / g.
+    -- Greifbar ist die Kante bis Huefte + 2.75 am Scheitel (Spielcode).
+    local g = math.max(workspace.Gravity, 1)
+    local jp = math.max(hum.JumpPower, 1)
+    local apexT = jp / g
+    local maxRel = 2.75 + 0.75 * jp * jp / (2 * g)
+    if not AP.vmScanAt or now - AP.vmScanAt > 0.1 then
+        AP.vmScanAt = now
+        local angs = (mode == "FLUCHT") and VM_ANG_FLEE or VM_ANG_HUNT
+        local b = vaultMagnetScan(hrp, dir, angs, threatPos, maxRel)
+        if b then
+            if not AP.vm or (AP.vm.p - b.p).Magnitude > 3 then
+                diagEvent("magnet", ("%.1f"):format(b.rel), tostring(b.a),
+                          ("%.0f"):format(b.dist), mode)
+                diagStat("magnet").n = diagStat("magnet").n + 1
+            end
+            b.t = now
+            AP.vm = b
+        elseif AP.vm and now - AP.vm.t > 0.3 then
+            AP.vm = nil
+        end
+    end
+    local vm = AP.vm
+    if not vm then return nil end
+    local to = (vm.p - pos) * Vector3.new(1, 0, 1)
+    -- AN DER KANTE ANGEKOMMEN, ABER KEIN GRIFF: Stelle 30 s sperren. Sonst
+    -- rennt der Bot immer wieder an dieselbe Ecke und verliert sein Tempo.
+    if to.Magnitude < 1.8 and now - (AP.vrFired or 0) > 0.5 then
+        AP.vmBad = AP.vmBad or {}
+        AP.vmBad[vm.key] = now + 30
+        diagEvent("magnet_fehl", ("%.1f"):format(vm.rel), ("%.0f"):format(to.Magnitude), mode, "")
+        diagStat("magnet_fehl").n = diagStat("magnet_fehl").n + 1
+        AP.vm = nil
+        return nil
+    end
+    if to.Magnitude < 0.8 or now - vm.t > 1.2 or now - (AP.vrFired or 0) < 0.25 then
+        return nil
+    end
+    local td = to.Unit
+    if td:Dot(dir) < math.cos(math.rad(40)) then AP.vm = nil return nil end
+    -- Hohe Kante: vom Boden aus nicht greifbar (Griff nur bis Huefte+2.75).
+    -- Absprung so, dass die Wand kurz vor dem Scheitel erreicht wird.
+    local grounded = hum.FloorMaterial ~= Enum.Material.Air
+    if grounded and vm.rel > 2.2 then
+        local spd = (hrp.AssemblyLinearVelocity * Vector3.new(1, 0, 1)).Magnitude
+        if to.Magnitude <= spd * apexT * 0.8 + 1.5 and now - (AP.vmJumpAt or 0) > 0.6 then
+            AP.vmJumpAt = now
+            RENV.shared.jumpMobileTap = now + 0.12
+        end
+    end
+    return td
+end
+
+-- MOMENTUM MESSEN: den Parkour-Zustand des Spiels finden (Tabelle mit
+-- Momentum und VaultDebounce) und den echten Wert mitschreiben.
+local function findParkourState()
+    local ok, gc = pcall(getgc, true)
+    if not ok then return nil end
+    for _, t in ipairs(gc) do
+        if type(t) == "table" and rawget(t, "VaultDebounce") ~= nil
+           and type(rawget(t, "Momentum")) == "number" then
+            return t
+        end
+    end
+end
+ENV.parkourState = function() return AP.pk end
 
 -- Strahl auf einer Hoehe: 0 = sofort Wand, 1 = freie Bahn
 local PROBE = 11
@@ -4889,6 +5045,24 @@ local function hookControlModule()
         -- fehlender Charakter, Rundenwechsel), blieb die zuletzt gesetzte
         -- Richtung im Hook stehen und der Bot lief stur immer weiter
         -- geradeaus, ohne dass sie noch jemand aktualisiert haette.
+        -- MOMENTUM SCHUETZEN: Das Spiel setzt Momentum auf 0, sobald EIN
+        -- Frame ohne Bewegungseingabe kommt. Faellt die Autopilot-Richtung
+        -- kurz weg, wird deshalb bis zu 1 s die letzte Weltrichtung weiter
+        -- gegeben statt Null.
+        if CFG.autopilot and not AP.vec and AP.lastWorld and AP.lastWorldAt
+           and tick() - AP.lastWorldAt < 1.0 and tick() > AP.manualUntil then
+            local ch = LP.Character
+            local vs = ch and ch:FindFirstChild("values")
+            local cy = vs and vs:FindFirstChild("CameraY")
+            if cy and not (typeof(v) == "Vector3" and v.Magnitude > 0.15) then
+                local r = cy.Value:VectorToObjectSpace(AP.lastWorld)
+                r = Vector3.new(r.X, 0, r.Z)
+                if r.Magnitude > 0.05 then
+                    AP.holdUsed = tick()
+                    return r.Unit
+                end
+            end
+        end
         if AP.vecAt and tick() - AP.vecAt > 0.4 then
             AP.vec, AP.vecWorld = nil, nil
         end
@@ -7412,6 +7586,25 @@ local function autopilotStep(threat, threatD, prey, preyD)
         dir = pickDirection(pos, goal, hrp.AssemblyLinearVelocity)
     end
     if not dir then AP.mode, AP.vec = nil, nil return end
+    -- MOMENTUM-MOTOR: greifbare Kanten im Vorwaertsfaecher ansteuern
+    if AP.vaultCommitUntil and time() < AP.vaultCommitUntil and AP.vaultCommitDir then
+        dir = AP.vaultCommitDir
+        AP.smoothDir = dir     -- keine Drehrate dazwischen
+    end
+    local wpM = AP.usingPath and PATH.wps and PATH.wps[PATH.idx]
+    local kM = wpM and wpM.kind
+    local specialM = kM and kM ~= "walk" and kM ~= "step" and kM ~= "vault" and kM ~= "roll"
+    local allowM = (mode == "FLUCHT" and not specialM)
+        or (mode == "JAGD" and not AP.usingPath)
+    if not climbGoal and allowM and not AP.helper and not AP.climbing then
+        local humM = char:FindFirstChildOfClass("Humanoid")
+        local thrM = threat and hrpOf(threat)
+        if humM then
+            local okM, mg = pcall(vaultMagnet, hrp, humM, dir, mode,
+                                  mode == "FLUCHT" and thrM and thrM.Position or nil)
+            if okM and mg then dir = mg end
+        end
+    end
 
     ------------------------------------------------------------------
     -- ROLLE (C): Der Roll-Baustein merkt sich den C-Druck und macht daraus
@@ -7492,6 +7685,7 @@ local function autopilotStep(threat, threatD, prey, preyD)
     -- der aktuellen Kamera um, damit Mausdrehungen den Kurs nicht verbiegen
     AP.vecWorld = dir.Unit
     AP.vecAt = tick()
+    AP.lastWorld, AP.lastWorldAt = dir.Unit, tick()
     AP.mode = mode
 
     local m = RENV.shared.multipliers
@@ -7936,6 +8130,31 @@ local function assistStep(dt)
                 and nxV.Position.Y < hrpV.Position.Y - 4
             local okV, errV = pcall(vaultReflex, hrpV, humV, wantDown)
             if not okV then LOG("FEHLER vaultReflex: " .. tostring(errV)) end
+            -- echtes Momentum mitschreiben
+            if AP.pkChar ~= chV then
+                AP.pkChar = chV
+                AP.pk = nil
+                task.delay(2, function() AP.pk = findParkourState() end)
+            end
+            if AP.pk and type(AP.pk.Momentum) == "number" and AP.mode then
+                local mNow = AP.pk.Momentum
+                diagVal("momentum_" .. AP.mode, "m", mNow)
+                -- JEDEN RESET MIT URSACHE: Seitspeed < 6.8 oder ein Frame
+                -- ohne Bewegungseingabe loescht das ganze Momentum.
+                if (AP.momPrev or 0) > 1.5 and mNow == 0 then
+                    local lat = (hrpV.AssemblyLinearVelocity * Vector3.new(1, 0, 1)).Magnitude
+                    local noVec = not AP.vec
+                    local wpR = AP.usingPath and PATH.wps and PATH.wps[PATH.idx]
+                    diagEvent("mom_reset", ("%.1f"):format(AP.momPrev), ("%.1f"):format(lat),
+                              noVec and "ohne_eingabe" or (lat < 6.8 and "langsam" or "?"),
+                              ("commit=%s luft=%s weg=%s helfer=%s"):format(
+                                  tostring(AP.vaultCommitUntil and time() < AP.vaultCommitUntil + 0.3 or false),
+                                  tostring(humV.FloorMaterial == Enum.Material.Air),
+                                  tostring(wpR and wpR.kind or "-"), tostring(AP.helper or "-")))
+                    diagStat("mom_reset").n = diagStat("mom_reset").n + 1
+                end
+                AP.momPrev = mNow
+            end
         end
     end
     if not okAP then
