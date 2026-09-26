@@ -2178,7 +2178,12 @@ do
         -- Deshalb billiger als alles andere, auch als die Zipline.
         vault = 0.15,       -- ueber eine Kante ziehen, auch aus der Luft
         jump = 0.60,        -- Sprung ueber eine Luecke
-        climb = 0.30,       -- Leiter
+        -- LEITER KOSTET DAS GANZE MOMENTUM (Spielcode LateMomentum: Seit-
+        -- speed < 6.8 -> Momentum = 0; beim Klettern ist sie ~0). Bisher
+        -- 0.30 mal Hoehenrabatt 0.30 = ~9 % eines Fusswegs — der Bot nahm
+        -- jede Leiter und stand danach ohne Tempo da. Jetzt teuer, ohne
+        -- Hoehenrabatt, plus pauschale Strafzeit (NAV.CLIMB_PENALTY).
+        climb = 0.45,       -- Leiter
         -- Wallride bewusst TEUER: er braucht eigens markierte Waende, bricht
         -- oft ab und kostet dann das ganze Tempo. Nur wenn es sonst keinen
         -- Weg gibt.
@@ -2209,6 +2214,7 @@ do
     -- Der Bonus kommt ZUSAETZLICH zum Schwung-Abschlag.
     NAV.CHAIN_BONUS = 0.5
 
+    NAV.CLIMB_PENALTY = 0        -- (Nutzer: mit schnellem Anlauf bleibt das Momentum)
     NAV.RISE_PER_STUD = 0.10     -- je Stud Hoehe zehn Prozent billiger
     NAV.RISE_FLOOR    = 0.30     -- hoechstens auf ein Drittel herunter
     NAV.RISE_DISCOUNT = 0.62     -- Grundabschlag fuer jede steigende Kante
@@ -2271,12 +2277,13 @@ do
                     local tn = nodes[e.to]
                     if tn then
                         local dy = tn.p.Y - n.p.Y
-                        if dy > 1 then
+                        if dy > 1 and e.k ~= "climb" then
                             w = w * math.max(NAV.RISE_FLOOR,
                                              NAV.RISE_DISCOUNT - NAV.RISE_PER_STUD * dy)
                         end
                     end
                     local ng = dist[cur] + e.c * w * boost
+                        + (e.k == "climb" and NAV.CLIMB_PENALTY or 0)
                     if not dist[e.to] or ng < dist[e.to] then
                         dist[e.to] = ng
                         fromK[e.to] = e.k
@@ -2382,12 +2389,13 @@ do
                     local tn = nodes[e.to]
                     if tn then
                         local dy = tn.p.Y - n.p.Y
-                        if dy > 1 then
+                        if dy > 1 and e.k ~= "climb" then
                             w = w * math.max(NAV.RISE_FLOOR,
                                              NAV.RISE_DISCOUNT - NAV.RISE_PER_STUD * dy)
                         end
                     end
                     local ng = gScore[cur] + e.c * w * boost
+                        + (e.k == "climb" and NAV.CLIMB_PENALTY or 0)
                     if not gScore[e.to] or ng < gScore[e.to] then
                         gScore[e.to] = ng
                         came[e.to] = { from = cur, k = e.k, via = e.via }
@@ -2887,7 +2895,13 @@ local function failTick(pos, hum, goalActive)
         WATCH.hops = (WATCH.hops or 0) + 1
     end
     WATCH.wasAir = hum and hum.FloorMaterial == Enum.Material.Air
-    if goalActive and now - WATCH.movedAt > 1.5 then
+    -- Tot/ausgeschieden (Rolle "Dead") oder ausserhalb einer Runde zaehlt
+    -- nicht: gemessen waren 63 "Jagd-Haenger" in Wahrheit ein toter,
+    -- eingefrorener Charakter.
+    local rNow = myRole()
+    local liveR = rNow and rNow ~= "Dead" and inLiveRound()
+    if not liveR then WATCH.movedAt = now end
+    if liveR and goalActive and now - WATCH.movedAt > 1.5 then
         local wp = wps and idx and wps[idx]
         local ap = ENV.ap
         local look = (ap and ap.vecWorld) or Vector3.new(0, 0, 0)
@@ -3363,8 +3377,10 @@ local function diagCloseLadder()
     if not l or not DIAG.on then return end
     local kind = (l.climbing or (l.gain or 0) > 3) and "leiter_ok" or "leiter_daneben"
     diagEvent("leiter", kind, ("%.1f"):format(l.min), ("%.0f"):format(l.spdMin or 0),
-              ("touch=%s hoehe=%.0f dauer=%.1f"):format(tostring(l.touched),
-                                                        l.gain or 0, tick() - l.t0))
+              ("touch=%s hoehe=%.0f dauer=%.1f mom_vorher=%.1f mom_griff=%s mom_ende=%.1f"):format(
+                  tostring(l.touched), l.gain or 0, tick() - l.t0, l.mom0 or -1,
+                  l.momGrab and ("%.1f"):format(l.momGrab) or "-",
+                  (AP.pk and type(AP.pk.Momentum) == "number") and AP.pk.Momentum or -1))
     diagVal(kind, "min", l.min)
     diagVal(kind, "spd", l.spdMin or 0)
     diagLine(kind,
@@ -3517,6 +3533,7 @@ local function diagTick(pos, wps, idx, wp)
             diagCloseLadder()
             l = { part = lad, t0 = tick(), y0 = pos.Y, min = 1e9, spdMin = 0,
                   touched = false, climbing = false, gain = 0,
+                  mom0 = (AP.pk and type(AP.pk.Momentum) == "number") and AP.pk.Momentum or -1,
                   loose = AP.pathLoose and true or false }
             DIAG.lad = l
         end
@@ -3526,6 +3543,9 @@ local function diagTick(pos, wps, idx, wp)
             if RENV.shared.touchingTruss then l.touched = true end
             local humD = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
             if humD and humD:GetState() == Enum.HumanoidStateType.Climbing then
+                if not l.climbing and AP.pk and type(AP.pk.Momentum) == "number" then
+                    l.momGrab = AP.pk.Momentum
+                end
                 l.climbing = true
             end
             l.gain = pos.Y - l.y0
@@ -3549,6 +3569,157 @@ end
 -- liefert die Richtung zum naechsten Wegpunkt (oder nil, wenn kein Pfad taugt).
 -- "mode" entscheidet ueber die Strenge: beim Weglaufen ist der Weg nur eine
 -- Richtung, beim Jagen ein Ziel.
+------------------------------------------------------------------
+-- TEMPO-RUNDKURS ("Looping")
+-- Recherche: Looping um ein Hindernis mit blockierter Mitte ist die
+-- Standard-Flucht in Verfolgungsspielen (DbD, Forsaken). Geprueft gegen
+-- unseren Spielcode: Vaults haben keine Anti-Loop-Sperre (Cooldown 0.04,
+-- StackingMult 1), jeder Griff gibt +7.8 Momentum, Verfall ~2.5/s. Ein
+-- Kurs mit einem Vault alle ~2.5 s haelt das Momentum hoch — der Bot wird
+-- auf der Runde schneller als jeder Verfolger ohne Kurs.
+-- Die Kurse rechnet tools/circuits.py OFFLINE aus dem gespeicherten Graphen
+-- (utg_circ_<Map>.json); im Spiel wird nur geladen und abgefahren.
+------------------------------------------------------------------
+local CIRC = { map = nil, list = nil, ban = {} }
+
+function CIRC.load()
+    local m = evMap()
+    if CIRC.map == m then return CIRC.list end
+    CIRC.map, CIRC.list, CIRC.ban = m, nil, {}
+    local ok, raw = pcall(readfile, "utg_circ_" .. m .. ".json")
+    if not (ok and type(raw) == "string" and #raw > 10) then return nil end
+    local ok2, d = pcall(function()
+        return game:GetService("HttpService"):JSONDecode(raw)
+    end)
+    if not (ok2 and type(d) == "table" and d.circuits) then return nil end
+    CIRC.list = {}
+    for i, c in ipairs(d.circuits) do
+        local pts = {}
+        for _, q in ipairs(c.pts or {}) do
+            pts[#pts + 1] = { p = Vector3.new(q[1], q[2], q[3]), k = q[4] }
+        end
+        if #pts >= 4 then
+            CIRC.list[#CIRC.list + 1] = { id = i, pts = pts, n = c.n or 1, t = c.t or 10 }
+        end
+    end
+    LOG(("Rundkurse fuer %s geladen: %d"):format(m, #CIRC.list))
+    return CIRC.list
+end
+
+-- Wegpunkte fuer 'laps' Runden ab Index k (wie computeGraph sie baut)
+function CIRC.wps(c, k, laps)
+    local wps, n = {}, #c.pts
+    for i = 0, n * laps - 1 do
+        local q = c.pts[((k - 1 + i) % n) + 1]
+        wps[#wps + 1] = { Position = q.p, Action = Enum.PathWaypointAction.Walk, kind = q.k }
+    end
+    for i = 2, #wps do
+        local kk = wps[i].kind
+        if kk == "jump" or kk == "hop" then
+            local t = wps[i - 1]
+            t.Action = Enum.PathWaypointAction.Jump
+            t.takeoff, t.jumpTo, t.jumpKind = true, wps[i].Position, kk
+        end
+    end
+    return wps
+end
+
+function CIRC.nearest(c, pos)
+    -- Kurspunkte liegen auf Boden +0.5, pos ist die Huefte (Boden +3):
+    -- auf Fusshoehe vergleichen, sonst ist der Abstand mit dreifacher
+    -- Hoehe nie unter 7.5 und der Einstieg (< 6) nie erreichbar
+    -- (gemessen: 627 Anfahrt-Frames, 0 Einstiege)
+    local foot = pos - Vector3.new(0, 2.5, 0)
+    local bi, bd
+    for i, q in ipairs(c.pts) do
+        local d = q.p - foot
+        local dw = math.sqrt(d.X * d.X + d.Z * d.Z + (3 * d.Y) ^ 2)
+        if not bd or dw < bd then bi, bd = i, dw end
+    end
+    return bi, bd
+end
+
+-- steht ein Verfolger naeher an den naechsten Kurspunkten als ich?
+function CIRC.threatAhead(c, k, pos, threats)
+    local n = #c.pts
+    for i = 0, 10 do
+        local q = c.pts[((k - 1 + i) % n) + 1].p
+        local dMe = (q - pos).Magnitude
+        if dMe < 45 then
+            for _, t in ipairs(threats or {}) do
+                if (t.pos - q).Magnitude < dMe * 0.8 then return true end
+            end
+        end
+    end
+    return false
+end
+
+-- liefert "fahren", ("anfahrt", Einstiegspunkt) oder nil
+function CIRC.step(pos, threats)
+    local list = CIRC.load()
+    if not list or #list == 0 then AP.circ = nil return nil end
+    local now = tick()
+    local c = AP.circ
+    if c then
+        local k, d = CIRC.nearest(c, pos)
+        local why
+        if CIRC.threatAhead(c, k, pos, threats) then why = "verfolger_vorn"
+        elseif d > 14 then why = "abgekommen" end
+        if why then
+            CIRC.ban[c.id] = now + 15
+            diagEvent("rundkurs_ab", tostring(c.id), why,
+                      ("%.1f"):format(now - (AP.circAt or now)), "")
+            AP.circ = nil
+            if PATH.wps == AP.circWps then PATH.wps = nil end
+            return nil
+        end
+        if PATH.wps ~= AP.circWps or (PATH.idx or 1) > #AP.circWps - #c.pts then
+            AP.circWps = CIRC.wps(c, (k % #c.pts) + 1, 3)
+            PATH.wps, PATH.idx, PATH.target, PATH.fails = AP.circWps, 1,
+                AP.circWps[#AP.circWps].Position, 0
+            PATH.from = pos
+            AP.circLaps = (AP.circLaps or 0) + 1
+        end
+        PATH.at = now                 -- Weg am Leben halten
+        return "fahren"
+    end
+    local best, bestS, bestK, bestD
+    for _, cc in ipairs(list) do
+        if not (CIRC.ban[cc.id] and now < CIRC.ban[cc.id]) then
+            local k, d = CIRC.nearest(cc, pos)
+            if d < 60 and not CIRC.threatAhead(cc, k, pos, threats) then
+                local sc = cc.n / cc.t * 10 - d / 20
+                if not bestS or sc > bestS then best, bestS, bestK, bestD = cc, sc, k, d end
+            end
+        end
+    end
+    if not best then return nil end
+    if bestD < 6 then
+        AP.circ, AP.circAt, AP.circLaps = best, now, 0
+        AP.circWps = CIRC.wps(best, bestK, 3)
+        PATH.wps, PATH.idx, PATH.target, PATH.fails = AP.circWps, 1,
+            AP.circWps[#AP.circWps].Position, 0
+        PATH.at, PATH.from = now, pos
+        diagEvent("rundkurs_an", tostring(best.id), tostring(best.n),
+                  ("%.1f"):format(best.t), "")
+        diagStat("rundkurs_an").n = diagStat("rundkurs_an").n + 1
+        return "fahren"
+    end
+    if now - (AP.circLogAt or 0) > 1 then
+        AP.circLogAt = now
+        local pt = PATH.target
+        diagEvent("rundkurs_anfahrt", tostring(best.id), ("%.1f"):format(bestD),
+                  tostring(AP.usingPath),
+                  ("wegziel_abstand=%s weg=%s"):format(
+                      pt and ("%.1f"):format((pt - best.pts[bestK].p).Magnitude) or "-",
+                      PATH.wps and #PATH.wps or 0))
+    end
+    local sa = diagStat("rundkurs_anfahrt")
+    sa.n = sa.n + 1
+    sa.d_sum, sa.d_n = (sa.d_sum or 0) + bestD, (sa.d_n or 0) + 1
+    return "anfahrt", best.pts[bestK].p
+end
+
 local function followPath(pos, mode)
     local wps = PATH.wps
     if not wps then
@@ -3997,7 +4168,7 @@ local function followPath(pos, mode)
             end
         end
         if best then
-            AP.ladder = best
+            AP.ladder, AP.ladderSeek = best, tick()
             -- NOTFALL: klebt er laenger als eine Sekunde davor, ohne dass das
             -- Spiel den Truss erkennt, taugt der gewaehlte Anlaufpunkt nicht.
             -- Dann den Anlaufpunkt ignorieren und stur auf die Leitermitte
@@ -4309,10 +4480,13 @@ local function followPath(pos, mode)
     end
     -- Der Weg darf jetzt ueber Leitern fuehren. Ein Wegpunkt deutlich ueber uns
     -- in Leiternaehe heisst: dranhalten und klettern, nicht danebenlaufen.
-    if wp.Position.Y - pos.Y > 3 and tick() >= (AP.noClimbUntil or 0) then
+    -- NUR bei echten Leiter-Wegpunkten: sonst lenkte jeder hoehere Punkt
+    -- (Stufe, Vault) neben einer Leiter den Bot auf die Leiter — und die
+    -- Leiter kostet das ganze Momentum.
+    if wp.kind == "climb" and wp.Position.Y - pos.Y > 3 and tick() >= (AP.noClimbUntil or 0) then
         for _, l in ipairs(ladders()) do
             if l.Parent and (l.Position - wp.Position).Magnitude < 8 then
-                AP.ladder = l
+                AP.ladder, AP.ladderSeek = l, tick()
                 local v = (l.Position - pos) * Vector3.new(1, 0, 1)
                 if v.Magnitude > 0.1 and v.Magnitude < 14 then
                     return v.Unit
@@ -7346,10 +7520,15 @@ local function autopilotStep(threat, threatD, prey, preyD)
             end
         end
         if best then
-            AP.ladder = best
+            AP.ladder, AP.ladderSeek = best, tick()
             local v = (best.Position - pos) * Vector3.new(1, 0, 1)
             if v.Magnitude > 0.1 then climbGoal = v.Unit end
         end
+    end
+    -- gemerkte Leiter verfaellt, wenn sie nicht aktiv angesteuert wird
+    -- (sonst bremste die Leiterbremse bei jedem Vorbeilaufen auf 42 %)
+    if AP.ladder and not AP.climbing and tick() - (AP.ladderSeek or 0) > 1.0 then
+        AP.ladder = nil
     end
 
     if climbGoal then goal = climbGoal end
@@ -7467,6 +7646,13 @@ local function autopilotStep(threat, threatD, prey, preyD)
     -- Finten waeren fuer den Rest der Runde aus.
     rawset(CFG, "__chasing", false)
     local wantPath = false
+    AP.circDrive, AP.circEntry = false, nil
+    if mode ~= "FLUCHT" and AP.circ then
+        diagEvent("rundkurs_ab", tostring(AP.circ.id), "modus_" .. tostring(mode),
+                  ("%.1f"):format(tick() - (AP.circAt or tick())), "")
+        if PATH.wps == AP.circWps then PATH.wps = nil end
+        AP.circ = nil
+    end
     local pathTarget = nil
     if mode == "JAGD" and prey and preyD then
         -- Beim aktiven Verfolgen zaehlt Tempo: erst mal schnurgerade drauf zu.
@@ -7543,6 +7729,19 @@ local function autopilotStep(threat, threatD, prey, preyD)
         else
             AP.chasePoint = nil
             rawset(CFG, "__chasing", false)
+        end
+        -- TEMPO-RUNDKURS: hat Vorrang vor dem Fluchtziel
+        -- Rundkurse vorerst AUS: im Test wechselte er staendig den Kurs, lief
+        -- Wege weit weg vom Einstieg und brach nach 0.2-0.5 s wieder ab.
+        if CFG.circuits and not preyTarget then
+            local okC, cm, ce = pcall(CIRC.step, pos, state.threats)
+            if okC and cm == "fahren" then
+                AP.circDrive = true
+            elseif okC and cm == "anfahrt" then
+                AP.circEntry = ce
+            elseif not okC then
+                LOG("FEHLER circuitStep: " .. tostring(cm))
+            end
         end
 
         -- Das Fluchtziel bekommt eine Haltefrist. Vorher wurde alle 2.5 s
@@ -7627,6 +7826,13 @@ local function autopilotStep(threat, threatD, prey, preyD)
         end
     end
 
+    if AP.circDrive then
+        wantPath = false               -- Weg setzt der Rundkurs selbst
+        AP.routeTo = "Rundkurs"
+    elseif AP.circEntry then
+        wantPath, pathTarget = true, AP.circEntry
+        AP.routeTo = "zum Rundkurs"
+    end
     if climbGoal then wantPath = false end
     if mode == "STREIFEN" and AP.roamNode then
         local dRoam = ((AP.roamNode - pos) * Vector3.new(1, 0, 1)).Magnitude
@@ -7679,7 +7885,10 @@ local function autopilotStep(threat, threatD, prey, preyD)
         -- spaet, sonst frueh.
         local farEnough = (mode == "FLUCHT") and 150 or 70
         local nearEnough = (mode == "FLUCHT") and 110 or 45
-        if climbNeed then
+        -- Anfahrt zum Rundkurs immer per Graphweg: die Direktsteuerung der
+        -- Flucht ("weg vom Verfolger") fuehrte nie zum Einstieg (0 Einstiege
+        -- in 4 min bei 4 geladenen Kursen)
+        if climbNeed or AP.circEntry then
             AP.longRange = true
         elseif toGoal > farEnough then
             AP.longRange = true
@@ -8398,18 +8607,16 @@ local function assistStep(dt)
             elseif k == "climb" then
                 -- Leitern besonders frueh und deutlich: ab 16 Studs
                 -- herunterregeln, im Greifbereich auf gut ein Drittel.
-                local d = ((pw.Position - posS) * Vector3.new(1, 0, 1)).Magnitude
-                if d < 16 then
-                    wantSpeed = math.min(wantSpeed, math.clamp(d / 16, closeFlee and 0.75 or 0.36, 1))
-                    wantAccel = math.min(wantAccel, 1.1)
-                end
+                -- KEINE BREMSE MEHR vor Leitern (Nutzer: wer schnell anlaeuft
+                -- und das Tempo nicht verliert, behaelt das Momentum auf der
+                -- Leiter; die Bremse auf 36 % hat es vorher vernichtet)
             elseif AP.ladder and AP.ladder.Parent
+                   and tick() - (AP.ladderSeek or 0) < 0.3
                    and ((AP.ladder.Position - posS) * Vector3.new(1, 0, 1)).Magnitude < 12 then
                 -- Leiter angesteuert, ohne dass der Wegpunkt selbst vom Typ
                 -- climb ist: zwei der drei gemessenen Fehlversuche liefen
                 -- genau so, mit 27 bis 37 Studs/s ungebremst vorbei.
-                wantSpeed = math.min(wantSpeed, closeFlee and 0.75 or 0.42)
-                wantAccel = math.min(wantAccel, 1.1)
+                -- (Bremse entfernt, siehe oben)
             elseif (k == "zip" or k == "pad" or k == "via") and not closeFlee then
                 -- Milder als frueher (Untergrenze 0.45 -> 0.7) und erst ab
                 -- zehn statt vierzehn Studs: jedes Abbremsen kostet das
@@ -8574,7 +8781,9 @@ local function assistStep(dt)
                     local wpR = AP.usingPath and PATH.wps and PATH.wps[PATH.idx]
                     diagEvent("mom_reset", ("%.1f"):format(AP.momPrev), ("%.1f"):format(lat),
                               noVec and "ohne_eingabe" or (lat < 6.8 and "langsam" or "?"),
-                              ("commit=%s luft=%s weg=%s helfer=%s"):format(
+                              ("leiter=%s commit=%s luft=%s weg=%s helfer=%s"):format(
+                                  tostring(humV:GetState() == Enum.HumanoidStateType.Climbing
+                                      or RENV.shared.touchingTruss == true or AP.climbing == true),
                                   tostring(AP.vaultCommitUntil and time() < AP.vaultCommitUntil + 0.3 or false),
                                   tostring(humV.FloorMaterial == Enum.Material.Air),
                                   tostring(wpR and wpR.kind or "-"), tostring(AP.helper or "-")))
