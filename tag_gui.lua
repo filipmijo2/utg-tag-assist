@@ -4850,6 +4850,23 @@ local function vaultReflex(hrp, hum, wantDown)
             AP.spamKey = AP.zoneKey
             AP.spamJP, AP.spamRel, AP.spamGroundJumps = hum.JumpPower, AP.zoneRel, 0
         end
+        -- AM BODEN NICHT ZU FRUEH TIPPEN: ausserhalb des Vault-Fensters
+        -- (0.4-2.1 Studs) wird der Tap ein normaler Sprung, danach sperrt
+        -- das Spiel 0.1 s weitere Eingaben und er prallt an die Wand — der
+        -- spaete Vault behaelt dann nur noch Seitspeed ~0 und das Spiel
+        -- nullt das Momentum (gemessen: Resets fast alle "langsam, in der
+        -- Luft" direkt nach Vaults). Am Boden also erst tippen, wenn die
+        -- Spielpruefung passt oder die Wand schon sehr nah ist.
+        local groundedZ = hum.FloorMaterial ~= Enum.Material.Air
+        if zone and groundedZ and not vaultProbe(hrp) then
+            local lk = hrp.CFrame.LookVector * Vector3.new(1, 0, 1)
+            local near = lk.Magnitude > 0.1 and workspace:Raycast(
+                pos + Vector3.new(0, -0.3, 0), lk.Unit * 1.8, AP.rp)
+            if not near then
+                if hum:GetAttribute("HasJumped") then S.jumpMobileTap = 0 end
+                return
+            end
+        end
         if zone then
             if hum:GetAttribute("HasJumped") then
                 S.jumpMobileTap = 0                 -- loslassen
@@ -4880,7 +4897,8 @@ local function vaultReflex(hrp, hum, wantDown)
         local deb = rawget(AP.pk, "VaultDebounce")
         if deb ~= AP.vrDeb0 then
             diagStat("vtap_echt").n = diagStat("vtap_echt").n + 1
-            diagEvent("vtap", "echt", ("%.1f"):format(AP.vrH or 0), AP.vrAir and "luft" or "boden", "")
+            diagEvent("vtap", "echt", ("%.1f"):format(AP.vrH or 0), AP.vrAir and "luft" or "boden",
+                      ("seit=%.1f"):format(AP.vrLat or -1))
             AP.vrTapAt, AP.vrLeer = nil, 0
         elseif now - AP.vrTapAt > 0.2 then
             diagStat("vtap_leer").n = diagStat("vtap_leer").n + 1
@@ -4928,6 +4946,7 @@ local function vaultReflex(hrp, hum, wantDown)
         AP.vaultCommitDir, AP.vaultCommitUntil = lk.Unit, now + 0.35
     end
     AP.vrFired, AP.vrY = now, pos.Y
+    AP.vrLat = (hrp.AssemblyLinearVelocity * Vector3.new(1, 0, 1)).Magnitude
     AP.vrH = hit.Position.Y - pos.Y
     AP.vrAir = hum.FloorMaterial == Enum.Material.Air
     AP.vaultAt = tick()
