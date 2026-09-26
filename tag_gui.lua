@@ -4553,6 +4553,14 @@ local function vaultSpamZone(hrp, hum, pos)
         AP.zoneWhy = hit and "schraeg" or "keine_wand"
         return nil
     end
+    -- GESPERRTE STELLE: hier ist schon ein Spam ohne Vault geendet
+    local wkey = math.floor(hit.Position.X / 4) .. "," .. math.floor(hit.Position.Y / 4)
+        .. "," .. math.floor(hit.Position.Z / 4)
+    AP.zoneKey = wkey
+    if AP.wallBad and AP.wallBad[wkey] and time() < AP.wallBad[wkey] then
+        AP.zoneWhy = "gesperrt"
+        return nil
+    end
     local g = math.max(workspace.Gravity, 1)
     local jp = math.max(hum.JumpPower, 1)
     local maxRel = 2.75 + jp * jp / (2 * g)
@@ -4561,15 +4569,21 @@ local function vaultSpamZone(hrp, hum, pos)
                                   Vector3.new(0, -(maxRel + 3), 0), AP.rp)
     if not (top and top.Normal.Y > 0.7) then AP.zoneWhy = "keine_oberkante" return nil end
     local rel = top.Position.Y - pos.Y
+    AP.zoneRel = rel
     if rel < -0.6 then AP.zoneWhy = "schon_drueber" return nil end
     if rel > maxRel then AP.zoneWhy = "zu_hoch" return nil end
     if top.Instance:GetAttribute("NoClimb") then return nil end
     if not vaultHeadroom(pos, dir, top.Position, vaultNeed(top.Position.Y, hum, top.Position), AP.rp) then
         AP.zoneWhy = "decke"
+        AP.wallBad = AP.wallBad or {}
+        AP.wallBad[wkey] = time() + 10
         return nil
     end
     local n = (-hit.Normal) * Vector3.new(1, 0, 1)
-    return "wand", n.Magnitude > 0.1 and n.Unit or dir
+    -- Frontal lenken nur bei niedriger Kante (ohne Absprung greifbar);
+    -- an hohen Waenden wird gespammt, aber nicht in die Wand gelenkt
+    local low = rel <= 2.4
+    return "wand", (low and n.Magnitude > 0.1) and n.Unit or nil
 end
 
 local function vaultReflex(hrp, hum, wantDown)
@@ -4615,7 +4629,8 @@ local function vaultReflex(hrp, hum, wantDown)
         if zone == "wand" then
             AP.spamStick = { face = face, tEnd = now + 0.8 }
         elseif not zone and AP.spamStick and now < AP.spamStick.tEnd
-               and AP.zoneWhy ~= "decke" and AP.zoneWhy ~= "pause" then
+               and AP.zoneWhy ~= "decke" and AP.zoneWhy ~= "pause"
+               and AP.zoneWhy ~= "gesperrt" then
             local air = hum.FloorMaterial == Enum.Material.Air
             if air or now < AP.spamStick.tEnd - 0.5 then
                 zone, face = "wand", AP.spamStick.face
@@ -4644,11 +4659,22 @@ local function vaultReflex(hrp, hum, wantDown)
                 diagEvent("spam_ende", AP.spamZone, AP.spamHit and "echt" or "nichts",
                           tostring(AP.spamTaps or 0), tostring(AP.mode or "-")
                           .. " grund=" .. tostring(zone or AP.zoneWhy or "?")
-                          .. (" dauer=%.2f"):format(now - (AP.spamStart or now)))
+                          .. (" dauer=%.2f"):format(now - (AP.spamStart or now))
+                          .. (" jp=%.0f kante=%.1f bodenspruenge=%d"):format(AP.spamJP or 0,
+                                 AP.spamRel or -99, AP.spamGroundJumps or 0))
                 local st = diagStat("spam_" .. AP.spamZone .. "_" .. (AP.spamHit and "echt" or "nichts"))
                 st.n = st.n + 1
+                -- Stelle ohne Vault: 10 s sperren (sonst flackert die Zone
+                -- und lenkt ihn immer wieder frontal in dieselbe Wand —
+                -- gemessen 136 Abbrueche "decke" in 3.5 min)
+                if AP.spamZone == "wand" and not AP.spamHit and AP.spamKey then
+                    AP.wallBad = AP.wallBad or {}
+                    AP.wallBad[AP.spamKey] = now + 10
+                end
             end
             AP.spamZone, AP.spamHit, AP.spamTaps, AP.spamStart = zone, false, 0, now
+            AP.spamKey = AP.zoneKey
+            AP.spamJP, AP.spamRel, AP.spamGroundJumps = hum.JumpPower, AP.zoneRel, 0
         end
         if zone then
             if hum:GetAttribute("HasJumped") then
@@ -4656,6 +4682,9 @@ local function vaultReflex(hrp, hum, wantDown)
             else
                 S.jumpMobileTap = now + 0.12        -- druecken
                 AP.spamTaps = (AP.spamTaps or 0) + 1
+                if hum.FloorMaterial ~= Enum.Material.Air then
+                    AP.spamGroundJumps = (AP.spamGroundJumps or 0) + 1
+                end
                 if AP.vp then AP.vp.taps = AP.vp.taps + 1 end
             end
             return
@@ -7256,7 +7285,9 @@ local function autopilotStep(threat, threatD, prey, preyD)
     if mode == "JAGD" and prey then
         local pr = hrpOf(prey)
         targetPos = pr and pr.Position
-    elseif mode == "FLUCHT" and AP.escNode and AP.escNode.Y - pos.Y > 6 then
+    elseif mode == "FLUCHT" and AP.escNode and AP.escNode.Y - pos.Y > 6
+           and (threatD or 999) > 18
+           and not (AP.climbBlockUntil and tick() < AP.climbBlockUntil) then
         -- BEIM WEGLAUFEN IST HOEHE DIE HAUPTRICHTUNG. Liegt das Fluchtziel
         -- deutlich hoeher, bekommt der Kletter-Assistent (Leiter, Vault,
         -- Wandanlauf) es als Ziel. Bisher war er nur fuer die Jagd aktiv —
@@ -7896,6 +7927,67 @@ local function autopilotStep(threat, threatD, prey, preyD)
     end
     if not dir then AP.mode, AP.vec = nil, nil return end
     -- MOMENTUM-MOTOR: greifbare Kanten im Vorwaertsfaecher ansteuern
+    -- ECKEN-AUSBRUCH. Gemessen: alle Haenger auf der Flucht ohne Weg an
+    -- Waenden. Die Richtungswahl bestraft jede Richtung zum Verfolger bei
+    -- unter 25 Studs neunfach — in einer Ecke mit dem Verfolger an der
+    -- offenen Seite gewinnt dann "in die Wand", Frame fuer Frame neu.
+    -- Jetzt: 0.6 s ohne 2 Studs Fortschritt -> 16 Richtungen abtasten, die
+    -- mit dem meisten Platz nehmen (auch seitlich AM Verfolger vorbei, nur
+    -- nicht frontal auf ihn zu) und 1 s festhalten.
+    if mode == "FLUCHT" then
+        local st0 = diagStat("ecke_pruefung")
+        st0.n = st0.n + 1
+        if AP.usingPath then st0.weg = (st0.weg or 0) + 1 end
+        if climbGoal then st0.leiter = (st0.leiter or 0) + 1 end
+        if WATCH.movedAt and tick() - WATCH.movedAt > 0.6 then st0.stillstand = (st0.stillstand or 0) + 1 end
+    end
+    -- (auch beim Klettern: 458 von 965 Flucht-Frames lief der Kletter-
+    -- Assistent, genau dort war der Ausbruch gesperrt und der Assistent
+    -- drueckte den Bot in die Ecke)
+    if mode == "FLUCHT" and not AP.usingPath then
+        local nowC = tick()
+        if AP.cornerUntil and nowC < AP.cornerUntil and AP.cornerDir then
+            dir = AP.cornerDir
+            AP.smoothDir = dir
+        else
+            if AP.cornerUntil and AP.cornerFrom then
+                diagEvent("ecke_ausbruch", ("%.1f"):format(((pos - AP.cornerFrom) * Vector3.new(1, 0, 1)).Magnitude),
+                          ("%.0f"):format(AP.cornerFree or 0), "", "")
+                AP.cornerUntil, AP.cornerFrom = nil, nil
+            end
+            local stalled = WATCH.movedAt and nowC - WATCH.movedAt > 0.6
+            if stalled then
+                local thr = threat and hrpOf(threat)
+                local tdir = thr and ((thr.Position - pos) * Vector3.new(1, 0, 1))
+                tdir = tdir and tdir.Magnitude > 0.1 and tdir.Unit or nil
+                local bestD, bestS, bestF
+                for i = 0, 15 do
+                    local an = i * math.pi / 8
+                    local d = Vector3.new(math.cos(an), 0, math.sin(an))
+                    local h1 = workspace:Raycast(pos + Vector3.new(0, -1.5, 0), d * 14, AP.rp)
+                    local h2 = workspace:Raycast(pos + Vector3.new(0, 0.5, 0), d * 14, AP.rp)
+                    local free = math.min(h1 and (h1.Position - pos).Magnitude or 14,
+                                          h2 and (h2.Position - pos).Magnitude or 14)
+                    local toT = tdir and d:Dot(tdir) or -1
+                    if free >= 5 and toT < 0.82 then
+                        local sc = free - math.max(toT, 0) * 6
+                        if not bestS or sc > bestS then bestD, bestS, bestF = d, sc, free end
+                    end
+                end
+                if not bestD then
+                    diagEvent("ecke_keine_richtung", "", "", "", "")
+                end
+                if bestD then
+                    AP.cornerDir, AP.cornerUntil, AP.cornerFrom, AP.cornerFree = bestD, nowC + 1.0, pos, bestF
+                    AP.climbBlockUntil = nowC + 2.0      -- Kletterhilfe kurz aus
+                    WATCH.movedAt = nowC      -- nicht sofort erneut ausloesen
+                    diagStat("ecke_ausbruch").n = diagStat("ecke_ausbruch").n + 1
+                    dir = bestD
+                    AP.smoothDir = dir
+                end
+            end
+        end
+    end
     if AP.vaultCommitUntil and time() < AP.vaultCommitUntil and AP.vaultCommitDir then
         dir = AP.vaultCommitDir
         AP.smoothDir = dir     -- keine Drehrate dazwischen
@@ -8289,6 +8381,13 @@ local function assistStep(dt)
         -- Der Tempoverlust vor dem Verfolger ist der Preis dafuer, dass die
         -- Leiter ueberhaupt genommen wird; oben ist man ohnehin sicherer.
         local pw = PATH.wps and PATH.wps[PATH.idx] or nil
+        -- VERFOLGER IM NACKEN: keine Bremse. Gemessen gingen 2 von 3
+        -- verlorenen Zweikaempfen durch einen Durchgang, gefangen 0.5 bis
+        -- 3 s nach Annaeherung auf 3 bis 8 Studs — und genau dort wurde auf
+        -- 70 % (Leiter 36 %) gebremst. Genauigkeit ist nichts wert, wenn er
+        -- einen dabei einholt.
+        local closeFlee = AP.mode == "FLUCHT" and threatD and threatD < 12
+        if closeFlee and pw then diagStat("bremse_aus_nah").n = diagStat("bremse_aus_nah").n + 1 end
         if pw and posS then
             local k = pw.kind
             -- "jump" ist hier bewusst NICHT dabei. Die Sprungkante braucht
@@ -8301,7 +8400,7 @@ local function assistStep(dt)
                 -- herunterregeln, im Greifbereich auf gut ein Drittel.
                 local d = ((pw.Position - posS) * Vector3.new(1, 0, 1)).Magnitude
                 if d < 16 then
-                    wantSpeed = math.min(wantSpeed, math.clamp(d / 16, 0.36, 1))
+                    wantSpeed = math.min(wantSpeed, math.clamp(d / 16, closeFlee and 0.75 or 0.36, 1))
                     wantAccel = math.min(wantAccel, 1.1)
                 end
             elseif AP.ladder and AP.ladder.Parent
@@ -8309,9 +8408,9 @@ local function assistStep(dt)
                 -- Leiter angesteuert, ohne dass der Wegpunkt selbst vom Typ
                 -- climb ist: zwei der drei gemessenen Fehlversuche liefen
                 -- genau so, mit 27 bis 37 Studs/s ungebremst vorbei.
-                wantSpeed = math.min(wantSpeed, 0.42)
+                wantSpeed = math.min(wantSpeed, closeFlee and 0.75 or 0.42)
                 wantAccel = math.min(wantAccel, 1.1)
-            elseif k == "zip" or k == "pad" or k == "via" then
+            elseif (k == "zip" or k == "pad" or k == "via") and not closeFlee then
                 -- Milder als frueher (Untergrenze 0.45 -> 0.7) und erst ab
                 -- zehn statt vierzehn Studs: jedes Abbremsen kostet das
                 -- Momentum, und das aufzubauen dauert laenger, als die
